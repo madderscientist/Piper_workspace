@@ -1,0 +1,32 @@
+{
+  "folders": [{"path": "."}],
+  "settings": {
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+    "python.terminal.activateEnvironment": false,
+    "python.analysis.autoSearchPaths": false,
+    "python.analysis.exclude": [
+      "build",
+      "install",
+      "log",
+      "src/vendor"
+    ],
+    "python.analysis.extraPaths": [
+      "${workspaceFolder}/src/piper_x_driver",
+      "${workspaceFolder}/src/piper_teaching",
+      "${workspaceFolder}/src/state_dashboard",
+      "${workspaceFolder}/src/piper_description",
+      "${workspaceFolder}/install/piper_x_interfaces/lib/python3.10/site-packages",
+      "/opt/ros/humble/lib/python3.10/site-packages",
+      "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "urdf-visualizer.packages": {
+      "piper_description": "${workspaceFolder}/src/piper_description"
+    },
+    "files.exclude": {
+      "**/__pycache__": true,
+      "build": true,
+      "install": true,
+      "log": true
+    }
+  }
+}

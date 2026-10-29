@@ -1,0 +1,5 @@
+numpy>=1.26,<2
+scipy>=1.10
+python-can>=4.3.1,<5
+PyYAML>=5.4
+pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm.git@d90e234ba8e408cfa964b38aa9120b3131fc9f85

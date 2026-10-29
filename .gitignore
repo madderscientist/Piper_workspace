@@ -1,0 +1,10 @@
+.venv/
+build/
+install/
+log/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+src/piper_x_driver/config/*.yaml.lock
+src/vendor/*
+!src/vendor/COLCON_IGNORE
