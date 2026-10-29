@@ -1,0 +1,6 @@
+# Operator confirms the unloaded end effector is physically at its closed zero.
+# Writes the device zero over CAN; never automatically enables or moves any axis.
+bool confirm_closed
+---
+bool success
+string message

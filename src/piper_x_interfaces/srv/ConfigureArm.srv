@@ -1,0 +1,5 @@
+string end_effector
+float64 gravity_scale
+---
+bool success
+string message

@@ -1,0 +1,6 @@
+# standby, joint, point, linear, mit, drag, hold
+# drag/hold use the firmware's start/end drag-recording requests.
+string mode
+---
+bool success
+string message

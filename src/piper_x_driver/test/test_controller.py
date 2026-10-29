@@ -1,0 +1,429 @@
+from dataclasses import replace
+import math
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock, patch
+
+import pytest
+
+from piper_x_driver.backend import SdkArm
+from piper_x_driver.controller import Controller
+
+
+def target(**changes):
+    fields = dict(
+        position=[0.0, 0.5, -0.5, 0.0, 0.0, 0.0], velocity=[0.0] * 6,
+        kp=[1.0] * 6, kd=[0.5] * 6, torque=[0.0] * 6,
+    )
+    fields.update(changes)
+    return SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize('width', [-0.0108, 0.0, 0.02, 0.1, 0.1041])
+def test_enable_preserves_measured_width_without_clamping_or_mode_change(fake_arm, width):
+    arm = fake_arm()
+    arm.position = arm.position[:6] + (width,)
+    control = Controller(arm)
+    control.power(True)
+    assert arm.calls == [('power', True, width)]
+    assert control.mode == 'standby'
+
+
+@pytest.mark.parametrize('acknowledged', [True, False])
+def test_sdk_calibration_only_calls_the_bounded_zeroing_interface(acknowledged):
+    adapter = offline_adapter()
+    adapter.gripper = Mock()
+    adapter.gripper.calibrate_gripper.return_value = acknowledged
+    if acknowledged:
+        adapter.calibrate_effector()
+    else:
+        with pytest.raises(RuntimeError, match='not acknowledge'):
+            adapter.calibrate_effector()
+    assert adapter.gripper.mock_calls == [
+        ('calibrate_gripper', (), {'timeout': 1.0})]
+
+
+def test_sdk_mit_request_uses_can_control_even_after_native_hold():
+    from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
+
+    with patch('socket.socket', side_effect=AssertionError('Hardware forbidden')):
+        adapter = offline_adapter()
+        adapter.robot = AgxArmFactory.create_arm(create_agx_arm_config(
+            robot=ArmModel.PIPER_X, firmeware_version=PiperFW.V189, auto_connect=False))
+        try:
+            with patch.object(adapter.robot, '_send_msg') as send:
+                adapter.mode('hold')
+                adapter.mode('mit')
+                assert send.call_count == 2
+                assert send.call_args_list[0].args[0].grag_teach_ctrl == 2
+                assert send.call_args_list[1].args[0].ctrl_mode == 1
+        finally:
+            adapter.robot.disconnect()
+
+
+def test_no_implicit_modes_and_no_partial_targets(fake_arm):
+    arm = fake_arm()
+    control = Controller(arm)
+    control.power(True)
+    with pytest.raises(ValueError, match='matching mode'):
+        control.joints(SimpleNamespace(position=target().position, speed_percent=10))
+    control.set_mode('joint')
+    with pytest.raises(ValueError, match='six'):
+        control.joints(SimpleNamespace(position=[0.1], speed_percent=10))
+    control.joints(SimpleNamespace(position=target().position, speed_percent=10))
+    assert arm.calls[-1] == ('joints', target().position, 10)
+    control.mit(target())
+    control.set_mode('mit')
+    new_pos = [0.2, 0.4, -0.4, 0.1, -0.1, 0.3]
+    control.joints(SimpleNamespace(position=new_pos, speed_percent=0))
+    assert control.mit_target is not None
+    assert control.mit_target.position == tuple(new_pos)
+    assert control.mit_target.kp == tuple(target().kp)
+    assert control.mit_target.kd == tuple(target().kd)
+
+
+@pytest.mark.parametrize('angle_deg', [-2.0, 195.0])
+def test_joint_and_mit_commands_preserve_raw_j2_outside_model_workspace(fake_arm, angle_deg):
+    arm = fake_arm()
+    control = Controller(arm)
+    control.power(True)
+    position = list(arm.position[:6])
+    position[1] = math.radians(angle_deg)
+    control.set_mode('joint')
+    control.joints(SimpleNamespace(position=position, speed_percent=10))
+    assert arm.calls[-1] == ('joints', position, 10)
+    assert control.feedback().position[1] == position[1]
+    control.set_mode('standby')
+    control.mit(target(position=position))
+    control.set_mode('mit')
+    assert arm.calls[-2][1].position == position
+    assert arm.position[1] == position[1]
+
+
+@pytest.mark.parametrize('angle_deg', [-2.0, 195.0])
+def test_real_sdk_encodes_raw_j2_without_model_clipping(angle_deg):
+    from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
+
+    with patch('socket.socket', side_effect=AssertionError('Hardware forbidden')):
+        adapter = offline_adapter()
+        adapter.robot = AgxArmFactory.create_arm(create_agx_arm_config(
+            robot=ArmModel.PIPER_X, firmeware_version=PiperFW.V189, auto_connect=False))
+        try:
+            assert not adapter.robot.get_joint_limits_enabled()
+            parser = adapter.robot._parser
+            with (patch.object(adapter.robot, '_send_msg'),
+                  patch.object(adapter.robot, '_send_msgs')):
+                with patch.object(parser, '_make_joint_ctrl_msgs',
+                                  wraps=parser._make_joint_ctrl_msgs) as joint_message:
+                    position = target().position
+                    position[1] = math.radians(angle_deg)
+                    adapter.joints(position, 10)
+                    assert joint_message.call_args.args[0][1] == round(angle_deg * 1000)
+                with patch.object(parser, '_make_joint_mit_ctrl_msg',
+                                  wraps=parser._make_joint_mit_ctrl_msg) as mit_message:
+                    adapter.mit(target(position=position))
+                    encoded = mit_message.call_args_list[1].kwargs['p_des']
+                    assert encoded * 25 / 65535 - 12.5 == pytest.approx(
+                        position[1], abs=25 / 65535)
+        finally:
+            adapter.robot.disconnect()
+
+
+@pytest.mark.parametrize('field', ['position', 'velocity', 'kp', 'kd', 'torque'])
+def test_entire_mit_packet_validated_before_transmit(field, fake_arm):
+    arm = fake_arm()
+    control = Controller(arm)
+    with pytest.raises(ValueError):
+        control.mit(target(**{field: [0.0] * 5}))
+    assert arm.calls == []
+
+
+@pytest.mark.parametrize('trigger', ['explicit', 'input_timeout', 'feedback'])
+def test_timeouts_and_exit_enter_gravity_drag_without_soft_stop(fake_arm, trigger):
+    from piper_x_driver.gravity import gravity_torques
+
+    now = [0.0]
+    arm = fake_arm()
+    control = Controller(arm, clock=lambda: now[0])
+    control.power(True)
+    with pytest.raises(ValueError, match='fresh'):
+        control.set_mode('mit')
+    command = target()
+    control.mit(command)
+    assert arm.calls == [('power', True, 0.02)]
+    control.set_mode('mit')
+    assert arm.calls[-2:] == [('mit', command), ('mode', 'mit')]
+    control.watchdog()
+    initial = arm.calls[-1][1]
+    original_snapshot = arm.snapshot
+    now[0] = 0.201
+    if trigger == 'input_timeout':
+        expected_g = gravity_torques(arm.position[:6])
+        control.watchdog()
+        output = arm.calls[-1][1]
+        assert output.position == pytest.approx([
+            q + g / kp for q, g, kp in zip(arm.position[:6], expected_g, control.debug_kp)
+        ])
+        assert output.kp == control.debug_kp
+        assert output.kd == control.debug_kd
+        assert output.velocity == (0.0,) * 6
+        assert output.torque == (0.0,) * 6
+        assert control.mode == 'mit' and all(arm.enabled)
+    elif trigger == 'feedback':
+        sample = arm.snapshot()
+        arm.snapshot = lambda: replace(sample, age=(-1.0,) * 11, position=None)
+        with pytest.raises(ValueError, match='retaining last MIT output'):
+            control.watchdog()
+        for elapsed in (1.0, 5.0, 60.0):
+            now[0] = 0.201 + elapsed
+            with pytest.raises(ValueError, match='retaining last MIT output'):
+                control.watchdog()
+            assert arm.calls[-1] == ('mit', initial)
+            assert control.mode == 'mit' and all(arm.enabled)
+        arm.snapshot = original_snapshot
+        control.mit(command)
+        control.watchdog()
+        assert not control.hold_reason
+    control.power(False)
+    assert arm.calls[-1] == ('power', False, 0.0)
+    assert not any(arm.enabled)
+    assert control.mode == 'standby'
+
+
+def test_bad_feedback_blocks_enable_but_never_blocks_disable(fake_arm):
+    arm = fake_arm()
+    control = Controller(arm)
+    sample = arm.snapshot()
+    arm.snapshot = lambda: replace(sample, age=(-1.0,) * 11)
+    with pytest.raises(ValueError, match='fresh') as error:
+        control.power(True)
+    assert 'joint12(0x2A5)=missing' in str(error.value)
+    control.power(False)
+    assert arm.calls == [('power', False, 0.0)]
+
+
+def test_actual_native_mode_is_not_external_joint_mode(fake_arm):
+    arm = fake_arm()
+    control = Controller(arm)
+    control.power(True)
+    control.set_mode('joint')
+    arm.mode('hold')
+    with pytest.raises(ValueError, match='matching'):
+        control.joints(SimpleNamespace(position=target().position, speed_percent=10))
+
+
+def test_sdk_snapshot_never_fills_absent_can_segments_with_zero():
+    from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
+    from can import Message
+    import time
+
+    with patch('socket.socket', side_effect=AssertionError('Hardware forbidden')):
+        adapter = offline_adapter()
+        adapter.robot = AgxArmFactory.create_arm(create_agx_arm_config(
+            robot=ArmModel.PIPER_X, firmeware_version=PiperFW.V189, auto_connect=False))
+        adapter.gripper = SimpleNamespace(get_gripper_status=lambda: None)
+        adapter.robot._parser.parse_packet(Message(
+            arbitration_id=0x2A7, data=bytes(8), timestamp=time.time(), is_extended_id=False))
+        sample = adapter.snapshot()
+        assert sample.position is None
+        assert sample.age[0] == -1.0 and sample.age[2] >= 0
+        adapter.robot.disconnect()
+
+
+def test_complete_sdk_snapshot_uses_real_message_fields_and_si_values():
+    from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
+    from pyAgxArm.protocols.can_protocol.drivers.effector.agx_gripper.default.parser import Parser
+    from pyAgxArm.utiles.fps import FPSManager
+    from can import Message
+    import time
+
+    with patch('socket.socket', side_effect=AssertionError('Hardware forbidden')):
+        adapter = offline_adapter()
+        adapter.robot = AgxArmFactory.create_arm(create_agx_arm_config(
+            robot=ArmModel.PIPER_X, firmeware_version=PiperFW.V189, auto_connect=False))
+        gripper = Parser(FPSManager())
+        stamp = time.time()
+        gripper.parse_packet(Message(
+            arbitration_id=0x2A8, data=bytes.fromhex('00004E2000000000'),
+            timestamp=stamp, is_extended_id=False))
+        adapter.gripper = SimpleNamespace(get_gripper_status=lambda: gripper.gripper)
+        for id_ in (0x2A1, 0x2A5, 0x2A6, 0x2A7, 0x2A2, 0x2A3, 0x2A4,
+                    *range(0x251, 0x257), *range(0x261, 0x267)):
+            data = bytes.fromhex('03E8000000000000') if 0x251 <= id_ <= 0x256 else bytes(8)
+            adapter.robot._parser.parse_packet(Message(
+                arbitration_id=id_, data=data, timestamp=stamp, is_extended_id=False))
+
+        def clock_during_receive():
+            adapter.robot._parser.parse_packet(Message(
+                arbitration_id=0x261, data=bytes(8),
+                timestamp=stamp + 0.001, is_extended_id=False))
+            return stamp
+
+        with patch('piper_x_driver.backend.time', SimpleNamespace(time=clock_during_receive)):
+            sample = adapter.snapshot()
+        assert sample.position == pytest.approx((0.0,) * 6 + (0.02,))
+        assert sample.velocity == (1.0,) * 6
+        assert sample.torque == (0.0,) * 6
+        assert sample.pose == (0.0,) * 6
+        assert all(0 <= age < 0.2 for age in sample.age)
+        adapter.robot.disconnect()
+
+
+def test_sdk_disable_attempts_every_joint_and_gripper_after_can_failure():
+    from can import CanError
+
+    calls = []
+
+    def disable(index):
+        calls.append(index)
+        if index == 2:
+            raise CanError('J2 bus error')
+
+    adapter = offline_adapter()
+    adapter.robot = SimpleNamespace(disable=disable)
+    adapter.gripper = SimpleNamespace(disable_gripper=lambda: calls.append('gripper'))
+    with pytest.raises(CanError, match='J2'):
+        adapter.power(False, 0.0)
+    assert calls == [1, 2, 3, 4, 5, 6, 'gripper']
+
+
+def test_partial_sdk_enable_is_rolled_back_without_closing_gripper():
+    from can import CanError
+
+    calls = []
+
+    def enable(index):
+        calls.append(('enable', index))
+        if index == 3:
+            raise CanError('Enable failed')
+
+    adapter = offline_adapter()
+    adapter.robot = SimpleNamespace(
+        enable=enable, disable=lambda index: calls.append(('disable', index)))
+    adapter.gripper = SimpleNamespace(
+        disable_gripper=lambda: calls.append(('disable', 'gripper')))
+    with pytest.raises(CanError, match='Enable failed'):
+        adapter.power(True, 0.02)
+    assert calls[:3] == [('enable', 1), ('enable', 2), ('enable', 3)]
+    assert calls[3:] == [('disable', index) for index in range(1, 7)] + [
+        ('disable', 'gripper')]
+
+
+def test_hold_request_can_end_a_nonfault_recording_state(fake_arm):
+    arm = fake_arm()
+    control = Controller(arm)
+    control.power(True)
+    arm.status['arm_status'] = 11
+    arm.status['teach_status'] = 1
+    control.set_mode('hold')
+    assert arm.status['teach_status'] == 2
+
+
+def test_disable_changes_enable_flags_but_preserves_native_firmware_mode(fake_arm):
+    arm = fake_arm()
+    control = Controller(arm)
+    control.power(True)
+    arm.mode('hold')
+    status = arm.status.copy()
+    arm.calls.clear()
+    control.power(False)
+    assert arm.calls == [('power', False, 0.0)]
+    assert not any(arm.enabled)
+    assert arm.status == status
+
+
+def test_sdk_waits_for_receive_fps_before_querying_firmware():
+    from unittest.mock import Mock
+
+    robot = Mock()
+    robot.get_fps.side_effect = [0, 0, 50]
+
+    def firmware(**_):
+        assert robot.get_fps.call_count == 3
+        return {'software_version': 'S-V1.9-0'}
+
+    robot.get_firmware.side_effect = firmware
+    with patch('piper_x_driver.backend.AgxArmFactory.create_arm', return_value=robot):
+        with patch('piper_x_driver.backend.time.sleep') as sleep:
+            adapter = SdkArm('can0')
+    assert adapter.robot is robot
+    robot.set_follower_mode.assert_called_once_with()
+    assert robot.get_fps.call_count == 3
+    assert sleep.call_count == 2
+    robot.get_firmware.assert_called_once_with(timeout=2.0)
+    robot.set_joint_limits_enabled.assert_called_once_with(False)
+    robot.enable.assert_not_called()
+    robot.disable.assert_not_called()
+    robot.set_motion_mode.assert_not_called()
+    adapter.close()
+
+
+def test_sdk_missing_receive_stream_fails_and_disconnects():
+    from unittest.mock import Mock
+
+    robot = Mock()
+    robot.get_fps.return_value = 0
+    with patch('piper_x_driver.backend.AgxArmFactory.create_arm', return_value=robot):
+        with patch('piper_x_driver.backend.time.monotonic', side_effect=[0.0, 2.1]):
+            with pytest.raises(RuntimeError, match='receive stream'):
+                SdkArm('can0')
+    robot.get_firmware.assert_not_called()
+    robot.disconnect.assert_called_once()
+
+
+def offline_adapter() -> Any:
+    adapter = SdkArm.__new__(SdkArm)
+    adapter._initialize_shutdown()
+    return adapter
+
+
+@pytest.mark.parametrize('entrypoint', ['power', 'close'])
+def test_backend_mit_exit_and_close_enter_firmware_drag_mode(entrypoint):
+    adapter = offline_adapter()
+    events = []
+    adapter.robot = SimpleNamespace(
+        set_motion_mode=lambda _: None,
+        move_mit=lambda *args: events.append(('mit', args)),
+        set_leader_mode=lambda: events.append(('leader',)),
+        restore_leader_drag_mode=lambda: events.append(('restore_drag',)),
+        set_follower_mode=lambda: events.append(('follower',)),
+        disable=lambda index: events.append(('disable', index)),
+        disconnect=lambda: events.append(('disconnect',)),
+    )
+    adapter.gripper = SimpleNamespace(
+        disable_gripper=lambda: events.append(('gripper',)))
+    adapter.mode('mit')
+    adapter.mit(target(torque=[0.1] * 6))
+    if entrypoint == 'power':
+        adapter.power(False, 0.0)
+        assert events[-7:] == [('disable', i) for i in range(1, 7)] + [('gripper',)]
+        assert adapter._mode == 'standby'
+    else:
+        adapter.close()
+        assert events[-3:] == [('leader',), ('restore_drag',), ('disconnect',)]
+        assert adapter._mode == 'drag'
+
+
+def test_sdk_mit_scales_post_reduction_kp_kd_and_calibrates_gravity_offset():
+    from piper_x_driver.backend import MIT_GAIN_SCALE, MitTarget
+
+    adapter = offline_adapter()
+    sent = []
+    adapter.robot = SimpleNamespace(
+        move_mit=lambda *args: sent.append(args),
+    )
+    base = (0.0, 0.2, -0.4, -1.0, 0.0, 0.0)
+    kp = (5.0, 5.0, 5.0, 1.0, 0.7, 0.7)
+    kd = (0.5, 0.8, 0.8, 0.2, 0.2, 0.2)
+    gravity = (0.0, 2.6, -4.0, 0.33, 0.0, 0.0)
+    offset = tuple(g / k for g, k in zip(gravity, kp))
+    position = tuple(q + off for q, off in zip(base, offset))
+    adapter.mit(MitTarget(position, (0.0,) * 6, kp, kd, (0.0,) * 6, offset))
+    assert len(sent) == 6
+    for idx, (j, p_wire, v_wire, kp_wire, kd_wire, t_wire) in enumerate(sent):
+        assert j == idx + 1
+        assert v_wire == 0.0 and t_wire == 0.0
+        assert kd_wire == pytest.approx(kd[idx] / MIT_GAIN_SCALE[idx])
+        kp_uint = int(kp_wire * 4095 / 500.0)
+        kp_realized = MIT_GAIN_SCALE[idx] * (kp_uint * 500.0 / 4095.0)
+        assert (p_wire - base[idx]) * kp_realized == pytest.approx(gravity[idx])
