@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>piper_teaching</name>
+  <version>0.1.0</version>
+  <description>Four-arm bilateral teaching through workspace ROS interfaces only.</description>
+  <maintainer email="maintainer@example.invalid">Workspace maintainer</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>piper_x_interfaces</depend>
+  <exec_depend>piper_x_driver</exec_depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>launch_ros</depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
