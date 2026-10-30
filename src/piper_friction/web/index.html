@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PiPER-X · 单臂六关节摩擦力与周期性齿轮感标定工作台</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="page-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">F</span>
+        <h1>关节摩擦力与周期性齿轮阻碍标定工作台</h1>
+        <span class="version">PIPER-X · STRIBECK + SPATIAL HARMONICS</span>
+      </div>
+      <div class="header-right">
+        <span class="transport-badge" id="conn-badge">
+          <span class="dot" id="conn-dot"></span>
+          <strong id="conn-text">检测 ROS 服务中…</strong>
+        </span>
+        <button type="button" id="btn-demo-all" class="btn-accent-soft" title="无需真机，直接生成 J1~J6 多速正反转数据并展示完整解耦与拟合曲线">⚡ 加载整臂 J1~J6 示例数据</button>
+        <time class="clock" id="clock">--:--:--</time>
+      </div>
+    </header>
+
+    <!-- 顶部五步全操作流程导航条 -->
+    <section class="workflow-banner" aria-label="摩擦力标定全操作流程">
+      <div class="wf-step active" id="wf-step-1" data-step="1">
+        <div class="wf-num">①</div>
+        <div class="wf-body">
+          <strong>选择 CAN 口（单臂）与姿态</strong>
+          <span>一次选定一条机械臂；查看六轴实时反馈与重力矩</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-2" data-step="2">
+        <div class="wf-num">②</div>
+        <div class="wf-body">
+          <strong>配置 J1~J6 扫描区间与速度</strong>
+          <span>支持勾选 J1→J6 顺序自动跑完，或单选某一关节</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-3" data-step="3">
+        <div class="wf-num">③</div>
+        <div class="wf-body">
+          <strong>正反转等速扫描采集</strong>
+          <span>每次动一轴、其余五轴锁死，记录角度/速度/实测力矩</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-4" data-step="4">
+        <div class="wf-num">④</div>
+        <div class="wf-body">
+          <strong>半和/半差解耦与谐波拟合</strong>
+          <span>分离齿槽转矩 τ_cog、啮合调制 τ_mod、Stribeck 与衰减包络</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-5" data-step="5">
+        <div class="wf-num">⑤</div>
+        <div class="wf-body">
+          <strong>前馈补偿试算与导出 YAML</strong>
+          <span>验证慢速齿轮阻碍抵消与高速平滑退火，保存整臂参数</span>
+        </div>
+      </div>
+    </section>
+
+    <div id="notice-bar" class="notice-bar" hidden role="status"></div>
+
+    <div class="workbench-grid">
+      <!-- 左栏：步骤 ① ② ③（选择 CAN 口、配置六轴计划、执行扫描采集） -->
+      <section class="column col-left" aria-label="步骤一至三：设备选择、扫描计划与采集控制">
+        <!-- 步骤 ① -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ①</span>
+              <h2>选择目标 CAN 口（单台机械臂）与姿态检查</h2>
+            </div>
+            <span class="sub-badge" id="selected-arm-summary">can0 · /arm_1</span>
+          </header>
+          <p class="helper-note">
+            <strong>为什么同一时刻只动一个关节？</strong>
+            多关节同时运动会引入科氏力、离心力及下游连杆重心变化，掩盖微小的“齿轮感”波纹。因此选定一个 CAN 口后，系统采用<strong>“单轴运动、其余五轴 MIT 锁死”</strong>的方式，按 <code>J1 → J2 → … → J6</code> 顺序自动依次完成整臂标定（也可单独重标任意一轴）。
+          </p>
+
+          <div class="arm-selector" id="arm-selector" role="radiogroup" aria-label="选择 CAN 口与机械臂"></div>
+
+          <div class="telemetry-box">
+            <div class="telemetry-header">
+              <strong>当前选中机械臂六轴实时状态</strong>
+              <div class="header-actions">
+                <span id="arm-friction-scale-badge" class="pill">驱动 friction_scale: 0.00</span>
+                <button type="button" id="btn-zero-friction-scale" class="btn-xs" title="标定前将驱动摩擦补偿倍率设为 0，防止已标定摩擦力影响采样">标定置 0</button>
+                <button type="button" id="btn-restore-friction-scale" class="btn-xs" title="标定完成后将驱动摩擦补偿倍率恢复为 1.0">恢复 1.0</button>
+                <span id="arm-live-status" class="pill">等待遥测</span>
+              </div>
+            </div>
+            <table class="data-table compact" aria-label="六轴实时状态表">
+              <thead>
+                <tr>
+                  <th>关节</th>
+                  <th>使能</th>
+                  <th>实测角 q (rad / °)</th>
+                  <th>实测速度 dq (rad/s)</th>
+                  <th>实测力矩 τ_meas (Nm)</th>
+                  <th>理论重力 τ_g (Nm)</th>
+                  <th>标定状态</th>
+                </tr>
+              </thead>
+              <tbody id="live-joints-tbody"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <!-- 步骤 ② -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ②</span>
+              <h2>配置 J1～J6 扫描区间与多档速度计划</h2>
+            </div>
+            <div class="header-actions">
+              <button type="button" id="btn-select-all-joints" class="btn-xs">全选 J1~J6</button>
+              <button type="button" id="btn-center-around-live" class="btn-xs" title="以当前真机实测角为中心 ±0.40 rad 自动设置扫描窗口">按当前实测角 ±0.4 rad 设范围</button>
+            </div>
+          </header>
+
+          <table class="data-table plan-table" aria-label="六关节扫描计划表">
+            <thead>
+              <tr>
+                <th>队列</th>
+                <th>关节</th>
+                <th>扫描起点 q_min (rad)</th>
+                <th>扫描终点 q_max (rad)</th>
+                <th>角度跨度</th>
+                <th>推荐姿态说明</th>
+                <th>单轴操作</th>
+              </tr>
+            </thead>
+            <tbody id="plan-joints-tbody"></tbody>
+          </table>
+
+          <div class="form-grid">
+            <label>
+              <span>扫描速度档位 (rad/s，低速抓齿轮感 → 高速抓粘滞与衰减)</span>
+              <input type="text" id="input-speeds" value="0.03 0.06 0.12 0.25 0.50 1.00 1.50">
+            </label>
+            <label>
+              <span>每档往复次数 (repeats)</span>
+              <input type="number" id="input-repeats" value="1" min="1" max="5" step="1">
+            </label>
+            <label>
+              <span>换向停顿时间 settle (s)</span>
+              <input type="number" id="input-settle" value="0.4" min="0.0" max="3.0" step="0.1">
+            </label>
+            <label>
+              <span>MIT 扫描刚度 kp (六轴 Nm/rad)</span>
+              <input type="text" id="input-kp" value="30 30 30 8 6 6">
+            </label>
+            <label>
+              <span>CSV 采样保存路径（多轴队列自动追加 _j1.._j6）</span>
+              <input type="text" id="input-output-csv" value="/home/a/piper_x_ws/src/piper_friction/config/arm_1_sweep.csv">
+            </label>
+            <label>
+              <span>标定结果 YAML 保存路径</span>
+              <input type="text" id="input-fit-output" value="/home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml">
+            </label>
+          </div>
+
+          <div class="cli-preview-box">
+            <div class="cli-preview-head">
+              <span>对应终端 CLI 命令（可复制在终端独立执行，估计单轴耗时 <strong id="est-duration">—</strong>）：</span>
+              <button type="button" id="btn-copy-cli" class="btn-xs">复制命令</button>
+            </div>
+            <pre id="cli-command-preview"></pre>
+          </div>
+        </article>
+
+        <!-- 步骤 ③ -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ③</span>
+              <h2>执行正反转等速扫描采集（或导入离线 CSV）</h2>
+            </div>
+            <span class="pill" id="sweep-phase-pill">空闲 (idle)</span>
+          </header>
+
+          <div class="action-bar">
+            <button type="button" id="btn-start-queue" class="btn-primary">▶ 一键按序标定勾选关节 (队列执行)</button>
+            <button type="button" id="btn-start-single" class="btn-secondary">▶ 仅扫描当前查看关节 (<span id="lbl-active-joint">J1</span>)</button>
+            <button type="button" id="btn-stop-sweep" class="btn-danger" disabled>⏹ 紧急停止扫描</button>
+          </div>
+
+          <div class="progress-panel">
+            <div class="progress-row">
+              <span>队列关节进度：<strong id="prog-queue-text">未开始</strong></span>
+              <span>当前轨迹子段：<strong id="prog-seg-text">—</strong></span>
+              <span>已采样本：<strong id="prog-samples-text">0</strong> 帧</span>
+            </div>
+            <div class="progress-bar-track" aria-label="扫描进度条">
+              <div class="progress-bar-fill" id="prog-bar-fill" style="width: 0%"></div>
+            </div>
+            <div class="progress-row subtle-row">
+              <span>当前指令角度 q_des：<code id="prog-q-des">0.000 rad</code></span>
+              <span>当前指令速度 dq_des：<code id="prog-dq-des">0.000 rad/s</code></span>
+              <a href="/api/samples.csv" download="sweep_samples.csv" class="link-btn">⬇ 下载当前采样 CSV</a>
+            </div>
+          </div>
+
+          <div class="offline-bar">
+            <span>离线 / 演示数据入口：</span>
+            <button type="button" id="btn-demo-single" class="btn-xs">生成当前关节示例数据并拟合</button>
+            <label class="file-upload-btn btn-xs">
+              📂 上传本地 CSV 文件拟合
+              <input type="file" id="input-csv-file" accept=".csv,text/csv" hidden>
+            </label>
+          </div>
+        </article>
+      </section>
+
+      <!-- 右栏：步骤 ④ ⑤（解耦与拟合曲线、参数报表、前馈试算与 YAML 导出） -->
+      <section class="column col-right" aria-label="步骤四至五：参数辨识图表、补偿试算与导出">
+        <!-- 步骤 ④ -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ④</span>
+              <h2>半和/半差解耦与空间谐波 + Stribeck 参数拟合</h2>
+            </div>
+            <div class="header-actions">
+              <label class="inline-field">谐波阶数 M
+                <input type="number" id="input-max-harmonics" value="2" min="0" max="6" step="1">
+              </label>
+              <label class="inline-field">指定频率 ω (可选)
+                <input type="text" id="input-omegas" placeholder="自动 FFT 寻峰" style="width:110px">
+              </label>
+              <button type="button" id="btn-run-fit" class="btn-primary-sm">⚡ 重新拟合当前关节</button>
+            </div>
+          </header>
+
+          <!-- 六关节切换标签栏 -->
+          <div class="joint-tabs" id="fit-joint-tabs" role="tablist" aria-label="切换查看关节拟合结果"></div>
+
+          <!-- 关键辨识参数指标卡 -->
+          <div class="param-summary-grid" id="param-summary-grid">
+            <div class="param-box"><span>库仑摩擦 Fc</span><strong id="val-fc">—</strong><small>Nm (动摩擦基准)</small></div>
+            <div class="param-box"><span>静摩擦峰值 Fs</span><strong id="val-fs">—</strong><small>Nm (慢速启动阻力)</small></div>
+            <div class="param-box"><span>Stribeck 速度 vs</span><strong id="val-vs">—</strong><small>rad/s (静→动拐点)</small></div>
+            <div class="param-box"><span>粘滞阻尼 fv</span><strong id="val-fv">—</strong><small>Nm/(rad/s)</small></div>
+            <div class="param-box highlight"><span>齿轮感消失速度 vr</span><strong id="val-vr">—</strong><small>rad/s (包络 w=e^-(v/vr)²)</small></div>
+            <div class="param-box"><span>总稳态拟合 RMSE</span><strong id="val-rmse">—</strong><small>Nm (越小越准)</small></div>
+          </div>
+
+          <!-- 三幅核心物理诊断图 -->
+          <div class="charts-stack">
+            <div class="chart-card">
+              <div class="chart-title-bar">
+                <strong>① 极低速正反转力矩与半和解耦：方向无关齿槽转矩 τ_cog(θ)</strong>
+                <span class="legend">
+                  <i style="background:#93a8c2"></i>正转 τ⁺(θ)
+                  <i style="background:#c4a59b"></i>反转 τ⁻(θ)
+                  <i style="background:#182537"></i>实测半和 (τ⁺+τ⁻)/2
+                  <i style="background:#245cbe"></i>谐波拟合 τ̂_cog(θ)
+                </span>
+              </div>
+              <canvas id="canvas-cogging" width="760" height="200"></canvas>
+            </div>
+
+            <div class="chart-card">
+              <div class="chart-title-bar">
+                <strong>② 极低速半差去均值解耦：方向相关啮合摩擦调制 τ_mod(θ)</strong>
+                <span class="legend">
+                  <i style="background:#60748a"></i>实测半差波纹 (τ⁺−τ⁻)/2 − F(v)
+                  <i style="background:#15714d"></i>谐波拟合 τ̂_mod(θ)
+                </span>
+              </div>
+              <canvas id="canvas-modulation" width="760" height="180"></canvas>
+            </div>
+
+            <div class="chart-card">
+              <div class="chart-title-bar">
+                <strong>③ 多速度 Stribeck 摩擦曲线 F(v) 与周期齿轮阻碍衰减包络 w(v)</strong>
+                <span class="legend">
+                  <i style="background:#245cbe"></i>稳态摩擦拟合 F(v) (左轴 Nm)
+                  <i style="background:#d96b27"></i>周期波纹包络 w(v)=e^-(v/vr)² (右轴 0~1)
+                </span>
+              </div>
+              <canvas id="canvas-stribeck" width="760" height="200"></canvas>
+            </div>
+          </div>
+
+          <!-- 空间谐波明细表 -->
+          <div class="harmonics-section">
+            <h3>识别出的空间周期谐波分量（齿轮感频谱）</h3>
+            <table class="data-table compact" aria-label="空间谐波分量表">
+              <thead>
+                <tr>
+                  <th>阶次</th>
+                  <th>空间角频率 ω_m (rad⁻¹)</th>
+                  <th>单个齿格周期角 (°)</th>
+                  <th>齿槽项 a_m (cos)</th>
+                  <th>齿槽项 b_m (sin)</th>
+                  <th>齿槽幅值 |A_m| (Nm)</th>
+                  <th>调制项 c_m (cos)</th>
+                  <th>调制项 d_m (sin)</th>
+                  <th>调制幅值 |C_m| (Nm)</th>
+                </tr>
+              </thead>
+              <tbody id="harmonics-tbody">
+                <tr><td colspan="9" class="empty-cell">尚未运行拟合，请点击“加载整臂示例数据”或完成一次扫描采集</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <!-- 步骤 ⑤ -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ⑤</span>
+              <h2>前馈补偿力矩实时试算与整臂 YAML 导出</h2>
+            </div>
+            <span class="sub-badge" id="calibrated-count-badge">已标定 0 / 6 轴</span>
+          </header>
+
+          <div class="eval-panel">
+            <div class="eval-sliders">
+              <label>
+                <span>测试角度 θ (<code id="lbl-eval-q">0.00 rad / 0.0°</code>)</span>
+                <input type="range" id="slider-eval-q" min="-1.57" max="1.57" step="0.002" value="0.0">
+              </label>
+              <label>
+                <span>测试速度 dq (<code id="lbl-eval-dq">0.05 rad/s</code>) — 拖动观察慢速与快速下周期项变化</span>
+                <input type="range" id="slider-eval-dq" min="-1.50" max="1.50" step="0.005" value="0.05">
+              </label>
+              <div class="scale-row">
+                <label>
+                  <span>齿槽项补偿比例 cogging_scale (推荐 1.0)</span>
+                  <input type="number" id="input-cog-scale" value="1.0" min="0.0" max="1.5" step="0.05">
+                </label>
+                <label>
+                  <span>方向摩擦补偿比例 friction_scale (推荐 0.7~0.85)</span>
+                  <input type="number" id="input-fric-scale" value="0.8" min="0.0" max="1.5" step="0.05">
+                </label>
+              </div>
+            </div>
+
+            <div class="eval-results">
+              <div class="eval-item"><span>当前速度包络权重 w(dq)</span><strong id="eval-env">1.000</strong></div>
+              <div class="eval-item"><span>方向无关齿槽补偿 τ_cog</span><strong id="eval-cog">0.0000 Nm</strong></div>
+              <div class="eval-item"><span>方向相关啮合调制 τ_mod</span><strong id="eval-mod">0.0000 Nm</strong></div>
+              <div class="eval-item"><span>平滑 Stribeck + 粘滞项</span><strong id="eval-stribeck">0.0000 Nm</strong></div>
+              <div class="eval-item total"><span>合成前馈补偿总力矩 τ_fric</span><strong id="eval-total">0.0000 Nm</strong></div>
+            </div>
+          </div>
+
+          <div class="yaml-export-box">
+            <div class="yaml-export-header">
+              <strong>当前选中机械臂 (<span id="yaml-arm-label">arm_1</span>) 标定参数 YAML</strong>
+              <div class="header-actions">
+                <button type="button" id="btn-save-yaml" class="btn-primary-sm">💾 保存至服务器路径</button>
+                <button type="button" id="btn-copy-yaml" class="btn-xs">复制 YAML</button>
+                <button type="button" id="btn-download-yaml" class="btn-xs">⬇ 下载 YAML 文件</button>
+              </div>
+            </div>
+            <div class="yaml-path-row">
+              <label for="input-save-yaml-path">服务器保存路径：</label>
+              <input type="text" id="input-save-yaml-path" value="/home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml">
+            </div>
+            <div id="save-yaml-feedback" class="save-feedback" hidden role="status"></div>
+            <pre id="yaml-output-preview"># 完成任意关节拟合后，此处将生成对应的 YAML 标定参数</pre>
+          </div>
+        </article>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
