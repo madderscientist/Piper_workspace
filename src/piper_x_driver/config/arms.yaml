@@ -3,49 +3,117 @@ effectors:
   teaching_handle:
     label: 示教手柄
     mass_kg: 0.54
-    com_m: [0.007963485290706084, 0.0000555501947027822, 0.03788358878334557]
-    source: piper_description/urdf/piper_description_with_teach.urdf; combined terminal inertials in link6; CAD assumed accurate, not hardware calibrated
+    com_m:
+    - 0.007963485290706084
+    - 5.55501947027822e-05
+    - 0.03788358878334557
+    source: piper_description/urdf/piper_description_with_teach.urdf; combined terminal
+      inertials in link6; CAD assumed accurate, not hardware calibrated
     model: piper_description_with_teach.urdf
   gripper:
     label: 标准夹爪
     mass_kg: 0.54
-    com_m: [0.00001822434565775221, -0.00009521502789096145, 0.03953134028382456]
-    source: agilexrobotics/agx_arm_urdf@680fa925cd00db7e2628563d2edc5540963045de; PiPER-X empty stock gripper
+    com_m:
+    - 1.822434565775221e-05
+    - -9.521502789096145e-05
+    - 0.03953134028382456
+    source: agilexrobotics/agx_arm_urdf@680fa925cd00db7e2628563d2edc5540963045de;
+      PiPER-X empty stock gripper
     model: piper_description.urdf
 arms:
-  - id: arm_1
-    name: 机械臂 1
-    namespace: /arm_1
-    can_port: can0
-    end_effector: teaching_handle
-    gravity_scale: 1.0
-    mounting: upright
-    debug_kp: [15.0, 15.0, 15.0, 3.0, 2.0, 2.0]
-    debug_kd: [4.62, 4.65, 2.25, 0.30, 0.24, 0.06]
-  - id: arm_2
-    name: 机械臂 2
-    namespace: /arm_2
-    can_port: can1
-    end_effector: teaching_handle
-    gravity_scale: 1.0
-    mounting: upright
-    debug_kp: [15.0, 15.0, 15.0, 3.0, 2.0, 2.0]
-    debug_kd: [4.62, 4.65, 2.25, 0.30, 0.24, 0.06]
-  - id: arm_3
-    name: 机械臂 3
-    namespace: /arm_3
-    can_port: can2
-    end_effector: gripper
-    gravity_scale: 1.0
-    mounting: upright
-    debug_kp: [15.0, 15.0, 15.0, 3.0, 2.0, 2.0]
-    debug_kd: [4.56, 4.60, 2.22, 0.29, 0.24, 0.05]
-  - id: arm_4
-    name: 机械臂 4
-    namespace: /arm_4
-    can_port: can3
-    end_effector: gripper
-    gravity_scale: 1.0
-    mounting: upright
-    debug_kp: [15.0, 15.0, 15.0, 3.0, 2.0, 2.0]
-    debug_kd: [4.56, 4.60, 2.22, 0.29, 0.24, 0.05]
+- id: arm_1
+  name: 机械臂 1
+  namespace: /arm_1
+  can_port: can0
+  end_effector: teaching_handle
+  gravity_scale: 1.0
+  mounting: upright
+  debug_kp:
+  - 15.0
+  - 15.0
+  - 15.0
+  - 3.0
+  - 2.0
+  - 2.0
+  debug_kd:
+  - 4.62
+  - 4.65
+  - 2.25
+  - 0.3
+  - 0.24
+  - 0.06
+  friction_scale: 0.85
+  friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml
+  gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_1_gravity.yaml
+- id: arm_2
+  name: 机械臂 2
+  namespace: /arm_2
+  can_port: can1
+  end_effector: teaching_handle
+  gravity_scale: 1.0
+  mounting: upright
+  debug_kp:
+  - 15.0
+  - 15.0
+  - 15.0
+  - 3.0
+  - 2.0
+  - 2.0
+  debug_kd:
+  - 4.62
+  - 4.65
+  - 2.25
+  - 0.3
+  - 0.24
+  - 0.06
+  friction_scale: 0.85
+  friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_2_friction.yaml
+  gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_2_gravity.yaml
+- id: arm_3
+  name: 机械臂 3
+  namespace: /arm_3
+  can_port: can2
+  end_effector: gripper
+  gravity_scale: 1.0
+  mounting: upright
+  debug_kp:
+  - 15.0
+  - 15.0
+  - 15.0
+  - 3.0
+  - 2.0
+  - 2.0
+  debug_kd:
+  - 4.56
+  - 4.6
+  - 2.22
+  - 0.29
+  - 0.24
+  - 0.05
+  friction_scale: 0.85
+  friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_3_friction.yaml
+  gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_3_gravity.yaml
+- id: arm_4
+  name: 机械臂 4
+  namespace: /arm_4
+  can_port: can3
+  end_effector: gripper
+  gravity_scale: 1.0
+  mounting: upright
+  debug_kp:
+  - 15.0
+  - 15.0
+  - 15.0
+  - 3.0
+  - 2.0
+  - 2.0
+  debug_kd:
+  - 4.56
+  - 4.6
+  - 2.22
+  - 0.29
+  - 0.24
+  - 0.05
+  friction_scale: 0.85
+  friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_4_friction.yaml
+  gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_4_gravity.yaml

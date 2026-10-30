@@ -31,14 +31,22 @@ def test_hardware_mapping_and_defaults(fleet_path):
     assert [arm.end_effector for arm in fleet.arms] == [
         'teaching_handle', 'teaching_handle', 'gripper', 'gripper']
     assert all(arm.gravity_scale == 1 for arm in fleet.arms)
+    assert all(0 < arm.friction_scale <= 1 for arm in fleet.arms)
+    assert all(arm.friction_config.endswith(f'{arm.id}_friction.yaml') for arm in fleet.arms)
+    assert all(fleet.friction_model(arm) is not None for arm in fleet.arms)
+    assert all(arm.gravity_config.endswith(f'{arm.id}_gravity.yaml') for arm in fleet.arms)
+    assert all(fleet.gravity_model(arm) is not None for arm in fleet.arms)
 
 
 @pytest.mark.parametrize('field,value', [
     ('gravity_scale', -0.01), ('gravity_scale', 1.01),
     ('gravity_scale', float('nan')), ('gravity_scale', True),
+    ('friction_scale', -0.01), ('friction_scale', 1.01),
+    ('friction_scale', float('nan')), ('friction_scale', True),
     ('end_effector', 'unknown'), ('mounting', 'sideways'),
     ('can_port', '../can0'), ('namespace', '/bad name'),
     ('debug_kp', [-1.0] * 6), ('debug_kd', [101.0] * 6),
+    ('friction_config', '/nonexistent/friction.yaml'),
 ])
 def test_invalid_configuration_is_rejected(fleet_path, field, value):
     data = yaml.safe_load(fleet_path.read_text())

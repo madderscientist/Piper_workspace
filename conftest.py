@@ -1,5 +1,9 @@
 """Hardware substitutes for tests only; never installed as a driver backend."""
 
+import os
+
+os.environ.setdefault('ROS_DOMAIN_ID', '97')
+
 import pytest
 
 from piper_x_driver.backend import Feedback, SdkArm, STATUS_FIELDS

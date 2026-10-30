@@ -47,17 +47,25 @@ def test_gravity_is_only_calculated_after_external_mit_acknowledgement(fake_arm)
 
 @pytest.mark.parametrize('effector', ['teaching_handle', 'gripper'])
 def test_default_gravity_added_exactly_once_and_live_scale_is_slewed(fake_arm, effector):
+    from piper_x_driver.backend import MAX_GRAVITY_OFFSET
+
     arm, control, clock, profile = setup_control(fake_arm, effector)
     control.power(True)
-    target = replace(command(arm.position[:6]), kp=(2.0,) * 6, torque=(0.1,) * 6)
+    target = replace(command(arm.position[:6]), kp=(4.0,) * 6, torque=(0.1,) * 6)
     control.mit(target)
     control.set_mode('mit')
     expected = gravity_torques(arm.position[:6], profile.mass_kg, profile.com_m)
     control.watchdog()
+    offsets = [
+        max(-MAX_GRAVITY_OFFSET, min(MAX_GRAVITY_OFFSET, g / kp))
+        for g, kp in zip(expected, target.kp)
+    ]
     assert arm.calls[-1][1].position == pytest.approx([
-        q + g / kp for q, g, kp in zip(target.position, expected, target.kp)
+        q + off for q, off in zip(target.position, offsets)
     ])
-    assert arm.calls[-1][1].torque == pytest.approx((0.1,) * 6)
+    assert arm.calls[-1][1].torque == pytest.approx([
+        0.1 + (g - off * kp) for g, off, kp in zip(expected, offsets, target.kp)
+    ])
     control.gravity_scale = 0.0
     for tick in range(1, 11):
         clock[0] = tick / 10
@@ -72,7 +80,12 @@ def test_default_gravity_added_exactly_once_and_live_scale_is_slewed(fake_arm, e
     control.mit(zero_kp)
     control.watchdog()
     assert arm.calls[-1][1].position == pytest.approx(target.position)
-    assert arm.calls[-1][1].torque == pytest.approx((0.1,) * 6)
+    assert arm.calls[-1][1].torque == pytest.approx([0.1 + g for g in expected])
+    zero_kd = replace(target, kd=(0.0,) * 6)
+    control.mit(zero_kd)
+    control.watchdog()
+    assert arm.calls[-1][1].position == pytest.approx(target.position)
+    assert arm.calls[-1][1].torque == pytest.approx([0.1 + g for g in expected])
 
 
 def test_mit_debug_start_initializes_from_measurement_and_never_enables(fake_arm):

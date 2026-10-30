@@ -332,7 +332,8 @@ def test_disable_changes_enable_flags_but_preserves_native_firmware_mode(fake_ar
     assert arm.status == status
 
 
-def test_sdk_waits_for_receive_fps_before_querying_firmware():
+@pytest.mark.parametrize('fw_version', ['S-V1.9-0', 'S-V1.9-1'])
+def test_sdk_waits_for_receive_fps_before_querying_firmware(fw_version):
     from unittest.mock import Mock
 
     robot = Mock()
@@ -340,7 +341,7 @@ def test_sdk_waits_for_receive_fps_before_querying_firmware():
 
     def firmware(**_):
         assert robot.get_fps.call_count == 3
-        return {'software_version': 'S-V1.9-0'}
+        return {'software_version': fw_version}
 
     robot.get_firmware.side_effect = firmware
     with patch('piper_x_driver.backend.AgxArmFactory.create_arm', return_value=robot):
@@ -405,7 +406,7 @@ def test_backend_mit_exit_and_close_enter_firmware_drag_mode(entrypoint):
 
 
 def test_sdk_mit_scales_post_reduction_kp_kd_and_calibrates_gravity_offset():
-    from piper_x_driver.backend import MIT_GAIN_SCALE, MitTarget
+    from piper_x_driver.backend import MAX_GRAVITY_OFFSET, MIT_GAIN_SCALE, MitTarget
 
     adapter = offline_adapter()
     sent = []
@@ -422,8 +423,60 @@ def test_sdk_mit_scales_post_reduction_kp_kd_and_calibrates_gravity_offset():
     assert len(sent) == 6
     for idx, (j, p_wire, v_wire, kp_wire, kd_wire, t_wire) in enumerate(sent):
         assert j == idx + 1
-        assert v_wire == 0.0 and t_wire == 0.0
+        assert v_wire == 0.0
+        assert abs(p_wire - base[idx]) <= MAX_GRAVITY_OFFSET + 1e-12
         assert kd_wire == pytest.approx(kd[idx] / MIT_GAIN_SCALE[idx])
         kp_uint = int(kp_wire * 4095 / 500.0)
         kp_realized = MIT_GAIN_SCALE[idx] * (kp_uint * 500.0 / 4095.0)
-        assert (p_wire - base[idx]) * kp_realized == pytest.approx(gravity[idx])
+        assert (p_wire - base[idx]) * kp_realized + t_wire == pytest.approx(gravity[idx])
+
+
+def test_controller_applies_configured_friction_compensation_in_mit(fake_arm):
+    from piper_x_driver.friction import ArmFrictionModel, JointFrictionModel, SpatialHarmonic
+
+    arm = fake_arm()
+    j1_model = JointFrictionModel(
+        fc=0.3, fs=0.6, vs=0.15, fv=0.1, v0=0.005, vr=0.4,
+        harmonics=(SpatialHarmonic(omega=36.0, a=0.12, b=-0.05, c=0.08, d=0.03),),
+    )
+    friction_model = ArmFrictionModel(arm_id='arm_1', joints={1: j1_model})
+    control = Controller(arm, friction_model=friction_model)
+    control.start_mit()
+    # Stationary arm: friction compensation is strictly 0.0
+    assert control.friction == (0.0,) * 6
+
+    # Moving J1 at slow velocity: friction compensation is added to MIT torque
+    base_snapshot = arm.snapshot
+    vel = (0.05, 0.0, 0.0, 0.0, 0.0, 0.0)
+    arm.snapshot = lambda: replace(base_snapshot(), velocity=vel)
+    arm.status['ctrl_mode'] = 1
+    arm.status['mode_feedback'] = 6
+    control.watchdog()
+    expected_f1 = j1_model.torque(arm.position[0], vel[0])
+    assert expected_f1 > 0.4
+    assert control.friction[0] == pytest.approx(expected_f1)
+    assert control.output_torque[0] == pytest.approx(expected_f1)
+    assert arm.calls[-1][1].torque[0] == pytest.approx(expected_f1)
+
+    # Zeroing friction_scale disables friction compensation
+    control.friction_scale = 0.0
+    control.friction_scale_applied = 0.0
+    control.watchdog()
+    assert control.friction == (0.0,) * 6
+    assert arm.calls[-1][1].torque[0] == pytest.approx(0.0)
+
+
+def test_controller_applies_configured_gravity_model_in_mit(fake_arm):
+    from piper_x_driver.gravity import ArmGravityModel, JointGravityModel, gravity_torques
+
+    arm = fake_arm()
+    g_model = ArmGravityModel(
+        arm_id='arm_1',
+        joints={2: JointGravityModel(scale=1.10, angle_offset=0.0, bias=-0.05, static_friction=0.7)},
+    )
+    control = Controller(arm, gravity_model=g_model)
+    control.start_mit()
+    cad = gravity_torques(arm.position[:6])
+    assert control.gravity[1] == pytest.approx(1.10 * cad[1] - 0.05)
+
+

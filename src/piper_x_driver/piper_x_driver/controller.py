@@ -6,9 +6,11 @@ import time
 
 from can import CanError
 
-from .backend import feedback_problem, fresh, MitTarget
+from .backend import (
+    feedback_problem, fresh, MAX_GRAVITY_OFFSET, MIT_KD_LSB, MIT_KP_LSB, MitTarget,
+)
 from .configuration import bounded
-from .gravity import gravity_torques
+from .gravity import gravity_torques, max_critical_kd
 
 MIT_POSITION_LIMIT = 12.5
 LOWER = (-MIT_POSITION_LIMIT,) * 6
@@ -30,18 +32,25 @@ def vector(values, name, lower, upper):
 
 class Controller:
     def __init__(self, arm, clock=time.monotonic, *, effector=None, gravity_scale=1.0,
+                 gravity_model=None,
+                 friction_scale=1.0, friction_model=None,
                  debug_kp=(15.0, 15.0, 15.0, 3.0, 2.0, 2.0),
-                 debug_kd=(4.62, 4.65, 2.25, 0.30, 0.24, 0.06)):
+                 debug_kd=None):
         self.arm = arm
         self.clock = clock
         self.mode = 'standby'
         self.mit_target = None
         self.mit_received = None
         self.effector = effector
+        self.gravity_model = gravity_model
+        self.friction_model = friction_model
         self.gravity_scale = bounded(gravity_scale, 'gravity_scale', 0, 1)
         self.gravity_scale_applied = self.gravity_scale
+        self.friction_scale = bounded(friction_scale, 'friction_scale', 0, 1)
+        self.friction_scale_applied = self.friction_scale
         self.gravity_updated = self.clock()
-        self.debug_kp, self.debug_kd = tuple(debug_kp), tuple(debug_kd)
+        self.debug_kp = tuple(debug_kp)
+        self.debug_kd = max_critical_kd(self.debug_kp) if debug_kd is None else tuple(debug_kd)
         self.debug_session = ''
         self.debug_desired = ()
         self.debug_target = ()
@@ -49,6 +58,7 @@ class Controller:
         self.mit_started = 0.0
         self.mit_ready = False
         self.gravity = (0.0,) * 6
+        self.friction = (0.0,) * 6
         self.output_torque = (0.0,) * 6
         self.hold_reason = ''
 
@@ -74,6 +84,8 @@ class Controller:
 
     def power(self, enabled):
         if enabled:
+            if hasattr(self.arm, 'leave_drag'):
+                self.arm.leave_drag()
             sample = self.healthy(enabled=False)
             assert sample.position is not None
             self.arm.power(True, sample.position[6])
@@ -86,7 +98,7 @@ class Controller:
         self.mit_target = None
         self.mit_received = None
         self.debug_session = ''
-        self.gravity = self.output_torque = (0.0,) * 6
+        self.gravity = self.friction = self.output_torque = (0.0,) * 6
         self.hold_reason = ''
 
     def start_mit(self):
@@ -97,6 +109,7 @@ class Controller:
             self.arm.mode('hold')
         command = self._gravity_command(sample)
         self.gravity_scale_applied = self.gravity_scale
+        self.friction_scale_applied = self.friction_scale
         self.gravity_updated = self.clock()
         self.mit_started = self.clock()
         self.mit_ready = (
@@ -112,6 +125,8 @@ class Controller:
             raise ValueError('MIT debugger owns this arm; stop/disable it first')
         if mode not in MODES:
             raise ValueError(f'Unknown mode {mode}; expected {MODES}')
+        if mode != 'drag' and hasattr(self.arm, 'leave_drag'):
+            self.arm.leave_drag()
         if mode != 'standby':
             sample = self.healthy()
             if mode == 'mit':
@@ -129,16 +144,19 @@ class Controller:
             self.mit_started = self.clock()
             self.mit_ready = False
             self.gravity_scale_applied = self.gravity_scale
+            self.friction_scale_applied = self.friction_scale
             self.gravity_updated = self.clock()
         else:
-            self.gravity = self.output_torque = (0.0,) * 6
+            self.gravity = self.friction = self.output_torque = (0.0,) * 6
 
     def require_mode(self, *modes):
+        if self.mode not in modes:
+            raise ValueError('Select the matching mode and wait for actual firmware feedback')
         sample = self.healthy()
         assert sample.status is not None
         expected = {'joint': 1, 'point': 0, 'linear': 2, 'mit': 6}
-        if (self.mode not in modes or sample.status['ctrl_mode'] != 1
-                or sample.status['mode_feedback'] != expected[self.mode]):
+        if (sample.status['ctrl_mode'] != 1
+                or sample.status['mode_feedback'] not in (expected[self.mode], 255)):
             raise ValueError('Select the matching mode and wait for actual firmware feedback')
         return sample
 
@@ -220,26 +238,86 @@ class Controller:
         )
 
     def _send_mit(self, command, sample):
+        """合成重力补偿与摩擦补偿，并下发六轴 MIT 指令。
+
+        电机驱动器底层 MIT 控制律：
+            tau_motor = kp * (p_des - q_meas) + kd * (v_des - dq_meas) + t_ff
+
+        本函数对各项力矩的叠加规则：
+        1. 重力矩 `gravity` (g)：
+           - 当关节有有效刚度与阻尼（kp、kd 均大于 CAN 最小量化步长）时，
+             优先折算为目标位置偏置 `offset = clip(g / kp)` 叠加到 `p_des = q_cmd + offset`，
+             使 kp * offset 产生重力支撑力矩；若 offset 被限幅（±MAX_GRAVITY_OFFSET 或 ±12.5 rad），
+             未折算完的剩余重力 `residual = g - offset * kp` 补入前馈力矩 `t_ff`。
+           - 当 kp 或 kd 为 0（如纯力矩透传 / 零刚度主臂）时，无法通过位置偏置产生力矩，
+             此时 `offset = 0`，全部重力矩 `residual = g` 直接进入 `t_ff`。
+        2. 摩擦力矩 `friction` (f)：
+           - 根据当前实测位置 `sample.position[:6]` 与速度计算的摩擦+齿槽补偿力矩，
+             不改变目标位置 `p_des`，直接叠加到前馈力矩 `t_ff` 上。
+        3. 最终合成输出：
+           - 发送位置：`positions[i] = command.position[i] + offset`
+           - 发送前馈力矩：`torques[i] = command.torque[i] + residual + f`
+        """
         assert sample.position is not None
         model = {} if self.effector is None else {
             'mass_kg': self.effector.mass_kg, 'com_m': self.effector.com_m}
         now = self.clock()
         dt = max(0.0, now - self.gravity_updated)
+        # 重力补偿与摩擦补偿比例因子均按最大 1.0/s 斜率平滑过渡，避免突变跳变
         self.gravity_scale_applied += max(
             -dt, min(dt, self.gravity_scale - self.gravity_scale_applied))
+        self.friction_scale_applied += max(
+            -dt, min(dt, self.friction_scale - self.friction_scale_applied))
         self.gravity_updated = now
-        gravity = tuple(self.gravity_scale_applied * value for value in
-                        gravity_torques(sample.position[:6], **model))
-        offset = tuple(
-            0.0 if kp == 0 else value / kp
-            for value, kp in zip(gravity, command.kp)
+        # 1. 计算当前姿态下的六轴重力补偿力矩 g = gravity_scale_applied * g_model(q) (Nm)
+        raw_gravity = (
+            gravity_torques(sample.position[:6], **model)
+            if self.gravity_model is None
+            else self.gravity_model.torques(sample.position[:6], **model)
         )
-        position = tuple(a + b for a, b in zip(command.position, offset))
-        torque = tuple(command.torque)
-        output = MitTarget(position, tuple(command.velocity),
-                           tuple(command.kp), tuple(command.kd), torque, offset)
+        gravity = tuple(self.gravity_scale_applied * value for value in raw_gravity)
+        # 2. 计算当前位置与速度下的六轴摩擦力补偿力矩 f = friction_scale_applied * f_model(q, dq) (Nm)
+        velocity = (
+            sample.velocity[:6]
+            if len(sample.velocity) >= 6
+            else tuple(command.velocity)
+        )
+        friction = (
+            (0.0,) * 6
+            if self.friction_model is None or self.friction_scale_applied == 0.0
+            else tuple(
+                self.friction_scale_applied * value
+                for value in self.friction_model.torques(sample.position[:6], velocity)
+            )
+        )
+        # 3. 逐轴合成目标位置 (q + offset) 与前馈力矩 t_ff (t_cmd + residual + f)
+        offsets, positions, torques = [], [], []
+        for idx, (q, g, f, kp, kd, t_cmd) in enumerate(zip(
+            command.position, gravity, friction, command.kp, command.kd, command.torque,
+        )):
+            if kd < MIT_KD_LSB[idx] or round(kp / MIT_KP_LSB[idx]) <= 0:
+                # 零刚度或零阻尼：重力无法折算为位置偏置，全部进入 t_ff
+                offset = 0.0
+                residual = g
+            else:
+                # 有刚度：重力优先折算为位置偏置 offset = g / kp，截断超出部分作为 residual 进入 t_ff
+                lo = max(-MAX_GRAVITY_OFFSET, -MIT_POSITION_LIMIT - q)
+                hi = min(MAX_GRAVITY_OFFSET, MIT_POSITION_LIMIT - q)
+                raw = g / kp
+                offset = max(lo, min(hi, raw))
+                residual = 0.0 if offset == raw else g - offset * kp
+            offsets.append(offset)
+            positions.append(q + offset)
+            # 前馈力矩 = 外部指令力矩 t_cmd + 重力截断残差 residual + 摩擦力矩 f
+            torques.append(t_cmd + residual + f)
+        output = MitTarget(
+            tuple(positions), tuple(command.velocity),
+            tuple(command.kp), tuple(command.kd), tuple(torques), tuple(offsets),
+        )
         self.arm.mit(output)
-        self.gravity, self.output_torque = gravity, torque
+        self.gravity, self.friction, self.output_torque = (
+            gravity, friction, tuple(torques),
+        )
 
     def gripper(self, command):
         self.healthy()

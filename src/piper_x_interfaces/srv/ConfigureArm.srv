@@ -1,5 +1,6 @@
 string end_effector
 float64 gravity_scale
+float64 friction_scale -1.0
 ---
 bool success
 string message

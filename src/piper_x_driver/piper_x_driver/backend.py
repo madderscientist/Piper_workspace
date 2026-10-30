@@ -8,7 +8,7 @@ from typing import Literal
 from can import CanError
 from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
 from pyAgxArm.protocols.can_protocol.msgs.piper.default import (
-    ArmMsgLeaderFollowerModeConfig, ArmMsgMotionCtrl,
+    ArmMsgLeaderFollowerModeConfig, ArmMsgMotionCtrl, ArmMsgParamEnquiryAndConfig,
 )
 
 
@@ -26,7 +26,12 @@ FEEDBACK_FIELDS = (
 ) + tuple(f'driver{i}(0x{0x260 + i:X})' for i in _JOINTS)
 MIT_GAIN_SCALE = (24.75, 24.75, 28.41, 2.10, 1.36, 1.0)
 _MIT_KP_MAX = 500.0
+_MIT_KD_SPAN = 10.0
 _MIT_KP_STEPS = 4095
+MIT_KP_LSB = tuple(scale * _MIT_KP_MAX / _MIT_KP_STEPS for scale in MIT_GAIN_SCALE)
+MIT_KD_LSB = tuple(scale * _MIT_KD_SPAN / _MIT_KP_STEPS for scale in MIT_GAIN_SCALE)
+MAX_GRAVITY_OFFSET = 1.0
+SUPPORTED_FIRMWARE = ('S-V1.9-0', 'S-V1.9-1')
 
 
 @dataclass(frozen=True)
@@ -96,11 +101,13 @@ class SdkArm:
                     self.robot.get_firmware(timeout=0.5, min_interval=0.0)
                 )
                 if (identity is not None
-                        and identity['software_version'].strip('\x00 ') == 'S-V1.9-0'):
+                        and identity['software_version'].strip('\x00 ') in SUPPORTED_FIRMWARE):
                     break
                 time.sleep(0.05)
-            if identity is None or identity['software_version'].strip('\x00 ') != 'S-V1.9-0':
-                raise RuntimeError(f'{channel}: expected S-V1.9-0, received {identity}')
+            if (identity is None
+                    or identity['software_version'].strip('\x00 ') not in SUPPORTED_FIRMWARE):
+                raise RuntimeError(
+                    f'{channel}: expected {SUPPORTED_FIRMWARE}, received {identity}')
             self.robot.set_auto_set_motion_mode_enabled(False)
             # Do not silently clamp raw angles to the SDK model's preset workspace.
             self.robot.set_joint_limits_enabled(False)
@@ -133,6 +140,19 @@ class SdkArm:
         self._powered = False
         self.mit_output = None
 
+    def leave_drag(self):
+        if self._mode != 'drag':
+            return
+        if hasattr(self, 'robot'):
+            self.robot.set_follower_mode()
+        self._mode = 'standby'
+        if self._real_sdk():
+            deadline = time.monotonic() + 1.0
+            while not fresh(self.snapshot().age):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+
     def retain_mit(self):
         if self.mit_output is None:
             raise RuntimeError('No transmitted MIT output available to retain')
@@ -162,6 +182,20 @@ class SdkArm:
             if grip.msg.mode != 'width':
                 raise ValueError('This workspace requires width-mode gripper feedback')
             position = tuple(joint.msg) + (float(grip.msg.value),)
+        elif self._mode == 'drag' and self._real_sdk():
+            leader_parts = [
+                getattr(parser, name, None)
+                for name in ('leader_joint_12', 'leader_joint_34', 'leader_joint_56')
+            ]
+            leader_stamps = [getattr(x, 'timestamp', None) for x in leader_parts]
+            if all(s is not None and 0 <= now - s <= 1.0 for s in leader_stamps):
+                leader = self.robot.get_leader_joint_angles()
+                if leader is not None:
+                    width = 0.0 if grip is None else float(grip.msg.value)
+                    position = tuple(leader.msg) + (width,)
+                    ages = tuple(
+                        now - s if s is not None else -1.0 for s in leader_stamps
+                    ) + (0.0,) + ages[4:]
         enabled = tuple(
             item is not None and item.msg.foc_status.driver_enable_status for item in drivers
         ) + (grip is not None and grip.msg.foc_status.driver_enable_status,)
@@ -185,15 +219,19 @@ class SdkArm:
                                'result unknown, inspect feedback before any further operation')
 
     def power(self, enabled, width=0.0):
-        if self._mode == 'drag' and hasattr(self, 'robot'):
-            self.robot.set_follower_mode()
+        self.leave_drag()
         self._write_power(enabled, width if enabled else 0.0)
         if self._real_sdk():
             deadline = time.monotonic() + 1.5
+            next_retry = time.monotonic() + 0.12
             while (not all(self.snapshot().enabled[:6]) if enabled
                    else any(self.snapshot().enabled)):
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if now >= deadline:
                     break
+                if now >= next_retry:
+                    self._write_power(enabled, width if enabled else 0.0)
+                    next_retry = now + 0.12
                 time.sleep(0.02)
         self._powered = bool(enabled)
         if not enabled:
@@ -229,6 +267,9 @@ class SdkArm:
     def _write_mode(self, name):
         if name == 'drag':
             if self._real_sdk():
+                # 切入固件内置零力拖动前，将固件末端负载档位设为满载（0x477: set_end_load=0x02）
+                self.robot._send_msg(ArmMsgParamEnquiryAndConfig(
+                    end_load_param_setting_effective=0xAE, set_end_load=0x02))
                 self.gripper.disable_gripper()
                 self.robot._send_msg(ArmMsgLeaderFollowerModeConfig(
                     linkage_config=0xFA, linkage_offset=0x10))
@@ -238,21 +279,28 @@ class SdkArm:
                 self.robot.set_leader_mode()
                 self.robot.restore_leader_drag_mode()
             return
-        if self._mode == 'drag':
-            self.robot.set_follower_mode()
+        self.leave_drag()
         if name == 'hold':
             self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=2))
         elif name == 'standby':
             self.robot._send_msg(self.robot._MSG_ModeCtrl(ctrl_mode=0))
         else:
-            self.robot.set_motion_mode(_MOTION_MODES[name])
+            mode_code = _MOTION_MODES[name]
+            self.robot.set_motion_mode(mode_code)
+            if self._mode == 'mit' and name != 'mit' and self._real_sdk():
+                time.sleep(0.02)
+                self.robot.set_motion_mode(mode_code)
 
     def joints(self, position, speed):
         self.robot.set_speed_percent(speed)
+        if self._real_sdk():
+            self.robot.set_motion_mode('j')
         self.robot.move_j(list(position))
 
     def cartesian(self, pose, speed, mode):
         self.robot.set_speed_percent(speed)
+        if self._real_sdk():
+            self.robot.set_motion_mode('p' if mode == 'point' else 'l')
         (self.robot.move_p if mode == 'point' else self.robot.move_l)(list(pose))
 
     def mit(self, command):
@@ -265,6 +313,18 @@ class SdkArm:
         self.mit_output = output
 
     def _write_mit(self, command):
+        """将关节侧 MIT 指令转换为 CAN 线侧参数并校准 12 位 kp 量化误差。
+
+        注意：
+        - 上层传入的 `kp`、`kd` 均为减速器输出端（关节侧）物理量；
+          底层驱动器直接按电机侧尺度计算 PD，放大倍数为 `scale = MIT_GAIN_SCALE[index]`。
+        - 上层传入的 `torque`（含外部 t_cmd + 重力残差 + 摩擦力矩 f）已经是关节侧 Nm，
+          SDK 的 `move_mit` 内部会自动做力矩常数换算。
+        - 因为 CAN 帧中 `kp` 只有 12 bit（4095 步），量化后的实际关节刚度 `kp_realized`
+          与理想 `kp` 存在微小偏差。这里将位置偏置重标定为 `wire_offset = offset * (kp / kp_realized)`，
+          若 `wire_offset` 被限幅，则把差值 `offset * kp - wire_offset * kp_realized` 补回 `torque` (t_ff)，
+          保证 `wire_offset * kp_realized + torque` 严格等于期望的总补偿力矩。
+        """
         offsets = getattr(command, 'gravity_offset', (0.0,) * 6)
         for index, joint in enumerate(_JOINTS):
             scale = MIT_GAIN_SCALE[index]
@@ -272,19 +332,35 @@ class SdkArm:
             kd = command.kd[index]
             position = command.position[index]
             offset = offsets[index] if index < len(offsets) else 0.0
-            if kp <= 0.0:
-                kp_wire = 0.0
+            # 还原未叠加重力位置偏置前的原始目标角度 base_pos
+            base_pos = position - offset
+            # torque 初始已包含：command.torque + 重力截断残差 residual + 摩擦力矩 friction
+            torque = command.torque[index]
+            raw_uint = round(kp / MIT_KP_LSB[index]) if kp > 0.0 else 0
+            if raw_uint <= 0 or kd < MIT_KD_LSB[index]:
+                # kp 或 kd 低于最小量化步长时，不通过位置偏置输出重力，将 offset * kp 退回 t_ff
+                kp_wire = 0.0 if raw_uint <= 0 else (
+                    (min(_MIT_KP_STEPS, raw_uint) + 0.25) * _MIT_KP_MAX / _MIT_KP_STEPS
+                )
+                position = max(-12.5, min(12.5, base_pos))
+                torque += offset * kp
             else:
-                kp_uint = max(
-                    1, min(_MIT_KP_STEPS, round((kp / scale) * _MIT_KP_STEPS / _MIT_KP_MAX)))
+                # 计算 12 位无符号量化后的线侧 kp_wire 与实际生效的关节刚度 kp_realized
+                kp_uint = min(_MIT_KP_STEPS, raw_uint)
                 kp_wire = (kp_uint + 0.25) * _MIT_KP_MAX / _MIT_KP_STEPS
                 kp_realized = scale * (kp_uint * _MIT_KP_MAX / _MIT_KP_STEPS)
                 if offset != 0.0:
-                    position = max(
-                        -12.5, min(12.5, position - offset + offset * (kp / kp_realized)))
+                    lo = max(-MAX_GRAVITY_OFFSET, -12.5 - base_pos)
+                    hi = min(MAX_GRAVITY_OFFSET, -base_pos + 12.5)
+                    # 按实际量化刚度 kp_realized 缩放位置偏置，未覆盖的残差补入 torque (t_ff)
+                    wire_offset = max(lo, min(hi, offset * (kp / kp_realized)))
+                    position = base_pos + wire_offset
+                    torque += offset * kp - wire_offset * kp_realized
+                else:
+                    position = max(-12.5, min(12.5, position))
             self.robot.move_mit(
                 joint, position, command.velocity[index],
-                kp_wire, max(0.0, min(5.0, kd / scale)), command.torque[index],
+                kp_wire, max(0.0, min(5.0, kd / scale)), torque,
             )
 
     def grip(self, width, effort):

@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import json
+import math
 import os
 import select
 import signal
@@ -19,11 +20,10 @@ from piper_x_interfaces.srv import (
 )
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
-from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
@@ -54,6 +54,9 @@ class DriverNode(Node):
         self.control = Controller(
             self.arm, effector=self.fleet.effectors[self.arm_config.end_effector],
             gravity_scale=self.arm_config.gravity_scale,
+            gravity_model=self.fleet.gravity_model(self.arm_config),
+            friction_scale=self.arm_config.friction_scale,
+            friction_model=self.fleet.friction_model(self.arm_config),
             debug_kp=self.arm_config.debug_kp, debug_kd=self.arm_config.debug_kd)
         self.last_error = ''
         self.teaching_active = False
@@ -108,6 +111,7 @@ class DriverNode(Node):
             if self.control.debug_session:
                 raise ValueError('MIT debugger owns this arm; external commands rejected')
             handler(message)
+            self.last_error = ''
         except (ValueError, RuntimeError, CanError) as error:
             self._error(error)
 
@@ -122,12 +126,26 @@ class DriverNode(Node):
                         or not fresh(sample.age[3:4] + sample.age[5:])):
                     raise ValueError('Stop MIT/teaching and confirm all seven axes disabled '
                                      'before changing the end effector')
+            raw_friction_scale = getattr(request, 'friction_scale', -1.0)
+            friction_scale = (
+                self.arm_config.friction_scale
+                if raw_friction_scale == -1.0
+                else raw_friction_scale
+            )
             updated = self.fleet.save_arm(
-                self.arm_config, request.end_effector, request.gravity_scale)
+                self.arm_config, request.end_effector, request.gravity_scale, friction_scale)
             self.fleet = updated
             self.arm_config = updated.arm(self.arm_config.id)
             self.control.effector = updated.effectors[self.arm_config.end_effector]
             self.control.gravity_scale = self.arm_config.gravity_scale
+            if self.arm_config.gravity_scale == 0.0:
+                self.control.gravity_scale_applied = 0.0
+            self.control.gravity_model = updated.gravity_model(self.arm_config)
+            self.control.friction_scale = self.arm_config.friction_scale
+            if self.arm_config.friction_scale == 0.0:
+                self.control.friction_scale_applied = 0.0
+            self.control.friction_model = updated.friction_model(self.arm_config)
+            self.last_error = ''
             response.success = True
             response.message = 'Configuration saved and applied; no power or mode change'
         except (ValueError, RuntimeError, OSError, yaml.YAMLError) as error:
@@ -153,6 +171,7 @@ class DriverNode(Node):
                 self.control.debug_stop(request.session)
             else:
                 raise ValueError('Unknown MIT debugging action')
+            self.last_error = ''
             response.success = True
             response.message = 'Request accepted; inspect actual mode and enable feedback'
         except (ValueError, RuntimeError, CanError) as error:
@@ -263,8 +282,10 @@ class DriverNode(Node):
             'debug_target': self.control.debug_target if self.control.debug_session else None,
             'joint_lower': list(SLIDER_LOWER), 'joint_upper': list(SLIDER_UPPER),
             'gravity_torque': list(self.control.gravity),
+            'friction_torque': list(self.control.friction),
             'output_torque': list(self.control.output_torque),
             'gravity_scale_applied': self.control.gravity_scale_applied,
+            'friction_scale_applied': self.control.friction_scale_applied,
             'holding': bool(self.control.hold_reason),
             'hold_reason': self.control.hold_reason,
             'calibration_active': self.calibration_active,
@@ -293,6 +314,7 @@ class DriverNode(Node):
                 await future
             finally:
                 self.destroy_timer(timer)
+            self.last_error = ''
             response.enable_response = True
             response.message = 'Fresh feedback confirms all seven enable flags'
         except (ValueError, RuntimeError, CanError) as error:
@@ -329,12 +351,21 @@ class DriverNode(Node):
         try:
             if self.calibration_active:
                 raise ValueError('Wait for effector calibration to finish before changing modes')
+            if request.mode != 'drag' and hasattr(self.arm, 'leave_drag'):
+                self.arm.leave_drag()
+            if (request.mode == 'mit' and not self.control.debug_session
+                    and (self.control.mit_target is None or self.control.mit_received is None
+                         or self.control.clock() - self.control.mit_received > 0.2)):
+                sample = self.control.healthy()
+                self.control.mit(self.control._gravity_command(sample))
             self.control.set_mode(request.mode)
+            self.last_error = ''
             response.success = True
             response.message = 'Request sent; inspect ctrl_mode/mode_feedback/teach_status'
         except (ValueError, RuntimeError, CanError) as error:
             self._error(error)
             response.message = str(error)
+        self._publish_control_state()
         return response
 
     def _publish(self):
@@ -381,9 +412,14 @@ class DriverNode(Node):
             message.header.stamp, message.header.frame_id = stamp, 'base_link'
             (message.pose.position.x, message.pose.position.y,
              message.pose.position.z) = sample.pose[:3]
-            quaternion = Rotation.from_euler('xyz', sample.pose[3:]).as_quat()
-            (message.pose.orientation.x, message.pose.orientation.y,
-             message.pose.orientation.z, message.pose.orientation.w) = map(float, quaternion)
+            rx, ry, rz = (0.5 * v for v in sample.pose[3:])
+            cx, sx = math.cos(rx), math.sin(rx)
+            cy, sy = math.cos(ry), math.sin(ry)
+            cz, sz = math.cos(rz), math.sin(rz)
+            message.pose.orientation.x = float(sx * cy * cz - cx * sy * sz)
+            message.pose.orientation.y = float(cx * sy * cz + sx * cy * sz)
+            message.pose.orientation.z = float(cx * cy * sz - sx * sy * cz)
+            message.pose.orientation.w = float(cx * cy * cz + sx * sy * sz)
             self.pose_pub.publish(message)
 
     def destroy_node(self):
@@ -419,8 +455,11 @@ def main(args=None):
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
     tty_fd = None
+    executor = None
     try:
         node = DriverNode()
+        executor = SingleThreadedExecutor()
+        executor.add_node(node)
         if node.arm_config.id == node.fleet.arms[0].id:
             try:
                 tty_fd = os.open('/dev/tty', os.O_RDONLY | os.O_NONBLOCK)
@@ -435,7 +474,7 @@ def main(args=None):
                             node.teaching_start_client.call_async(Trigger.Request())
                 except OSError:
                     pass
-            rclpy.spin_once(node, timeout_sec=0.1)
+            executor.spin_once(timeout_sec=0.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
@@ -444,6 +483,8 @@ def main(args=None):
                 os.close(tty_fd)
             except OSError:
                 pass
+        if executor is not None:
+            executor.shutdown()
         if node is not None:
             node.destroy_node()
         rclpy.try_shutdown()
