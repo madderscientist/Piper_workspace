@@ -1,0 +1,33 @@
+version: 1
+arm_id: arm_1
+joints:
+  joint1:
+    scale: 1.0
+    angle_offset: 0.0
+    bias: 0.0
+    static_friction: 0.433799
+  joint2:
+    scale: 1.055257
+    angle_offset: 0.0
+    bias: 0.0
+    static_friction: 0.897958
+  joint3:
+    scale: 1.119697
+    angle_offset: 0.0
+    bias: 0.0
+    static_friction: 0.791871
+  joint4:
+    scale: 1.03
+    angle_offset: 0.0
+    bias: 0.0
+    static_friction: 0.119909
+  joint5:
+    scale: 1.0
+    angle_offset: 0.0
+    bias: 0.0
+    static_friction: 0.096016
+  joint6:
+    scale: 0.0
+    angle_offset: 0.0
+    bias: 0.0
+    static_friction: 0.060287

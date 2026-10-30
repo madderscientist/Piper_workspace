@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PiPER-X 重力与静摩擦标定工作台</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="page-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">G</span>
+        <div>
+          <h1>PiPER-X 关节重力补偿与静摩擦标定工作台</h1>
+        </div>
+        <span class="version">piper_gravity · 双向准静态逼近 / 半和半差解耦</span>
+      </div>
+      <div class="header-right">
+        <span id="ros-badge" class="transport-badge">
+          <span class="dot offline" id="ros-dot"></span>
+          <strong id="ros-text">离线演示模式</strong>
+        </span>
+        <span id="clock" class="clock">--:--:--</span>
+      </div>
+    </header>
+
+    <section class="workflow-banner" aria-label="标定五步流程">
+      <div class="wf-step active" id="wf-step-1" data-step="1">
+        <div class="wf-num">①</div>
+        <div class="wf-body">
+          <strong>选择 CAN 口（单臂）</strong>
+          <span>关闭重/摩擦补偿，检查六轴实时重力偏差</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-2" data-step="2">
+        <div class="wf-num">②</div>
+        <div class="wf-body">
+          <strong>配置双向逐点逼近计划</strong>
+          <span>设置各轴采样点数、预行程与停稳时间</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-3" data-step="3">
+        <div class="wf-num">③</div>
+        <div class="wf-body">
+          <strong>正向/反向阶梯逼近采样</strong>
+          <span>或直接导入已有 CSV / 生成六轴仿真数据</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-4" data-step="4">
+        <div class="wf-num">④</div>
+        <div class="wf-body">
+          <strong>半和算重力 · 半差算静摩擦</strong>
+          <span>拟合 scale / angle_offset / bias 与静摩擦 Fs</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-5" data-step="5">
+        <div class="wf-num">⑤</div>
+        <div class="wf-body">
+          <strong>导出重力 YAML 并同步 Fs</strong>
+          <span>一键写入 arm_X_gravity.yaml 并更新摩擦 Fs</span>
+        </div>
+      </div>
+    </section>
+
+    <div id="notice-bar" class="notice-bar" hidden role="status"></div>
+
+    <div class="workbench-grid">
+      <section class="column col-left" aria-label="步骤一至三：设备选择、双向逼近计划与采集">
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ①</span>
+              <h2>选择目标 CAN 口（单台机械臂）与补偿开关</h2>
+            </div>
+            <span class="sub-badge" id="selected-arm-summary">can0 · /arm_1</span>
+          </header>
+          <p class="helper-note">
+            <strong>双向准静态逼近原理（在现有重力补偿基础上测量）：</strong>
+            采样时<strong>保持重力补偿开启（<code>gravity_scale=1.0</code> 防止机械臂失重下垂碰桌）</strong>，仅关闭摩擦补偿（<code>friction_scale=0.0</code>），让目标关节从正、反两个方向缓慢逼近同一组目标角度点 <code>q*</code> 并停稳。总平衡力矩 <code>τ± = τ_g,applied + kp·(q* − q±)</code> 的<strong>半和</strong>抵消静摩擦得到<strong>真实重力矩 τ_g(q*)</strong>，<strong>半差</strong>抵消重力得到<strong>静摩擦 Fs(q*)</strong>。
+          </p>
+
+          <div class="arm-selector" id="arm-selector" role="radiogroup" aria-label="选择 CAN 口与机械臂"></div>
+
+          <div class="telemetry-box">
+            <div class="telemetry-header">
+              <strong>当前选中机械臂六轴实时状态</strong>
+              <div class="header-actions">
+                <span id="arm-scales-badge" class="pill">gravity: 1.00 | friction: 0.50</span>
+                <button type="button" id="btn-zero-scales" class="btn-xs" title="标定前将驱动重力与摩擦补偿倍率均设为 0">关闭补偿 (0, 0)</button>
+                <button type="button" id="btn-restore-scales" class="btn-xs" title="恢复驱动重力与摩擦补偿">恢复补偿 (1, 0.5)</button>
+                <span id="arm-live-status" class="pill">等待遥测</span>
+              </div>
+            </div>
+            <table class="data-table compact" aria-label="六轴实时状态表">
+              <thead>
+                <tr>
+                  <th>关节</th>
+                  <th>使能</th>
+                  <th>实测角 q (rad)</th>
+                  <th>实测力矩 τ_meas (Nm)</th>
+                  <th>CAD 重力 τ_cad (Nm)</th>
+                  <th>标定重力 τ_cal (Nm)</th>
+                  <th>标定状态</th>
+                </tr>
+              </thead>
+              <tbody id="live-joints-tbody"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ②</span>
+              <h2>配置 J1～J6 双向准静态逼近计划</h2>
+            </div>
+            <div class="header-actions">
+              <button type="button" id="btn-select-gravity-joints" class="btn-xs">仅选重力轴 (J2~J5)</button>
+              <button type="button" id="btn-select-all-joints" class="btn-xs">全选 J1~J6</button>
+            </div>
+          </header>
+
+          <table class="data-table plan-table" aria-label="六关节双向逼近计划表">
+            <thead>
+              <tr>
+                <th>队列</th>
+                <th>关节</th>
+                <th>起点 q_min (rad)</th>
+                <th>终点 q_max (rad)</th>
+                <th>物理特性说明</th>
+                <th>单轴操作</th>
+              </tr>
+            </thead>
+            <tbody id="plan-tbody"></tbody>
+          </table>
+
+          <div class="form-grid" style="margin-top: 10px;">
+            <label class="field">
+              <span>采样点数 (num_points)</span>
+              <input type="number" id="input-num-points" value="9" min="3" max="40" step="1" />
+            </label>
+            <label class="field">
+              <span>双向预行程 (pre_travel, rad)</span>
+              <input type="number" id="input-pre-travel" value="0.04" min="0.01" max="0.25" step="0.01" />
+            </label>
+            <label class="field">
+              <span>逼近速度 (rad/s)</span>
+              <input type="number" id="input-approach-speed" value="0.05" min="0.02" max="0.30" step="0.01" />
+            </label>
+            <label class="field">
+              <span>单点停稳时间 (s)</span>
+              <input type="number" id="input-settle-time" value="0.60" min="0.20" max="2.00" step="0.05" />
+            </label>
+            <label class="field">
+              <span>力矩信号源</span>
+              <select id="select-torque-source">
+                <option value="auto" selected>自动 (优先 kp·位置误差)</option>
+                <option value="kp_error">MIT 刚度位置误差 kp·(q* - q)</option>
+                <option value="motor_torque">电机实测力矩反馈 τ_meas</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>自动保存重力 YAML 路径</span>
+              <input type="text" id="input-output-yaml" value="/home/a/piper_x_ws/src/piper_gravity/config/arm_1_gravity.yaml" />
+            </label>
+          </div>
+        </article>
+
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ③</span>
+              <h2>执行双向逐点逼近采样 或 离线拟合</h2>
+            </div>
+            <span class="sub-badge" id="probe-phase-badge">idle</span>
+          </header>
+
+          <div class="action-row">
+            <button type="button" id="btn-start-queue" class="btn-primary">▶ 按序执行勾选关节双向逼近</button>
+            <button type="button" id="btn-stop-probe" class="btn-danger">■ 停止采样</button>
+            <button type="button" id="btn-demo-all" class="btn-secondary">⚡ 一键生成 J1~J6 仿真数据并拟合</button>
+          </div>
+
+          <div class="progress-box">
+            <div class="progress-meta">
+              <span id="probe-progress-label">等待开始</span>
+              <span id="probe-sample-count">0 样本</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill" id="probe-progress-fill" style="width: 0%"></div>
+            </div>
+          </div>
+
+          <details class="csv-details" style="margin-top: 10px;">
+            <summary>从已有 CSV 文件导入拟合（兼容 piper_gravity 探针 CSV 与 piper_friction 扫描 CSV）</summary>
+            <div class="csv-import-box">
+              <input type="file" id="input-csv-file" accept=".csv" />
+              <button type="button" id="btn-fit-csv" class="btn-secondary">上传并拟合此 CSV</button>
+            </div>
+          </details>
+        </article>
+      </section>
+
+      <section class="column col-right" aria-label="步骤四至五：半和/半差解耦曲线与参数导出">
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ④</span>
+              <h2>双向半和（重力 τ_g）与半差（静摩擦 Fs）可视化</h2>
+            </div>
+            <div class="joint-tabs" id="joint-tabs" role="tablist"></div>
+          </header>
+
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <span class="kpi-label">重力比例系数 scale</span>
+              <strong class="kpi-val" id="kpi-scale">1.0000</strong>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-label">零位角偏置 angle_offset</span>
+              <strong class="kpi-val" id="kpi-offset">0.000°</strong>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-label">重力常值偏置 bias</span>
+              <strong class="kpi-val" id="kpi-bias">0.0000 Nm</strong>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-label">实测静摩擦 Fs (均值 / P85)</span>
+              <strong class="kpi-val" id="kpi-fs">0.000 / 0.000 Nm</strong>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-label">重力 RMSE (CAD → 标定后)</span>
+              <strong class="kpi-val" id="kpi-rmse">-- → -- Nm</strong>
+            </div>
+          </div>
+
+          <div class="charts-stack">
+            <div class="chart-box">
+              <div class="chart-title">
+                <strong>图 1：正向/反向平衡力矩与半和重力曲线 τ_g(θ)</strong>
+                <span>蓝虚线: 正向 τ⁺(θ) | 橙虚线: 反向 τ⁻(θ) | 灰线: 原始 CAD 重力 | 绿实线: 标定后重力模型</span>
+              </div>
+              <canvas id="canvas-gravity" width="760" height="220"></canvas>
+            </div>
+            <div class="chart-box">
+              <div class="chart-title">
+                <strong>图 2：双向半差提取的静摩擦分布 Fs(θ) = ½|τ⁺(θ) − τ⁻(θ)|</strong>
+                <span>紫实线: 实测静摩擦随角度分布 | 绿虚线: 标定静摩擦均值 Fs</span>
+              </div>
+              <canvas id="canvas-stiction" width="760" height="170"></canvas>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ⑤</span>
+              <h2>整臂重力参数 YAML 导出与摩擦 Fs 同步</h2>
+            </div>
+          </header>
+          <div class="form-grid">
+            <label class="field">
+              <span>重力模型保存路径 (gravity_config)</span>
+              <input type="text" id="input-save-gravity-path" value="/home/a/piper_x_ws/src/piper_gravity/config/arm_1_gravity.yaml" />
+            </label>
+            <label class="field">
+              <span>可选同步静摩擦 Fs 至摩擦配置 (friction_config)</span>
+              <input type="text" id="input-sync-friction-path" value="/home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml" />
+            </label>
+          </div>
+          <div class="action-row" style="margin-top: 8px;">
+            <button type="button" id="btn-save-yaml" class="btn-primary">💾 保存重力 YAML 并同步静摩擦 Fs</button>
+            <button type="button" id="btn-copy-yaml" class="btn-secondary">📋 一键复制 YAML</button>
+            <button type="button" id="btn-download-yaml" class="btn-secondary">⬇ 下载 YAML 文件</button>
+          </div>
+          <pre class="yaml-preview" id="yaml-preview"># 尚未生成重力标定参数</pre>
+        </article>
+      </section>
+    </div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
