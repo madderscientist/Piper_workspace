@@ -123,22 +123,38 @@ def test_master_slave_mode_controls_slaves_with_position_folded_gravity():
         for index, (driver, base_target) in enumerate(zip(
             drivers, (master_1[:6], master_2[:6], master_1[:6], master_2[:6]),
         )):
+            from piper_x_driver.backend import MAX_GRAVITY_OFFSET
+
             profile = driver.fleet.effectors[driver.arm_config.end_effector]
-            expected_g = gravity_torques(base_target, profile.mass_kg, profile.com_m)
-            expected_pos = [
-                q + g / k for q, g, k in zip(base_target, expected_g, kp)
-            ]
-            spin_until(executor, lambda d=driver, g=expected_g, p=expected_pos: (
+            g_model = driver.control.gravity_model
+            expected_g = (
+                gravity_torques(base_target, profile.mass_kg, profile.com_m)
+                if g_model is None
+                else g_model.torques(base_target, profile.mass_kg, profile.com_m)
+            )
+            is_master = index in (0, 1)
+            offsets = (0.0,) * 6 if is_master else tuple(
+                max(-MAX_GRAVITY_OFFSET, min(MAX_GRAVITY_OFFSET, g / k))
+                for g, k in zip(expected_g, kp)
+            )
+            expected_pos = [q + off for q, off in zip(base_target, offsets)]
+            expected_torque = expected_g if is_master else tuple(
+                g - off * k for g, off, k in zip(expected_g, offsets, kp)
+            )
+            spin_until(executor, lambda d=driver, g=expected_g, p=expected_pos, t=expected_torque: (
                 d.arm.position[:6] == pytest.approx(base_target)
                 and d.control.gravity == pytest.approx(g)
                 and any(call[0] == 'mit' for call in d.arm.calls)
                 and [call[1] for call in d.arm.calls if call[0] == 'mit'][-1].position
                 == pytest.approx(p)
+                and [call[1] for call in d.arm.calls if call[0] == 'mit'][-1].torque
+                == pytest.approx(t)
             ))
             last_mit = [call[1] for call in driver.arm.calls if call[0] == 'mit'][-1]
             assert last_mit.position == pytest.approx(expected_pos)
-            assert last_mit.torque == (0.0,) * 6
-            expected_kd = (0.0,) * 6 if index in (0, 1) else (0.5, 0.8, 0.8, 0.2, 0.2, 0.2)
+            assert last_mit.torque == pytest.approx(expected_torque)
+            assert last_mit.kp == pytest.approx((0.0,) * 6 if is_master else kp)
+            expected_kd = (0.0,) * 6 if is_master else (0.5, 0.8, 0.8, 0.2, 0.2, 0.2)
             assert last_mit.kd == pytest.approx(expected_kd)
     finally:
         executor.shutdown(timeout_sec=1)

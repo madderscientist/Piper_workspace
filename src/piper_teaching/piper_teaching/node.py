@@ -11,7 +11,7 @@ import time
 from piper_x_interfaces.msg import ArmStatus, GripperCommand, MitCommand
 from piper_x_interfaces.srv import Enable, SetMode
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import JointState
@@ -217,10 +217,11 @@ class TeachingNode(Node):
         for index, (sample, target, velocity) in enumerate(zip(samples, targets, velocities)):
             free_master = self.config.mode == 'master_slave' and index in MASTER_INDICES
             follow = self.coupling.engaged and not free_master
+            zero_gain = self.coupling.engaged and free_master
             self.mit_pubs[index].publish(MitCommand(
                 position=list(target[:6]), velocity=list(velocity[:6]),
-                kp=kp_list,
-                kd=[0.0] * 6 if (self.coupling.engaged and free_master) else kd_list,
+                kp=[0.0] * 6 if zero_gain else kp_list,
+                kd=[0.0] * 6 if zero_gain else kd_list,
                 torque=[0.0] * 6,
             ))
             self.gripper_pubs[index].publish(GripperCommand(
@@ -232,6 +233,7 @@ class TeachingNode(Node):
         now = time.monotonic()
         elapsed = max(0.0, now - self._last_tick)
         self._last_tick = now
+        prev_phase = self.phase
         self.holding = False
         block = ''
         refs = None
@@ -295,6 +297,9 @@ class TeachingNode(Node):
                 self.reason = self.coupling.reason
             if self.phase in ('enabling', 'starting') and now > self.deadline:
                 raise TeachingFault(f'{self.phase} acknowledgement timeout')
+            if self.phase != prev_phase and self.phase in ('enabling', 'engaging', 'active'):
+                self.get_logger().info(
+                    f'Mode={self.config.mode} phase={self.phase}: {self.reason}')
         except (TeachingFault, ValueError, RuntimeError) as error:
             block = str(error)
             if self.phase in ('enabling', 'preloading', 'starting', 'engaging', 'active'):
@@ -335,8 +340,11 @@ def main(args=None):
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
     tty_fd = None
+    executor = None
     try:
         node = TeachingNode()
+        executor = SingleThreadedExecutor()
+        executor.add_node(node)
         try:
             tty_fd = os.open('/dev/tty', os.O_RDONLY | os.O_NONBLOCK)
             node.get_logger().info('Press Enter at any time to retry initialization')
@@ -349,7 +357,7 @@ def main(args=None):
                         node.request_retry()
                 except OSError:
                     pass
-            rclpy.spin_once(node, timeout_sec=0.1)
+            executor.spin_once(timeout_sec=0.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
@@ -358,6 +366,8 @@ def main(args=None):
                 os.close(tty_fd)
             except OSError:
                 pass
+        if executor is not None:
+            executor.shutdown()
         if node is not None:
             if rclpy.ok() and node.phase in (
                     'enabling', 'preloading', 'starting', 'engaging', 'active'):

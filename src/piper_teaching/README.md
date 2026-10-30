@@ -33,7 +33,7 @@ ros2 launch piper_teaching teaching.launch.py dry_run:=false mode:=bilateral
    - `master_slave`：主臂 `arm_1`、`arm_2` 锁定在初始位置，从臂 `arm_3`、`arm_4` 以 **24°/s** 靠近主臂位置。
    - `bilateral`：配对臂 `1↔3`、`2↔4` 以 **24°/s** 相互靠近至初始位置中点。
 3. 对齐完成后自动进入 **active**：
-   - `master_slave`：主臂 `velocity=0, kd=0` 且夹爪零力释放，经驱动重力补偿实现自由拖动；从臂跟随主臂位置 `p`、速度 `dp` 与夹爪开度。
+   - `master_slave`：主臂下发 `kp=0, kd=0, velocity=0` 且夹爪零力释放，驱动因 `kd` 低于 CAN 最小步进阈值自动切换为 `t_ff` 力矩偏置重力补偿，实现零刚度自由拖动；从臂以 `kp / kd`（位置折合+超限余量偏置补偿）跟随主臂位置 `p`、速度 `dp` 与夹爪开度。
    - `bilateral`：配对臂按 `1↔3`、`2↔4` 双向交换关节位置、速度与夹爪开度。
 
 运行过程中在示教终端或驱动终端按 **回车（Enter）**，可重新执行完整初始化流程。
@@ -61,8 +61,8 @@ ros2 service call /bilateral_teaching/stop std_srvs/srv/Trigger '{}'
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `mode` | `master_slave` | `master_slave` 或 `bilateral`（非活动阶段也可调 `/bilateral_teaching/set_mode` 切换） |
-| `kp` | `[15, 15, 15, 3, 2, 2]` | 六轴位置耦合与重力折合增益 |
-| `kd` | `[4.62, 4.65, 2.25, 0.30, 0.24, 0.06]` | 六轴阻尼增益 |
+| `kp` | `[60, 60, 60, 12, 8, 8]` | 从臂/双向耦合六轴位置增益与重力折合增益 |
+| `kd` | 自动计算 `[9.25, 9.31, 4.51, 0.6, 0.49, 0.13]` | 从臂/双向耦合六轴阻尼增益（未显式配置时由 `max_critical_kd(kp)` 自动计算） |
 | `gripper_effort` | `2.0` | 夹爪跟随力度（SDK 标度 `0..5`） |
 | `feedback_timeout` | `1.0 s` | 反馈时效窗口 |
 | `engage_speed_deg_s` | `24 °/s` | engage 阶段最大关节目标变化率 |

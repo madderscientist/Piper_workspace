@@ -3,8 +3,7 @@ bilateral_teaching:
     mode: master_slave
     dry_run: true
     auto_start: true
-    kp: [15.0, 15.0, 15.0, 3.0, 2.0, 2.0]
-    kd: [4.62, 4.65, 2.25, 0.30, 0.24, 0.06]
+    kp: [60.0, 60.0, 60.0, 12.0, 8.0, 8.0]
     gripper_effort: 2.0
     feedback_timeout: 1.0
     engage_speed_deg_s: 24.0

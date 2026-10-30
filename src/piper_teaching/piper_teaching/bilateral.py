@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import math
 
 from piper_x_driver.backend import feedback_problem
+from piper_x_driver.gravity import max_critical_kd
 
 
 JOINT_NAMES = tuple(f'joint{i}' for i in range(1, 7)) + ('gripper',)
@@ -37,6 +38,8 @@ class TeachingConfig:
     def __post_init__(self) -> None:
         if self.mode not in TEACHING_MODES:
             raise ValueError(f'mode must be one of {TEACHING_MODES}')
+        if all(v == 0 for v in self.kd) and any(v > 0 for v in self.kp):
+            object.__setattr__(self, 'kd', max_critical_kd(self.kp))
         for name, upper in (('kp', 500), ('kd', 100)):
             values = getattr(self, name)
             if len(values) != 6 or any(
@@ -180,6 +183,7 @@ class BilateralCoupling:
                     )
                 else:
                     self.targets = refs
+                    self.engage_error_deg = 0.0
                     peers = peers_for_mode(self.config.mode)
                     self.velocities = tuple(
                         (0.0,) * 6
