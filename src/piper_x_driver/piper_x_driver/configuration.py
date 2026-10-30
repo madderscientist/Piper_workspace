@@ -154,13 +154,16 @@ class FleetConfig:
                     raise ValueError(f'gravity_config file not found: {gravity_str}') from error
                 gravity_model = load_gravity_model(resolved_g_path)
             self.gravity_models[values['id']] = gravity_model
+            auto_kd = max_critical_kd(debug_kp, str(values.get('end_effector', '')), gravity_model)
+            raw_kd = _vector(values['debug_kd'], 'debug_kd', 6, -100.0, 100.0)
+            resolved_kd = tuple(auto if v < 0.0 else v for v, auto in zip(raw_kd, auto_kd))
             self.arms.append(ArmConfig(
                 values['id'], values['name'], values['namespace'],
                 values['can_port'], values['end_effector'],
                 bounded(values['gravity_scale'], 'gravity_scale', 0, 1),
                 values['mounting'],
-                _vector(values['debug_kp'], 'debug_kp', 6, 0.0, 500.0),
-                _vector(values['debug_kd'], 'debug_kd', 6, 0.0, 100.0),
+                debug_kp,
+                resolved_kd,
                 bounded(values['friction_scale'], 'friction_scale', 0, 1),
                 friction_str,
                 gravity_str,

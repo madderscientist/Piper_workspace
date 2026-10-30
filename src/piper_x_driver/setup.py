@@ -14,6 +14,7 @@ setup(
         'console_scripts': [
             'driver = piper_x_driver.node:main',
             'power_off = piper_x_driver.node:power_off_main',
+            'damping = piper_x_driver.gravity:damping_main',
         ],
     },
 )

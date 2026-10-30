@@ -62,7 +62,7 @@ ros2 service call /bilateral_teaching/stop std_srvs/srv/Trigger '{}'
 |---|---|---|
 | `mode` | `master_slave` | `master_slave` 或 `bilateral`（非活动阶段也可调 `/bilateral_teaching/set_mode` 切换） |
 | `kp` | `[60, 60, 60, 12, 8, 8]` | 从臂/双向耦合六轴位置增益与重力折合增益 |
-| `kd` | 自动计算 `[9.25, 9.31, 4.51, 0.6, 0.49, 0.13]` | 从臂/双向耦合六轴阻尼增益（未显式配置时由 `max_critical_kd(kp)` 自动计算） |
+| `kd` | `[9.25, 9.31, 4.51, 0.6, 0.49, 0.13]` | 从臂/双向耦合六轴阻尼增益（可用 `ros2 run piper_x_driver damping --kp ...` 计算，或传负数 `-1` 由底层 `piper_x_driver` 自动推导） |
 | `gripper_effort` | `2.0` | 夹爪跟随力度（SDK 标度 `0..5`） |
 | `feedback_timeout` | `1.0 s` | 反馈时效窗口 |
 | `engage_speed_deg_s` | `24 °/s` | engage 阶段最大关节目标变化率 |

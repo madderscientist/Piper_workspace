@@ -89,7 +89,9 @@ _EFFECTOR_INERTIAS = {
 }
 _MAX_INERTIA = {
     'teaching_handle': (0.712418, 0.722116, 0.169451, 0.015078, 0.014926, 0.001023),
+    'piper_description_with_teach.urdf': (0.712418, 0.722116, 0.169451, 0.015078, 0.014926, 0.001023),
     'gripper': (0.694602, 0.704391, 0.163588, 0.014434, 0.014274, 0.000726),
+    'piper_description.urdf': (0.694602, 0.704391, 0.163588, 0.014434, 0.014274, 0.000726),
 }
 
 
@@ -347,3 +349,19 @@ def load_gravity_model(path: str | Path) -> ArmGravityModel:
         data = yaml.safe_load(stream)
     return ArmGravityModel.from_dict(data)
 
+
+
+def damping_main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Compute six-joint critical damping kd from kp.')
+    parser.add_argument('--kp', '-k', type=float, nargs=6, required=True)
+    parser.add_argument(
+        '--effector', '-e', default='teaching_handle', choices=('teaching_handle', 'gripper'),
+    )
+    parser.add_argument('--gravity-config', '-g', type=Path, default=None)
+    args = parser.parse_args(argv)
+    g_model = load_gravity_model(args.gravity_config) if args.gravity_config else None
+    kd = max_critical_kd(args.kp, args.effector, g_model)
+    print('kd: [' + ', '.join(f'{v:g}' for v in kd) + ']')
+    return 0

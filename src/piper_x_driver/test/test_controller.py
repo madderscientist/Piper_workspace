@@ -480,3 +480,22 @@ def test_controller_applies_configured_gravity_model_in_mit(fake_arm):
     assert control.gravity[1] == pytest.approx(1.10 * cad[1] - 0.05)
 
 
+
+
+def test_negative_kd_in_mit_command_auto_derives_damping_in_driver(fake_arm, capsys):
+    from piper_x_driver.gravity import damping_main, max_critical_kd
+
+    arm = fake_arm()
+    control = Controller(arm)
+    control.power(True)
+    kp = [60.0, 60.0, 60.0, 12.0, 8.0, 8.0]
+    cmd = target(kp=kp, kd=[-1.0] * 6)
+    control.mit(cmd)
+    control.set_mode('mit')
+    control.watchdog()
+    sent = [call[1] for call in arm.calls if call[0] == 'mit'][-1]
+    assert sent.kd == max_critical_kd(kp) == (9.25, 9.31, 4.51, 0.6, 0.49, 0.13)
+    assert max_critical_kd((15.0, 15.0, 15.0, 3.0, 2.0, 2.0), 'gripper') == (
+        4.56, 4.6, 2.22, 0.29, 0.24, 0.05)
+    assert damping_main(['--kp', '60', '60', '60', '12', '8', '8']) == 0
+    assert 'kd: [9.25, 9.31, 4.51, 0.6, 0.49, 0.13]' in capsys.readouterr().out

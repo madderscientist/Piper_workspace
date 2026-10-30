@@ -32,8 +32,10 @@ $$
   上层所有接口（ROS `command/mit`、`debug_kp / debug_kd`、重力矩 $g_i$、摩擦力矩 $f_i$）均统一定义为**减速器输出端（关节侧）**的物理量，单位为 $\text{rad}$、$\text{rad/s}$、$\text{N}\cdot\text{m}$、$\text{N}\cdot\text{m/rad}$、$\text{N}\cdot\text{m/(rad/s)}$。
 - **底层减速比自动换算**：
   SDK 的 `t_ff` 已在内部按关节力矩常数换算为关节侧 $\text{N}\cdot\text{m}$，但 `kp` 与 `kd` 在驱动器内部直接作用于电机侧。驱动在 [backend.py](piper_x_driver/backend.py) 的 `SdkArm._write_mit` 中自动将关节侧 `kp`、`kd` 除以各轴放大系数 `MIT_GAIN_SCALE = (24.75, 24.75, 28.41, 2.10, 1.36, 1.0)` 换算为 CAN 线侧值。
-- **最大临界阻尼公共计算**：
-  [gravity.py](piper_x_driver/gravity.py) 提供 `max_critical_kd(kp, end_effector)`，基于 URDF 全姿态最大对角转动惯量包络 $M_{ii,\max}$ 按 $k_{d,i} = \sqrt{2 M_{ii,\max} k_{p,i}}$ 自动计算各轴阻尼。
+- **阻尼推导工具 (`damping`) 与负数阻尼自动推导 (`kd < 0`)**：
+  [gravity.py](piper_x_driver/gravity.py) 提供 `max_critical_kd(kp, end_effector, gravity_model)`，基于 URDF 全姿态最大对角转动惯量包络 $M_{ii,\max}$ 按 $k_{d,i} = \sqrt{2 M_{ii,\max} k_{p,i}}$ 计算各轴阻尼：
+  - **命令行工具**：可通过 `ros2 run piper_x_driver damping --kp 60 60 60 12 8 8 --effector teaching_handle` 直接算出 `kd: [9.25, 9.31, 4.51, 0.6, 0.49, 0.13]` 填入配置文件；
+  - **运行时负数自动推导**：当上层 `MitCommand` 或配置文件将某轴 `kd` 传为负数（如 `-1.0`）时，驱动层 `Controller` 自动根据当前机械臂末端负载与 `kp` 推导出对应阻尼下发。
 
 ---
 

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import math
 
 from piper_x_driver.backend import feedback_problem
-from piper_x_driver.gravity import max_critical_kd
 
 
 JOINT_NAMES = tuple(f'joint{i}' for i in range(1, 7)) + ('gripper',)
@@ -30,7 +29,7 @@ def peers_for_mode(mode: str) -> tuple[int, ...]:
 class TeachingConfig:
     mode: str = 'bilateral'
     kp: tuple[float, ...] = (0.0,) * 6
-    kd: tuple[float, ...] = (0.0,) * 6
+    kd: tuple[float, ...] = (-1.0,) * 6
     gripper_effort: float = 0.0
     feedback_timeout: float = 1.0
     engage_speed_deg_s: float = 24.0
@@ -38,13 +37,10 @@ class TeachingConfig:
     def __post_init__(self) -> None:
         if self.mode not in TEACHING_MODES:
             raise ValueError(f'mode must be one of {TEACHING_MODES}')
-        if all(v == 0 for v in self.kd) and any(v > 0 for v in self.kp):
-            object.__setattr__(self, 'kd', max_critical_kd(self.kp))
-        for name, upper in (('kp', 500), ('kd', 100)):
-            values = getattr(self, name)
-            if len(values) != 6 or any(
-                    not math.isfinite(v) or not 0 <= v <= upper for v in values):
-                raise ValueError(f'{name} requires six finite values in [0, {upper}]')
+        if len(self.kp) != 6 or any(not math.isfinite(v) or not 0 <= v <= 500 for v in self.kp):
+            raise ValueError('kp requires six finite values in [0, 500]')
+        if len(self.kd) != 6 or any(not math.isfinite(v) or not -100 <= v <= 100 for v in self.kd):
+            raise ValueError('kd requires six finite values in [-100, 100] (<0 selects driver auto-damping)')
         if not math.isfinite(self.gripper_effort) or not 0 <= self.gripper_effort <= 5:
             raise ValueError('gripper_effort requires a finite SDK value in [0, 5]')
         for name in ('feedback_timeout', 'engage_speed_deg_s'):
@@ -55,9 +51,10 @@ class TeachingConfig:
             raise ValueError('feedback_timeout must be <= 2.0s')
 
     def require_gains(self) -> None:
-        if any(v <= 0 for v in self.kp + self.kd) or self.gripper_effort <= 0:
+        if any(v <= 0 for v in self.kp) or any(v == 0 for v in self.kd) or self.gripper_effort <= 0:
             raise TeachingFault(
-                'Set six positive kp/kd values and positive gripper_effort explicitly')
+                'Set six positive kp values, non-zero kd values (<0 for driver auto-damping), '
+                'and positive gripper_effort explicitly')
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,7 @@ bilateral_teaching:
     dry_run: true
     auto_start: true
     kp: [60.0, 60.0, 60.0, 12.0, 8.0, 8.0]
+    kd: [9.25, 9.31, 4.51, 0.6, 0.49, 0.13]
     gripper_effort: 2.0
     feedback_timeout: 1.0
     engage_speed_deg_s: 24.0

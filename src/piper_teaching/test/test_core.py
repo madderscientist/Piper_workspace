@@ -4,8 +4,7 @@ import math
 import pytest
 
 from piper_teaching.bilateral import (
-    ArmSample, BilateralCoupling, max_critical_kd, TeachingConfig, TeachingFault,
-    references,
+    ArmSample, BilateralCoupling, TeachingConfig, TeachingFault, references,
 )
 from piper_x_driver.backend import FEEDBACK_FIELDS
 
@@ -22,11 +21,10 @@ def config():
     return TeachingConfig(kp=(3.0,) * 6, kd=(0.5,) * 6, gripper_effort=0.3)
 
 
-def test_auto_critical_kd_from_kp():
+def test_negative_kd_sentinel_forwarded_for_driver_auto_damping():
     auto = TeachingConfig(kp=(60.0, 60.0, 60.0, 12.0, 8.0, 8.0), gripper_effort=2.0)
-    assert auto.kd == max_critical_kd(auto.kp) == (9.25, 9.31, 4.51, 0.6, 0.49, 0.13)
-    assert max_critical_kd((15.0, 15.0, 15.0, 3.0, 2.0, 2.0), 'gripper') == (
-        4.56, 4.6, 2.22, 0.29, 0.24, 0.05)
+    assert auto.kd == (-1.0,) * 6
+    auto.require_gains()
 
 
 def test_home_engage_then_pair_coupling():

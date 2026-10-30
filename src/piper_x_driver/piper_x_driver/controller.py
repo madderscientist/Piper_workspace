@@ -50,7 +50,7 @@ class Controller:
         self.friction_scale_applied = self.friction_scale
         self.gravity_updated = self.clock()
         self.debug_kp = tuple(debug_kp)
-        self.debug_kd = max_critical_kd(self.debug_kp) if debug_kd is None else tuple(debug_kd)
+        self.debug_kd = self._resolve_kd(self.debug_kp, debug_kd)
         self.debug_session = ''
         self.debug_desired = ()
         self.debug_target = ()
@@ -182,12 +182,26 @@ class Controller:
         self.require_mode('point', 'linear')
         self.arm.cartesian(command.pose, command.speed_percent, self.mode)
 
+    def _resolve_kd(self, kp, kd=None):
+        eff = 'teaching_handle' if self.effector is None else getattr(self.effector, 'model', 'teaching_handle')
+        auto = max_critical_kd(kp, eff, self.gravity_model)
+        return auto if kd is None else tuple(a if float(v) < 0 else float(v) for v, a in zip(kd, auto))
+
     def mit(self, command):
         if self.debug_session:
             raise ValueError('MIT debugger owns this arm; external MIT target rejected')
         for name in ('position', 'velocity', 'kp', 'kd', 'torque'):
             if len(getattr(command, name)) != 6:
                 raise ValueError(f'{name}: six values required')
+        if any(float(v) < 0.0 for v in command.kd):
+            command = MitTarget(
+                tuple(command.position),
+                tuple(command.velocity),
+                tuple(command.kp),
+                self._resolve_kd(command.kp, command.kd),
+                tuple(command.torque),
+                tuple(getattr(command, 'gravity_offset', (0.0,) * 6)),
+            )
         self.mit_target = command
         self.mit_received = self.clock()
 
@@ -291,9 +305,10 @@ class Controller:
             )
         )
         # 3. 逐轴合成目标位置 (q + offset) 与前馈力矩 t_ff (t_cmd + residual + f)
+        resolved_kd = self._resolve_kd(command.kp, command.kd)
         offsets, positions, torques = [], [], []
         for idx, (q, g, f, kp, kd, t_cmd) in enumerate(zip(
-            command.position, gravity, friction, command.kp, command.kd, command.torque,
+            command.position, gravity, friction, command.kp, resolved_kd, command.torque,
         )):
             if kd < MIT_KD_LSB[idx] or round(kp / MIT_KP_LSB[idx]) <= 0:
                 # 零刚度或零阻尼：重力无法折算为位置偏置，全部进入 t_ff
@@ -312,7 +327,7 @@ class Controller:
             torques.append(t_cmd + residual + f)
         output = MitTarget(
             tuple(positions), tuple(command.velocity),
-            tuple(command.kp), tuple(command.kd), tuple(torques), tuple(offsets),
+            tuple(command.kp), tuple(resolved_kd), tuple(torques), tuple(offsets),
         )
         self.arm.mit(output)
         self.gravity, self.friction, self.output_torque = (
