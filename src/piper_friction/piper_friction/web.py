@@ -17,7 +17,7 @@ from ament_index_python.packages import PackageNotFoundError, get_package_share_
 import numpy as np
 from piper_x_driver.configuration import bounded, default_config_path, FleetConfig
 from piper_x_driver.gravity import gravity_torques
-from piper_x_interfaces.msg import ArmStatus, MitCommand
+from piper_x_interfaces.msg import ArmStatus, GripperCommand, MitCommand
 from piper_x_interfaces.srv import ConfigureArm, Enable, SetMode
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -28,6 +28,8 @@ from std_msgs.msg import String
 import yaml
 
 from .collector import (
+    DEFAULT_GRIPPER_EFFORT,
+    DEFAULT_GRIPPER_SPEEDS,
     DEFAULT_SWEEP_KP,
     DEFAULT_SWEEP_SPEEDS,
     JOINT_NAMES,
@@ -47,6 +49,7 @@ from .identification import (
 )
 from .model import (
     ArmFrictionModel,
+    GripperFrictionModel,
     JointFrictionModel,
     SpatialHarmonic,
     load_friction_model,
@@ -60,29 +63,102 @@ DEFAULT_JOINT_RANGES: dict[int, tuple[float, float]] = {
     4: (-0.45, 0.45),
     5: (-0.40, 0.40),
     6: (-0.50, 0.50),
+    7: (0.003, 0.080),
 }
 
 
 def web_root_path() -> Path:
+    src_web = Path(__file__).resolve().parent.parent / 'web'
+    if (src_web / 'index.html').is_file():
+        return src_web
     try:
         share = Path(get_package_share_directory('piper_friction')) / 'web'
         if (share / 'index.html').is_file():
             return share
     except PackageNotFoundError:
         pass
-    return Path(__file__).resolve().parent.parent / 'web'
+    return src_web
 
 
 def synthesize_demo_samples(
     joint: int = 1,
-    speeds: tuple[float, ...] = (0.03, 0.06, 0.12, 0.25, 0.5, 1.0, 1.5),
+    speeds: tuple[float, ...] | None = None,
     q_min: float | None = None,
     q_max: float | None = None,
 ) -> list[SweepSample]:
-    """Generate realistic synthetic multi-speed sweep data for a specific joint J1..J6."""
+    """Generate realistic synthetic multi-speed sweep data for J1..J6 or Gripper (J7)."""
     default_lo, default_hi = DEFAULT_JOINT_RANGES.get(joint, (-0.5, 0.5))
     lo = default_lo if q_min is None else float(q_min)
     hi = default_hi if q_max is None else float(q_max)
+
+    if joint == 7:
+        g_speeds = DEFAULT_GRIPPER_SPEEDS if speeds is None else speeds
+        w_knots = tuple(float(x) for x in np.linspace(lo, hi, 25))
+        span_w = max(1e-6, hi - lo)
+        # Non-periodic linkage & return-spring bias + U-shaped guide rail tightness
+        bias_knots = tuple(
+            round(-0.18 - 0.42 * ((w - lo) / span_w) - 0.08 * math.exp(-(((w - lo) / span_w - 0.25) / 0.18) ** 2), 4)
+            for w in w_knots
+        )
+        raw_mod = [
+            0.22 * (((w - lo) / span_w - 0.48) ** 2)
+            + 0.09 * math.exp(-(((w - lo) / span_w - 0.15) / 0.12) ** 2)
+            - 0.06 * math.exp(-(((w - lo) / span_w - 0.55) / 0.20) ** 2)
+            for w in w_knots
+        ]
+        mod_mean = sum(raw_mod) / len(raw_mod)
+        mod_knots = tuple(round(v - mod_mean, 4) for v in raw_mod)
+        demo_grip = GripperFrictionModel(
+            fc=0.38,
+            fs=0.72,
+            vs=0.016,
+            delta=2.0,
+            fv=2.40,
+            v0=0.002,
+            vr=0.075,
+            kp_equiv=85.0,
+            kv_equiv=12.5,
+            w_grid=w_knots,
+            bias_grid=bias_knots,
+            modulation_grid=mod_knots,
+        )
+        rng = np.random.default_rng(49)
+        samples_g: list[SweepSample] = []
+        t = 0.0
+        for speed in g_speeds:
+            n_steps = max(240, int((span_w / speed) * 80))
+            dt = (span_w / speed) / n_steps
+            for direction in (1.0, -1.0):
+                ws = (
+                    np.linspace(lo, hi, n_steps)
+                    if direction > 0
+                    else np.linspace(hi, lo, n_steps)
+                )
+                dw = direction * speed
+                for w in ws:
+                    f_true = demo_grip.force(float(w), float(dw))
+                    noise = float(rng.normal(0.0, 0.008))
+                    f_meas = f_true + noise
+                    w_des = (
+                        float(w)
+                        + f_true / (6.0 * demo_grip.kp_equiv)
+                        + float(dw) * (0.025 + 1.0 / demo_grip.kv_equiv)
+                    )
+                    samples_g.append(SweepSample(
+                        t=t,
+                        joint=7,
+                        q=float(w),
+                        dq=float(dw),
+                        tau_meas=float(f_meas),
+                        q_des=float(w_des),
+                        dq_des=float(dw),
+                        tau_gravity=0.0,
+                    ))
+                    t += dt
+        return samples_g
+
+    if speeds is None:
+        speeds = (0.03, 0.06, 0.12, 0.25, 0.5, 1.0, 1.5)
 
     scale = (1.0, 1.25, 0.95, 0.45, 0.38, 0.25)[joint - 1]
     base_omega = (36.0, 36.0, 36.0, 28.0, 28.0, 24.0)[joint - 1]
@@ -195,29 +271,50 @@ def serialize_report(
     idx = np.arange(0, n_grid, stride)
     theta_sub = d.theta_grid[idx]
 
-    half_sum_0 = detrend(d.half_sums[0], type='linear')[idx]
+    is_gripper = isinstance(m, GripperFrictionModel)
+    half_sum_0 = (
+        d.half_sums[0][idx]
+        if is_gripper
+        else detrend(d.half_sums[0], type='linear')[idx]
+    )
     half_diff_0 = d.half_diffs[0][idx]
     mean_f0 = float(np.mean(d.half_diffs[0]))
     mod_actual_0 = half_diff_0 - mean_f0
 
     env0 = m.envelope(float(d.speeds[0]))
-    cog_fit_0 = [float(env0 * m.cogging_torque(float(th))) for th in theta_sub]
+    cog_fit_0 = (
+        [float(m.bias_force(float(th))) for th in theta_sub]
+        if is_gripper
+        else [float(env0 * m.cogging_torque(float(th))) for th in theta_sub]
+    )
     mod_fit_0 = [float(env0 * m.modulation_torque(float(th))) for th in theta_sub]
     tau_pos_0 = (half_sum_0 + half_diff_0).tolist()
     tau_neg_0 = (half_sum_0 - half_diff_0).tolist()
 
-    v_max = max(float(np.max(d.speeds)) * 1.15, 1.6)
+    v_max = (
+        max(float(np.max(d.speeds)) * 1.2, 0.10)
+        if is_gripper
+        else max(float(np.max(d.speeds)) * 1.15, 1.6)
+    )
     v_dense = np.linspace(0.0, v_max, 120)
     stribeck_dense = [float(m.stribeck_magnitude(float(v))) for v in v_dense]
     envelope_dense = [float(m.envelope(float(v))) for v in v_dense]
 
     yaml_text = yaml.safe_dump(arm_model.to_dict(), allow_unicode=True, sort_keys=False)
 
-    return {
-        'joint': int(report.joint),
-        'arm_id': arm_model.arm_id,
-        'model': m.to_dict(),
-        'harmonics': [
+    harmonics_list = []
+    profile_knots = []
+    if isinstance(m, GripperFrictionModel):
+        for w_k, b_k, mod_k in zip(m.w_grid, m.bias_grid, m.modulation_grid):
+            profile_knots.append({
+                'w_m': float(w_k),
+                'w_mm': float(w_k * 1000.0),
+                'bias_n': float(b_k),
+                'modulation_n': float(mod_k),
+                'local_fc_n': float(max(0.0, m.fc + mod_k)),
+            })
+    else:
+        harmonics_list = [
             {
                 **h.to_dict(),
                 'cogging_amplitude': float(h.cogging_amplitude),
@@ -225,7 +322,15 @@ def serialize_report(
                 'period_deg': float(360.0 / h.omega) if h.omega > 0 else 0.0,
             }
             for h in m.harmonics
-        ],
+        ]
+
+    return {
+        'joint': int(report.joint),
+        'is_gripper': is_gripper,
+        'arm_id': arm_model.arm_id,
+        'model': m.to_dict(),
+        'harmonics': harmonics_list,
+        'profile_knots': profile_knots,
         'metrics': {
             'rmse_total': float(report.rmse_total),
             'rmse_stribeck': float(report.rmse_stribeck),
@@ -276,6 +381,7 @@ class _ArmSweepRunner:
     segment_velocities: list[tuple[float, float]] = field(default_factory=list)
     output_csv: str = ''
     fit_output: str = ''
+    saved_friction_scale: float | None = None
     samples: list[SweepSample] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -321,6 +427,9 @@ class FrictionWorkbenchNode(Node):
         self.positions: dict[str, tuple[float, ...]] = {}
         self.velocities: dict[str, tuple[float, ...]] = {}
         self.torques: dict[str, tuple[float, ...]] = {}
+        self.gripper_velocities: dict[str, float] = {}
+        self.gripper_forces: dict[str, float] = {}
+        self._prev_grip_samples: dict[str, tuple[float, float]] = {}
         self.joint_stamps: dict[str, float] = {}
         self.statuses: dict[str, ArmStatus] = {}
         self.status_stamps: dict[str, float] = {}
@@ -328,6 +437,7 @@ class FrictionWorkbenchNode(Node):
         self.effector_kwargs: dict[str, dict[str, Any]] = {}
 
         self.mit_pubs: dict[str, Any] = {}
+        self.gripper_pubs: dict[str, Any] = {}
         self.config_clients: dict[str, Any] = {}
         self.enable_clients: dict[str, Any] = {}
         self.mode_clients: dict[str, Any] = {}
@@ -349,6 +459,7 @@ class FrictionWorkbenchNode(Node):
                 partial(self._on_control_state, ns), 10,
             )
             self.mit_pubs[ns] = self.create_publisher(MitCommand, f'{ns}/command/mit', 1)
+            self.gripper_pubs[ns] = self.create_publisher(GripperCommand, f'{ns}/command/gripper', 1)
             self.config_clients[ns] = self.create_client(ConfigureArm, f'{ns}/configure_arm')
             self.enable_clients[ns] = self.create_client(Enable, f'{ns}/enable_srv')
             self.mode_clients[ns] = self.create_client(SetMode, f'{ns}/set_mode')
@@ -399,6 +510,20 @@ class FrictionWorkbenchNode(Node):
             self.positions[ns] = pos
             self.velocities[ns] = vel
             self.torques[ns] = tau
+            if len(message.velocity) >= 7:
+                self.gripper_velocities[ns] = float(message.velocity[order[6]])
+            elif (
+                'gripper_velocity' not in self.control_states.get(ns, {})
+                and ns in self._prev_grip_samples
+            ):
+                dt = now - self._prev_grip_samples[ns][0]
+                if 1e-4 <= dt <= 0.5:
+                    self.gripper_velocities[ns] = (
+                        pos[6] - self._prev_grip_samples[ns][1]
+                    ) / dt
+            self._prev_grip_samples[ns] = (now, pos[6])
+            if len(message.effort) >= 7:
+                self.gripper_forces[ns] = float(message.effort[order[6]])
             self.joint_stamps[ns] = now
             runner = self.runners.get(ns)
             if (runner is not None
@@ -406,29 +531,38 @@ class FrictionWorkbenchNode(Node):
                     and runner.config is not None
                     and abs(runner.current_dq_des) > 1e-6):
                 j_idx = runner.config.joint - 1
-                runner.segment_velocities.append((now, vel[j_idx]))
+                if runner.config.joint == 7:
+                    dq_meas = self.gripper_velocities.get(ns, 0.0)
+                    tau_meas = self.gripper_forces.get(ns, 0.0)
+                else:
+                    dq_meas = vel[j_idx]
+                    tau_meas = tau[j_idx]
+                runner.segment_velocities.append((now, dq_meas))
                 conf = sample_velocity_confidence(runner.segment_velocities, runner.current_dq_des)
                 if conf > 0.0:
                     ctrl_state = self.control_states.get(ns, {})
-                    g_vec = ctrl_state.get('gravity_torque')
-                    if isinstance(g_vec, list) and len(g_vec) >= 6:
-                        g_val = float(g_vec[j_idx])
+                    if runner.config.joint == 7:
+                        g_val = 0.0
                     else:
-                        arm_obj = self.arms_by_ns.get(ns)
-                        g_model = self.fleet.gravity_model(arm_obj) if arm_obj is not None else None
-                        g_torques = (
-                            gravity_torques(pos[:6], **self.effector_kwargs.get(ns, {}))
-                            if g_model is None
-                            else g_model.torques(pos[:6], **self.effector_kwargs.get(ns, {}))
-                        )
-                        g_scale_app = float(ctrl_state.get('gravity_scale_applied', 1.0))
-                        g_val = g_scale_app * float(g_torques[j_idx])
+                        g_vec = ctrl_state.get('gravity_torque')
+                        if isinstance(g_vec, list) and len(g_vec) >= 6:
+                            g_val = float(g_vec[j_idx])
+                        else:
+                            arm_obj = self.arms_by_ns.get(ns)
+                            g_model = self.fleet.gravity_model(arm_obj) if arm_obj is not None else None
+                            g_torques = (
+                                gravity_torques(pos[:6], **self.effector_kwargs.get(ns, {}))
+                                if g_model is None
+                                else g_model.torques(pos[:6], **self.effector_kwargs.get(ns, {}))
+                            )
+                            g_scale_app = float(ctrl_state.get('gravity_scale_applied', 1.0))
+                            g_val = g_scale_app * float(g_torques[j_idx])
                     sample = SweepSample(
                         t=now - runner.sweep_started,
                         joint=runner.config.joint,
                         q=pos[j_idx],
-                        dq=vel[j_idx],
-                        tau_meas=tau[j_idx],
+                        dq=dq_meas,
+                        tau_meas=tau_meas,
                         q_des=runner.current_q_des,
                         dq_des=runner.current_dq_des,
                         tau_gravity=g_val,
@@ -450,6 +584,10 @@ class FrictionWorkbenchNode(Node):
             return
         with self.lock:
             self.control_states[ns] = state
+            if isinstance(state.get('gripper_velocity'), (int, float)):
+                self.gripper_velocities[ns] = float(state['gripper_velocity'])
+            if isinstance(state.get('gripper_force'), (int, float)):
+                self.gripper_forces[ns] = float(state['gripper_force'])
             eff = state.get('configuration', {}).get('effector', {})
             if 'mass_kg' in eff and 'com_m' in eff:
                 self.effector_kwargs[ns] = {
@@ -466,6 +604,12 @@ class FrictionWorkbenchNode(Node):
         anchor_blend: float = 1.0,
         initial: tuple[float, ...] | None = None,
     ) -> None:
+        if cfg.joint == 7:
+            self.gripper_pubs[cfg.namespace].publish(GripperCommand(
+                width=max(0.0, min(0.1, float(q_j))),
+                effort=float(cfg.gripper_effort),
+            ))
+            return
         assert cfg.kd is not None
         if initial is not None and anchor_blend < 1.0:
             pos = [
@@ -536,17 +680,40 @@ class FrictionWorkbenchNode(Node):
                 if (runner.config is not None
                         and runner.anchor is not None
                         and ns in self.positions):
-                    cur_pos = self.positions[ns][:6]
+                    cur_pos = self.positions[ns][:7]
                     self._publish_mit_locked(
                         runner.config, cur_pos, cur_pos[runner.config.joint - 1], 0.0,
                     )
+                    if runner.config.joint == 7:
+                        self.gripper_pubs[ns].publish(GripperCommand(
+                            width=float(cur_pos[6]), effort=0.0,
+                        ))
                 runner.phase = 'stopped'
                 runner.queue = []
                 runner.pending_future = None
                 runner.segment_velocities = []
+                self._restore_friction_scale_locked(ns, runner)
         return self.status_payload()
 
-    def _fail_sweep_locked(self, runner: _ArmSweepRunner, reason: str) -> None:
+    def _restore_friction_scale_locked(self, ns: str, runner: _ArmSweepRunner) -> None:
+        if (runner.saved_friction_scale is not None
+                and ns in self.config_clients
+                and self.config_clients[ns].service_is_ready()):
+            arm = self.arms_by_ns[ns]
+            ctrl = self.control_states.get(ns, {})
+            cfg_dict = ctrl.get('configuration', {})
+            end_eff = str(cfg_dict.get('end_effector') or arm.end_effector)
+            grav_scale = float(cfg_dict.get('gravity_scale', arm.gravity_scale))
+            self.config_clients[ns].call_async(ConfigureArm.Request(
+                end_effector=end_eff,
+                gravity_scale=grav_scale,
+                friction_scale=-2.0 - runner.saved_friction_scale,
+            ))
+            runner.saved_friction_scale = None
+
+    def _fail_sweep_locked(self, runner: _ArmSweepRunner, reason: str, ns: str = '') -> None:
+        if ns:
+            self._restore_friction_scale_locked(ns, runner)
         runner.error = reason
         runner.phase = 'failed'
         runner.queue = []
@@ -564,7 +731,7 @@ class FrictionWorkbenchNode(Node):
         return str(p.with_name(f'{stem}{p.suffix or ".csv"}'))
 
     def request_friction_scale(self, namespace: str, friction_scale: float) -> bool:
-        """Asynchronously request driver to update friction_scale (e.g. 0.0 on entering calibration)."""
+        """Asynchronously request driver to update runtime friction_scale without modifying arms.yaml."""
         scale = bounded(friction_scale, 'friction_scale', 0, 1)
         with self.lock:
             if namespace not in self.arms_by_ns:
@@ -580,7 +747,7 @@ class FrictionWorkbenchNode(Node):
             client.call_async(ConfigureArm.Request(
                 end_effector=end_eff,
                 gravity_scale=grav_scale,
-                friction_scale=scale,
+                friction_scale=-2.0 - scale,
             ))
             return True
 
@@ -603,17 +770,19 @@ class FrictionWorkbenchNode(Node):
                     self._fail_sweep_locked(
                         runner,
                         f'Arm fault: arm_status={status.arm_status}, err_code={status.err_code}',
+                        ns,
                     )
                     continue
 
                 if runner.phase == 'waiting_feedback':
-                    runner.initial = pos[:6]
+                    runner.initial = pos[:7]
                     if runner.anchor is None:
-                        runner.anchor = (
-                            resolve_safe_anchor(runner.initial, cfg.joint)
+                        base_anchor = (
+                            resolve_safe_anchor(runner.initial[:6], cfg.joint)
                             if cfg.use_safe_anchor
-                            else runner.initial
+                            else runner.initial[:6]
                         )
+                        runner.anchor = base_anchor + (runner.initial[6],)
                     runner.current_q_des = runner.initial[cfg.joint - 1]
                     runner.current_dq_des = 0.0
                     cfg_client = self.config_clients[ns]
@@ -623,10 +792,13 @@ class FrictionWorkbenchNode(Node):
                         cfg_dict = ctrl.get('configuration', {})
                         end_eff = str(cfg_dict.get('end_effector') or arm.end_effector)
                         grav_scale = float(cfg_dict.get('gravity_scale', arm.gravity_scale))
+                        runner.saved_friction_scale = float(
+                            cfg_dict.get('friction_scale', arm.friction_scale)
+                        )
                         runner.pending_future = cfg_client.call_async(ConfigureArm.Request(
                             end_effector=end_eff,
                             gravity_scale=grav_scale,
-                            friction_scale=0.0,
+                            friction_scale=-2.0,
                         ))
                         runner.phase = 'zeroing_friction'
                         continue
@@ -641,6 +813,7 @@ class FrictionWorkbenchNode(Node):
                         self._fail_sweep_locked(
                             runner,
                             f'Zeroing friction_scale failed: {getattr(res, "message", "no response")}',
+                            ns,
                         )
                         continue
                     self._check_enable_or_mit_locked(runner, cfg, status)
@@ -654,6 +827,7 @@ class FrictionWorkbenchNode(Node):
                         self._fail_sweep_locked(
                             runner,
                             f'Enable failed: {getattr(res, "message", "no response")}',
+                            ns,
                         )
                         continue
                     self._enter_mit_locked(runner, cfg, status)
@@ -672,6 +846,7 @@ class FrictionWorkbenchNode(Node):
                         self._fail_sweep_locked(
                             runner,
                             f'SetMode(mit) failed: {getattr(res, "message", "no response")}',
+                            ns,
                         )
                         continue
                     self._start_schedule_locked(runner, cfg)
@@ -714,6 +889,10 @@ class FrictionWorkbenchNode(Node):
                     runner.current_dq_des = 0.0
                     runner.segment_velocities = []
                     self._publish_mit_locked(cfg, runner.anchor, runner.current_q_des, 0.0)
+                    if cfg.joint == 7:
+                        self.gripper_pubs[cfg.namespace].publish(GripperCommand(
+                            width=float(runner.current_q_des), effort=0.0,
+                        ))
                     finished_samples = list(runner.samples)
                     finished_cfg = cfg
                     arm_id = self.arms_by_ns[cfg.namespace].id
@@ -725,12 +904,13 @@ class FrictionWorkbenchNode(Node):
                     if runner.queue_index + 1 < len(runner.queue):
                         runner.queue_index += 1
                         runner.config = runner.queue[runner.queue_index]
-                        runner.initial = pos[:6]
-                        runner.anchor = (
-                            resolve_safe_anchor(runner.initial, runner.config.joint)
+                        runner.initial = pos[:7]
+                        base_anchor = (
+                            resolve_safe_anchor(runner.initial[:6], runner.config.joint)
                             if runner.config.use_safe_anchor
-                            else runner.initial
+                            else runner.initial[:6]
                         )
+                        runner.anchor = base_anchor + (runner.initial[6],)
                         runner.samples = []
                         if ns == self.active_namespace:
                             self.samples = runner.samples
@@ -739,6 +919,7 @@ class FrictionWorkbenchNode(Node):
                     else:
                         has_next_joint = False
                         runner.phase = 'completed'
+                        self._restore_friction_scale_locked(ns, runner)
 
                     completed_jobs.append((finished_samples, finished_cfg, out_csv, out_fit, has_next_joint))
 
@@ -764,6 +945,9 @@ class FrictionWorkbenchNode(Node):
     def _check_enable_or_mit_locked(
         self, runner: _ArmSweepRunner, cfg: SweepConfig, status: ArmStatus,
     ) -> None:
+        if cfg.joint == 7:
+            self._start_schedule_locked(runner, cfg)
+            return
         ns = cfg.namespace
         if not all(status.motor_enabled):
             client = self.enable_clients[ns]
@@ -797,9 +981,13 @@ class FrictionWorkbenchNode(Node):
         j_idx = cfg.joint - 1
         q_init = init_p[j_idx]
         q_ret = runner.anchor[j_idx]
-        anchor_travel = max(
-            (abs(runner.anchor[i] - init_p[i]) for i in range(6) if i != j_idx),
-            default=0.0,
+        anchor_travel = (
+            0.0
+            if cfg.joint == 7
+            else max(
+                (abs(runner.anchor[i] - init_p[i]) for i in range(6) if i != j_idx),
+                default=0.0,
+            )
         )
         runner.schedule = build_sweep_schedule(
             q_init, cfg, anchor_travel=anchor_travel, q_return=q_ret,
@@ -825,7 +1013,7 @@ class FrictionWorkbenchNode(Node):
         if samples:
             j_idx = samples[0].joint
             g_mod = self.fleet.gravity_model(arm_id)
-            if g_mod is not None:
+            if g_mod is not None and 1 <= j_idx <= 6:
                 inertia_scale = float(g_mod.joint(j_idx).scale)
         report = identify_joint_friction(
             samples,
@@ -842,6 +1030,8 @@ class FrictionWorkbenchNode(Node):
                     loaded = load_friction_model(output_yaml)
                     for j_idx, j_model in current_arm.joints.items():
                         loaded = loaded.with_joint(j_idx, j_model)
+                    if current_arm.gripper is not None:
+                        loaded = loaded.with_gripper(current_arm.gripper)
                     current_arm = loaded
                 except Exception:
                     pass
@@ -892,12 +1082,25 @@ class FrictionWorkbenchNode(Node):
                     'online': online,
                     'mode': ctrl.get('mode', 'unknown'),
                     'enabled': list(status.motor_enabled) if status is not None else [False] * 6,
+                    'gripper_enabled': bool(status.gripper_enabled) if status is not None else False,
                     'position': list(pos[:6]) if pos is not None else None,
+                    'gripper_position': float(pos[6]) if pos is not None and len(pos) >= 7 else None,
                     'velocity': list(vel[:6]) if pos is not None else None,
+                    'gripper_velocity': float(self.gripper_velocities.get(ns, 0.0)),
                     'torque': list(tau[:6]) if pos is not None else None,
+                    'gripper_force': float(self.gripper_forces.get(ns, 0.0)),
+                    'gripper_friction': float(ctrl.get('gripper_friction', 0.0)),
                     'gravity_torque': [float(x) for x in g_torques],
                     'sweep_phase': self.runners[ns].phase,
                     'calibrated_joints': calibrated_joints,
+                    'gripper_calibrated': (
+                        7 in calibrated_joints or self.arm_models[arm.id].gripper is not None
+                    ),
+                    'gripper_model': (
+                        self.arm_models[arm.id].gripper.to_dict()
+                        if self.arm_models[arm.id].gripper is not None
+                        else None
+                    ),
                 })
 
             sweeps_by_ns = {ns: runner.to_dict() for ns, runner in self.runners.items()}
@@ -987,6 +1190,7 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                 ns = str(body.get('namespace', '/arm_1'))
                 kp_raw = body.get('kp', list(DEFAULT_SWEEP_KP))
                 kd_raw = body.get('kd')
+                gripper_effort = float(body.get('gripper_effort', DEFAULT_GRIPPER_EFFORT))
                 speeds_raw = body.get('speeds', list(DEFAULT_SWEEP_SPEEDS))
                 repeats = int(body.get('repeats', 1))
                 approach_speed = float(body.get('approach_speed', 0.4))
@@ -1005,6 +1209,7 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                             repeats=repeats,
                             kp=tuple(float(x) for x in kp_raw),
                             kd=None if not kd_raw else tuple(float(x) for x in kd_raw),
+                            gripper_effort=gripper_effort,
                             approach_speed=approach_speed,
                             settle_time=settle_time,
                         ))
@@ -1018,6 +1223,7 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                         repeats=repeats,
                         kp=tuple(float(x) for x in kp_raw),
                         kd=None if not kd_raw else tuple(float(x) for x in kd_raw),
+                        gripper_effort=gripper_effort,
                         approach_speed=approach_speed,
                         settle_time=settle_time,
                     ))
@@ -1127,17 +1333,35 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                     raise ValueError('YAML output path is required')
                 arm_id = str(body.get('arm_id', 'arm_1'))
                 joints_payload = body.get('joints')
+                gripper_payload = body.get('gripper')
                 with self.node.lock:
                     model = self.node.arm_models.get(arm_id, ArmFrictionModel(arm_id=arm_id))
+                    if Path(yaml_path).is_file():
+                        try:
+                            existing = load_friction_model(yaml_path)
+                            for j_i, j_m in model.joints.items():
+                                existing = existing.with_joint(j_i, j_m)
+                            if model.gripper is not None:
+                                existing = existing.with_gripper(model.gripper)
+                            model = existing
+                        except Exception:
+                            pass
                     if isinstance(joints_payload, dict) and joints_payload:
                         for j_key, j_val in joints_payload.items():
                             j_idx = int(str(j_key).replace('joint', ''))
                             j_dict = j_val.get('model', j_val) if isinstance(j_val, dict) else {}
                             if j_dict:
-                                model = model.with_joint(j_idx, JointFrictionModel.from_dict(j_dict))
-                        self.node.arm_models[arm_id] = model
-                    if model is None or not model.joints:
-                        raise ValueError('No fitted joint model available to save')
+                                if j_idx == 7:
+                                    model = model.with_gripper(GripperFrictionModel.from_dict(j_dict))
+                                else:
+                                    model = model.with_joint(j_idx, JointFrictionModel.from_dict(j_dict))
+                    if isinstance(gripper_payload, dict) and gripper_payload:
+                        g_dict = gripper_payload.get('model', gripper_payload)
+                        if isinstance(g_dict, dict) and g_dict:
+                            model = model.with_gripper(GripperFrictionModel.from_dict(g_dict))
+                    self.node.arm_models[arm_id] = model
+                    if model is None or (not model.joints and model.gripper is None):
+                        raise ValueError('No fitted joint or gripper model available to save')
                 saved = save_friction_model(model, yaml_path).resolve()
                 self._send_json(200, {'ok': True, 'path': str(saved)})
                 return
@@ -1149,19 +1373,42 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                 fric_scale = float(body.get('friction_scale', 1.0))
                 model_dict = body.get('model')
                 if isinstance(model_dict, dict):
-                    jm = JointFrictionModel.from_dict(model_dict)
+                    jm: JointFrictionModel | GripperFrictionModel = (
+                        GripperFrictionModel.from_dict(model_dict)
+                        if 'w_grid' in model_dict
+                        else JointFrictionModel.from_dict(model_dict)
+                    )
                 else:
                     with self.node.lock:
                         if self.node.latest_fit is None:
                             raise ValueError('Fit a model first before evaluating')
-                        jm = JointFrictionModel.from_dict(self.node.latest_fit['model'])
+                        raw_m = self.node.latest_fit['model']
+                        jm = (
+                            GripperFrictionModel.from_dict(raw_m)
+                            if 'w_grid' in raw_m
+                            else JointFrictionModel.from_dict(raw_m)
+                        )
                 env = jm.envelope(velocity)
-                cog = env * jm.cogging_torque(theta)
-                mod = env * jm.modulation_torque(theta) * math.tanh(velocity / jm.v0)
-                stribeck = jm.stribeck_torque(velocity)
-                total = jm.torque(
-                    theta, velocity, cogging_scale=cog_scale, friction_scale=fric_scale,
-                )
+                if isinstance(jm, GripperFrictionModel):
+                    if velocity != 0.0:
+                        s_v = abs(velocity)
+                        dry = jm.fc + (jm.fs - jm.fc) * math.exp(-((s_v / jm.vs) ** jm.delta))
+                        dir_v = math.tanh(velocity / jm.v0)
+                        cog = math.tanh(s_v / jm.v0) * jm.bias_force(theta)
+                        mod = env * jm.modulation_force(theta) * dir_v
+                        stribeck = dry * dir_v + jm.fv * velocity
+                    else:
+                        cog = mod = stribeck = 0.0
+                    total = jm.force(
+                        theta, velocity, bias_scale=cog_scale, friction_scale=fric_scale,
+                    )
+                else:
+                    cog = env * jm.cogging_torque(theta)
+                    mod = env * jm.modulation_torque(theta) * math.tanh(velocity / jm.v0)
+                    stribeck = jm.stribeck_torque(velocity)
+                    total = jm.torque(
+                        theta, velocity, cogging_scale=cog_scale, friction_scale=fric_scale,
+                    )
                 self._send_json(200, {
                     'ok': True,
                     'envelope': env,

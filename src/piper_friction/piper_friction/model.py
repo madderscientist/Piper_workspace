@@ -2,6 +2,7 @@
 
 from piper_x_driver.friction import (
     ArmFrictionModel,
+    GripperFrictionModel,
     JointFrictionModel,
     SpatialHarmonic,
     load_friction_model,
@@ -10,6 +11,7 @@ from piper_x_driver.friction import (
 
 __all__ = [
     'ArmFrictionModel',
+    'GripperFrictionModel',
     'JointFrictionModel',
     'SpatialHarmonic',
     'load_friction_model',

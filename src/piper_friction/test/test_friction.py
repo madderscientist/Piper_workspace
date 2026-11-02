@@ -190,13 +190,15 @@ def test_ros_sweep_collector_and_cli_pipeline(tmp_path):
     executor.add_node(collector)
     try:
         deadline = time.monotonic() + 15.0
+        zeroed_during_sweep = False
         while not collector.completed and not collector.error and time.monotonic() < deadline:
             executor.spin_once(timeout_sec=0.005)
+            if collector.phase == 'running' and driver.control.friction_scale == 0.0:
+                zeroed_during_sweep = True
         assert collector.completed, collector.error
-        # Entering calibration automatically sets driver friction_scale to 0.0
-        assert driver.control.friction_scale == 0.0
-        assert driver.control.friction_scale_applied == 0.0
-        assert FleetConfig(cfg_path).arm('arm_1').friction_scale == 0.0
+        assert zeroed_during_sweep
+        # Calibration never modifies arms.yaml on disk
+        assert FleetConfig(cfg_path).arm('arm_1').friction_scale == FleetConfig(default_config_path()).arm('arm_1').friction_scale
         assert len(collector.samples) > 40
 
         csv_file = save_samples_csv(collector.samples, tmp_path / 'ros_j1.csv')
@@ -239,6 +241,8 @@ def test_web_workbench_demo_all_and_sequential_queue(tmp_path):
     try:
         html = urlopen(f'{base_url}/', timeout=3).read().decode('utf-8')
         assert '关节摩擦力与周期性齿轮阻碍标定工作台' in html
+        gripper_html = urlopen(f'{base_url}/gripper.html', timeout=3).read().decode('utf-8')
+        assert '夹爪 / 示教手柄非周期摩擦力标定工作台' in gripper_html
 
         req = Request(
             f'{base_url}/api/fit',
@@ -246,9 +250,22 @@ def test_web_workbench_demo_all_and_sequential_queue(tmp_path):
             headers={'Content-Type': 'application/json'},
             method='POST',
         )
-        fit_resp = json.loads(urlopen(req, timeout=10).read().decode('utf-8'))
+        fit_resp = json.loads(urlopen(req, timeout=30).read().decode('utf-8'))
         assert fit_resp['ok'] is True
         assert set(fit_resp['joint_fits'].keys()) == {'1', '2', '3', '4', '5', '6'}
+
+        req_g = Request(
+            f'{base_url}/api/fit',
+            data=json.dumps({'source': 'demo', 'arm_id': 'arm_1', 'joint': 7}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        fit_g_resp = json.loads(urlopen(req_g, timeout=30).read().decode('utf-8'))
+        assert fit_g_resp['ok'] is True
+        assert fit_g_resp['fit']['is_gripper'] is True
+        assert len(fit_g_resp['fit']['profile_knots']) >= 10
+        assert fit_g_resp['fit']['metrics']['rmse_total'] < 0.03
+        assert '7' in fit_g_resp['joint_fits']
 
         yaml_out = tmp_path / 'seq_arm1.yaml'
         sweep_req = Request(
@@ -290,11 +307,14 @@ def test_web_workbench_demo_all_and_sequential_queue(tmp_path):
         web_node.active_namespace = '/arm_1'
 
         deadline = time.monotonic() + 15.0
+        zeroed_during_web_sweep = False
         while web_node.sweep_phase != 'completed' and time.monotonic() < deadline:
             executor.spin_once(timeout_sec=0.005)
+            if web_node.sweep_phase == 'running' and driver.control.friction_scale == 0.0:
+                zeroed_during_web_sweep = True
         assert web_node.sweep_phase == 'completed', web_node.sweep_error
-        assert driver.control.friction_scale == 0.0
-        assert driver.control.friction_scale_applied == 0.0
+        assert zeroed_during_web_sweep
+        assert FleetConfig(cfg_path).arm('arm_1').friction_scale == FleetConfig(default_config_path()).arm('arm_1').friction_scale
         assert 1 in web_node.joint_samples['arm_1'] and 2 in web_node.joint_samples['arm_1']
     finally:
         server.shutdown()

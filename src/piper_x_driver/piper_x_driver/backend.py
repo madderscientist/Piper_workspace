@@ -1,7 +1,9 @@
 """The only boundary that knows pyAgxArm and its pinned parser internals."""
 
+from collections import deque
 from dataclasses import dataclass
 import math
+import threading
 import time
 from typing import Literal
 
@@ -53,6 +55,8 @@ class Feedback:
     pose: tuple[float, ...] | None = None
     velocity: tuple[float, ...] = ()
     torque: tuple[float, ...] = ()
+    gripper_velocity: float = 0.0
+    gripper_force: float = 0.0
 
 
 def fresh(ages, timeout=1.0):
@@ -123,6 +127,12 @@ class SdkArm:
                             time.sleep(0.05)
                         break
                     time.sleep(0.02)
+                self._grip_thread = threading.Thread(
+                    target=self._grip_interp_loop,
+                    name=f'grip-interp-{channel}',
+                    daemon=True,
+                )
+                self._grip_thread.start()
         except (RuntimeError, ValueError, OSError, CanError):
             self.robot.disconnect()
             raise
@@ -134,6 +144,19 @@ class SdkArm:
         self._mode = 'standby'
         self._powered = False
         self.mit_output = None
+        self._grip_history: deque[tuple[float, float]] = deque(maxlen=16)
+        self._grip_vel: float = 0.0
+        self._grip_cond = threading.Condition()
+        self._grip_stop = False
+        self._grip_thread: threading.Thread | None = None
+        self._grip_cmd_pos: float | None = None
+        self._grip_start_pos: float = 0.0
+        self._grip_target_pos: float = 0.0
+        self._grip_target_effort: float = 0.0
+        self._grip_interp_t0: float = 0.0
+        self._grip_last_cmd_time: float = 0.0
+        self._grip_last_tx_time: float = 0.0
+        self._grip_interp_active: bool = False
 
     def _enter_drag(self):
         self.mode('drag')
@@ -211,7 +234,39 @@ class SdkArm:
             sample = self.robot.get_flange_pose()
             if sample is not None:
                 pose = tuple(sample.msg)
-        return Feedback(position, fields, enabled, ages, pose, velocity, torque)
+        gripper_velocity = 0.0
+        gripper_force = 0.0
+        if grip is not None and 0 <= ages[3] <= 1.0:
+            grip_pos = float(grip.msg.value)
+            raw_force = getattr(grip.msg, 'force', 0.0)
+            if raw_force is not None and math.isfinite(float(raw_force)):
+                gripper_force = float(raw_force)
+            grip_stamp = timestamps[3]
+            if grip_stamp is not None:
+                if not self._grip_history or grip_stamp > self._grip_history[-1][0]:
+                    if self._grip_history and grip_stamp - self._grip_history[-1][0] > 0.5:
+                        self._grip_history.clear()
+                    self._grip_history.append((grip_stamp, grip_pos))
+                    while (len(self._grip_history) > 2
+                           and grip_stamp - self._grip_history[0][0] > 0.030):
+                        self._grip_history.popleft()
+                if len(self._grip_history) >= 4 and (
+                    abs(self._grip_history[-1][1] - self._grip_history[-4][1]) < 5e-5
+                ):
+                    # Stationary for the most recent 4 CAN frames (~20 ms) -> zero lag stop
+                    self._grip_vel = 0.0
+                elif len(self._grip_history) >= 2:
+                    t0_g, p0_g = self._grip_history[0]
+                    t1_g, p1_g = self._grip_history[-1]
+                    dt = t1_g - t0_g
+                    self._grip_vel = (p1_g - p0_g) / dt if dt >= 1e-4 else 0.0
+                else:
+                    self._grip_vel = 0.0
+            gripper_velocity = self._grip_vel
+        return Feedback(
+            position, fields, enabled, ages, pose, velocity, torque,
+            gripper_velocity, gripper_force,
+        )
 
     def calibrate_effector(self):
         if not self.gripper.calibrate_gripper(timeout=1.0):
@@ -249,7 +304,7 @@ class SdkArm:
                     break
         if not enabled or not errors:
             try:
-                self.gripper.disable_gripper()
+                self._disable_gripper()
             except CanError as error:
                 errors.append(f'gripper: {error}')
         if errors:
@@ -270,11 +325,11 @@ class SdkArm:
                 # 切入固件内置零力拖动前，将固件末端负载档位设为满载（0x477: set_end_load=0x02）
                 self.robot._send_msg(ArmMsgParamEnquiryAndConfig(
                     end_load_param_setting_effective=0xAE, set_end_load=0x02))
-                self.gripper.disable_gripper()
+                self._disable_gripper()
                 self.robot._send_msg(ArmMsgLeaderFollowerModeConfig(
                     linkage_config=0xFA, linkage_offset=0x10))
                 self.robot.restore_leader_drag_mode()
-                self.gripper.disable_gripper()
+                self._disable_gripper()
             else:
                 self.robot.set_leader_mode()
                 self.robot.restore_leader_drag_mode()
@@ -363,11 +418,85 @@ class SdkArm:
                 kp_wire, max(0.0, min(5.0, kd / scale)), torque,
             )
 
-    def grip(self, width, effort):
-        if effort <= 0.0:
-            self.gripper.disable_gripper()
+    def _disable_gripper(self):
+        if hasattr(self, '_grip_cond'):
+            with self._grip_cond:
+                self._grip_interp_active = False
+                self._grip_cmd_pos = None
+                self.gripper.disable_gripper()
         else:
-            self.gripper.move_gripper_m(value=width, force=effort)
+            self.gripper.disable_gripper()
+
+    def _grip_interp_loop(self):
+        while True:
+            with self._grip_cond:
+                while not self._grip_stop and not self._grip_interp_active:
+                    self._grip_cond.wait()
+                if self._grip_stop:
+                    return
+                now = time.monotonic()
+                while not self._grip_stop and self._grip_interp_active:
+                    wait_sec = 0.005 - (now - self._grip_last_tx_time)
+                    if wait_sec <= 0.0005:
+                        break
+                    self._grip_cond.wait(timeout=wait_sec)
+                    now = time.monotonic()
+                if self._grip_stop or not self._grip_interp_active:
+                    continue
+                alpha = min(1.0, (max(0.0, now - self._grip_interp_t0) + 0.005) / 0.020)
+                w_sub = self._grip_start_pos + alpha * (
+                    self._grip_target_pos - self._grip_start_pos
+                )
+                self._grip_cmd_pos = w_sub
+                self._grip_last_tx_time = now
+                if alpha >= 1.0:
+                    self._grip_interp_active = False
+                try:
+                    self.gripper.move_gripper_m(
+                        value=w_sub, force=self._grip_target_effort
+                    )
+                except (RuntimeError, ValueError, OSError, CanError):
+                    pass
+
+    def grip(self, width, effort, interpolate=True):
+        if effort <= 0.0:
+            self._disable_gripper()
+            return
+        target_w, target_eff = float(width), float(effort)
+        if getattr(self, '_grip_thread', None) is None or not self._real_sdk():
+            self.gripper.move_gripper_m(value=target_w, force=target_eff)
+            return
+        with self._grip_cond:
+            if not interpolate:
+                self._grip_interp_active = False
+                self._grip_cmd_pos = None
+                self.gripper.move_gripper_m(value=target_w, force=target_eff)
+                return
+            now = time.monotonic()
+            dt = now - self._grip_last_cmd_time
+            self._grip_last_cmd_time = now
+            start_w = (
+                (float(self._grip_history[-1][1]) if self._grip_history else target_w)
+                if (self._grip_cmd_pos is None or dt > 0.080)
+                else self._grip_cmd_pos
+            )
+            self._grip_target_pos = target_w
+            self._grip_target_effort = target_eff
+            if abs(target_w - start_w) <= 0.0002:
+                self._grip_cmd_pos = target_w
+                self._grip_interp_active = False
+                self._grip_last_tx_time = now
+                self.gripper.move_gripper_m(value=target_w, force=target_eff)
+            else:
+                self._grip_start_pos = start_w
+                self._grip_interp_t0 = now
+                self._grip_interp_active = True
+                if now - self._grip_last_tx_time >= 0.004:
+                    w_step = start_w + 0.25 * (target_w - start_w)
+                    self._grip_cmd_pos = w_step
+                    self._grip_last_tx_time = now
+                    self.gripper.move_gripper_m(value=w_step, force=target_eff)
+                self._grip_cond.notify()
 
     def close(self):
         try:
@@ -377,4 +506,12 @@ class SdkArm:
             self._disconnect()
 
     def _disconnect(self):
+        if hasattr(self, '_grip_cond'):
+            with self._grip_cond:
+                self._grip_stop = True
+                self._grip_interp_active = False
+                self._grip_cond.notify_all()
+        if getattr(self, '_grip_thread', None) is not None and self._grip_thread.is_alive():
+            self._grip_thread.join(timeout=0.2)
+        self._grip_thread = None
         self.robot.disconnect()

@@ -466,6 +466,58 @@ def test_controller_applies_configured_friction_compensation_in_mit(fake_arm):
     assert arm.calls[-1][1].torque[0] == pytest.approx(0.0)
 
 
+def test_controller_applies_nonperiodic_gripper_friction_in_active_and_free_drag(fake_arm):
+    from piper_x_driver.friction import ArmFrictionModel, GripperFrictionModel
+
+    arm = fake_arm()
+    g_model = GripperFrictionModel(
+        fc=0.40,
+        fs=0.70,
+        vs=0.015,
+        fv=2.0,
+        v0=0.002,
+        vr=0.08,
+        kp_equiv=100.0,
+        w_grid=(0.005, 0.035, 0.065),
+        bias_grid=(-0.20, -0.35, -0.55),
+        modulation_grid=(0.15, -0.10, 0.20),
+    )
+    # Non-periodic spatial profile varies across stroke positions
+    assert g_model.local_fc(0.005) != g_model.local_fc(0.035)
+    assert g_model.bias_force(0.005) != g_model.bias_force(0.065)
+
+    friction_model = ArmFrictionModel(arm_id='arm_1', gripper=g_model)
+    control = Controller(arm, friction_model=friction_model)
+    control.start_mit()
+    arm.status['ctrl_mode'] = 1
+    arm.status['mode_feedback'] = 6
+
+    # 1. Slave / active control (effort > 0): preserves w_cmd without self-excitation and adds |f_comp| to effort
+    base_snapshot = arm.snapshot
+    arm.position = arm.position[:6] + (0.010,)
+    arm.snapshot = lambda: replace(base_snapshot(), position=arm.position, gripper_velocity=0.05)
+    control.gripper(SimpleNamespace(width=0.050, effort=1.5))
+    last_call = arm.calls[-1]
+    assert last_call[0] == 'grip'
+    assert last_call[1] == pytest.approx(0.050)
+    assert last_call[2] == pytest.approx(1.5 + abs(control.gripper_friction))
+    assert control.gripper_friction > 0.0
+
+    # 2. Master / passive drag (effort <= 0): velocity-indexed assist when moving, 0 when stationary
+    arm.position = arm.position[:6] + (0.035,)
+    arm.snapshot = lambda: replace(base_snapshot(), position=arm.position, gripper_velocity=0.02)
+    control.gripper(SimpleNamespace(width=0.035, effort=0.0))
+    assert arm.calls[-1][0] == 'grip'
+    assert arm.calls[-1][2] > 0.0
+    assert control.gripper_friction != 0.0
+
+    # 3. Stationary (velocity == 0): drops to 0.0
+    arm.snapshot = lambda: replace(base_snapshot(), position=arm.position, gripper_velocity=0.0)
+    control.gripper(SimpleNamespace(width=0.035, effort=0.0))
+    assert arm.calls[-1] == ('grip', 0.035, 0.0)
+    assert control.gripper_friction == 0.0
+
+
 def test_controller_applies_configured_gravity_model_in_mit(fake_arm):
     from piper_x_driver.gravity import ArmGravityModel, JointGravityModel, gravity_torques
 

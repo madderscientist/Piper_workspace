@@ -232,3 +232,119 @@ from piper_friction import load_friction_model
 model = load_friction_model('/tmp/arm1_friction.yaml')
 tau_fric = model.torques(positions, velocities, cogging_scale=1.0, friction_scale=0.8)
 ```
+
+---
+
+## 4. 夹爪非周期空间摩擦力模型、标定与启用说明
+
+### 4.1 为什么夹爪不能沿用六关节的周期谐波模型？
+
+与 J1～J6 旋转关节（永磁同步电机 + 谐波/行星减速器，阻力具有固定空间角频率 $\omega_m$ 的周期性）不同，末端夹爪 / 示教手柄在行程 $w \in [0, w_{\max}]$（单位 $\text{m}$）上采用**连杆 / 齿轮齿条 / 平行滑块导轨机构**，其空间阻力分布是**非周期的**：
+1. **非线性传动比（连杆雅可比 $J(w)$）**：电机转角到指尖平行开度 $w$ 的等效传动比随开度连续变化；
+2. **导轨接触应力不均**：闭合端、中段与张开端的滑块倾覆力矩及装配预紧力不同（例如两端紧、中间松）；
+3. **非周期位置偏置力 $F_{\text{bias}}(w)$**：复位弹簧或连杆弹性死点产生随开度变化的单向偏置力。
+
+因此，夹爪模型 `GripperFrictionModel`（实现见 [`piper_x_driver/friction.py`](../src/piper_x_driver/piper_x_driver/friction.py)）不再做 FFT 谐波展开，而是采用**一维开度网格分段线性插值剖面（Non-periodic Spatial Profile）+ Stribeck 速度模型**：
+
+$$
+F_{\text{grip}}(w, \dot{w}) =
+\underbrace{
+  \Big[
+    \max\!\big(0,\; F_c + (F_s - F_c)e^{-(|\dot{w}|/v_s)^\delta} + e^{-(\dot{w}/v_r)^2}\Delta F_c(w)\big)\tanh\!\left(\frac{\dot{w}}{v_0}\right)
+    + F_v \dot{w}
+  \Big]
+}_{\text{A. 方向相关的非周期动/静摩擦项（由正反半差剖面插值）}}
+\;+\;
+\underbrace{
+  \tanh\!\left(\frac{|\dot{w}|}{v_0}\right) F_{\text{bias}}(w)
+}_{\text{B. 方向无关的非周期位置偏置项（由正反半和剖面插值，不做线性 detrend）}}
+$$
+
+其中：
+- `w_grid`：开度采样节点（单位 $\text{m}$，默认覆盖 `0.003 ~ 0.080 m` 稳态重叠区，共 25 个节点）；
+- `bias_grid`：各节点上的方向无关位置偏置力 $F_{\text{bias}}(w_i)$（正反扫描半和 $\frac{1}{2}(f^+(w) + f^-(w))$，完整保留非周期趋势）；
+- `modulation_grid`：各节点上的方向相关空间摩擦调制 $\Delta F_c(w_i)$（正反扫描半差去均值 $\frac{1}{2}(f^+(w) - f^-(w)) - \bar{F}_c$）；
+- `kp_equiv` 与 `kv_equiv`：由多速扫描期间的稳态跟踪滞后 $\lvert w_{\text{des}} - w_{\text{meas}} \rvert = \Delta w_0 + \lvert \dot{w} \rvert / k_{v,\text{equiv}}$ 联合线性回归辨识出的**固件内环稳态力矩刚度 $k_{p,\text{equiv}} = \text{median}(\lvert f_{\text{meas}} \rvert) / \Delta w_0$（单位 $\text{N/m}$）**与**外环位置-速度比例增益 $k_{v,\text{equiv}}$（单位 $\text{s}^{-1}$）**。
+
+---
+
+### 4.2 统一的夹爪摩擦力补偿公式（主臂 / 从臂 / 双边力控 / 代码控制通用）
+
+夹爪底层通过 CAN `0x159`（`width, effort, status_code`）控制，对应上层 ROS 话题 `/arm_X/command/gripper`（`GripperCommand`）。固件内部采用**位置外环（增益 $k_{v,\text{equiv}}$）+ 速度-力矩内环（刚度 $k_{p,\text{equiv}}$）**的串级结构。每条机械臂统一**仅读取本臂自身 CAN `0x2A8` 反馈的实测开度 $w_{\text{meas}}$ 与实测速度 $\dot{w}_{\text{meas}}$**（经 `30 ms` 滑动窗口估计，静止时严格为 $0$），完全使用标定参数进行补偿（实现见 [`GripperFrictionModel.compensate_command`](../src/piper_x_driver/piper_x_driver/friction.py)）：
+
+#### 1. 由本臂实测开度与速度计算补偿力 $f_{\text{comp}}$
+
+直接使用标定得到的完整非周期空间摩擦 + Stribeck 模型 $F_{\text{grip}}(w_{\text{meas}}, \dot{w}_{\text{meas}})$（含 Stribeck 静-动摩擦、空间调制 $\Delta F_c(w)$、粘滞项 $F_v\dot{w}$ 与非周期位置偏置 $F_{\text{bias}}(w)$，在 $\dot{w}_{\text{meas}} = 0$ 处经 $\tanh(\dot{w}_{\text{meas}}/v_0)$ 严格过零且连续可导）：
+
+$$
+f_{\text{comp}}(w_{\text{meas}}, \dot{w}_{\text{meas}}) = s \cdot F_{\text{grip}}(w_{\text{meas}}, \dot{w}_{\text{meas}})
+$$
+
+（其中 $s = \text{friction\_scale\_applied}$；当 $\lvert f_{\text{comp}} \rvert < 10^{-3}\text{ N}$ 小于硬件 $1\text{ mN}$ 最小分辨率或静止 $\dot{w}_{\text{meas}} = 0$ 时，$f_{\text{comp}} = 0$。）
+
+#### 2. 统一的力矩上限 $\text{effort}_{\text{out}}$ 与位置死区补偿 $w_{\text{out}}$
+
+与六轴关节（J1～J6）在 `driver` 内部根据 `kp == 0`（零刚度被动拖动）或 `kp > 0`（有刚度主动跟踪）自动切换重力补偿路径完全对称，夹爪在 CAN `0x159` 中没有 `kp` 字段，**`effort_cmd` 即为夹爪唯一表征“有无外部主动保持力”的物理量**。因此 `driver` 内部直接根据 `effort_cmd <= 0`（被动自由拖动 / 主臂）与 `effort_cmd > 0`（主动控制 / 从臂 / 双边力控）确定基准目标位置 $w_{\text{target}}$，使上层节点（如 `TeachingNode`）无需感知底层摩擦标定参数，且单臂不启动示教节点时也能独立享有被动捏合补偿：
+
+- **基准目标位置 $w_{\text{target}}$（为什么 `effort_cmd <= 0` 需要加一项速度折算位置 $\dot{w}_{\text{meas}} / k_{v,\text{equiv}}$？）**：
+  - 夹爪固件内部是**“位置外环（增益 $k_v$）$\to$ 速度-力矩内环（刚度 $k_p$）”**的串级控制器：
+    1. 位置外环先根据位置差算出固件内部期望速度：$\dot{w}_{\text{ref}} = k_{v,\text{equiv}} \cdot (w_{\text{out}} - w_{\text{meas}})$；
+    2. 速度-力矩内环再根据速度差 $(\dot{w}_{\text{ref}} - \dot{w}_{\text{meas}})$ 输出电机力矩。**只有当内部期望速度 $\dot{w}_{\text{ref}} > \dot{w}_{\text{meas}}$ 时，内环才会产生顺向助推力；若 $\dot{w}_{\text{ref}} < \dot{w}_{\text{meas}}$，内环反而会输出反向制动力（电感/阻尼刹车）！**
+  - 当 **`effort_cmd > 0`（主动控制 / 从臂 / 双边力控）** 时，外部或主臂给定的目标位置 $w_{\text{cmd}}$ 本身就超前于当前实测位置 $w_{\text{meas}}$（在速度 $\dot{w}$ 下天然保持 $\ge \dot{w} / k_{v,\text{equiv}}$ 的跟踪超前量），因此直接使用 $w_{\text{target}} = w_{\text{cmd}}$ 即可，无需也不能再叠加自身实测速度（否则会将从臂输出速度正反馈回输入位置引发自激）。
+  - 当 **`effort_cmd <= 0`（主臂 / 被动自由拖动）** 时，上层没有外部轨迹输入（每帧传入的基准位置就是当前实测位置 $w_{\text{meas}}$，位置差恒为 $0$）。若不补偿速度环超前量，当人手以速度 $\dot{w}_{\text{meas}}$ 捏动夹爪时，固件位置外环算出的期望速度 $\dot{w}_{\text{ref}} \approx 0 < \dot{w}_{\text{meas}}$，内环会把人手运动当成“超速”而反向制动，完全无法输出顺向摩擦补偿力。因此必须加上速度折算位置 $s \cdot \dot{w}_{\text{meas}} / k_{v,\text{equiv}}$，使固件外环算出的 $\dot{w}_{\text{ref}}$ 恰好同步跟上人手当前速度 $\dot{w}_{\text{meas}}$（消除内环阻尼拖累），再由 $\dfrac{f_{\text{comp}}}{k_{p,\text{equiv}}}$ 产生正向补偿推力。
+- **统一的摩擦位置偏置与力矩补偿**（对主动代码控制、从臂、双边力控、主臂完全一致）：
+
+$$
+\begin{aligned}
+w_{\text{out}} &= \begin{cases}
+w_{\text{cmd}}, & \text{effort}_{\text{cmd}} > 0 \quad \text{（代码主动控制 / 从臂 / 双边力控：保持外部目标位置）} \\[4pt]
+w_{\text{meas}} + \dfrac{f_{\text{comp}}}{k_{p,\text{equiv}}} + \dfrac{\dot{w}_{\text{meas}}}{k_{v,\text{equiv}}}, & \text{effort}_{\text{cmd}} \le 0 \quad \text{（主臂 / 被动自由拖动：瞬态比例饱和 + 抵消速度外环滞后）}
+\end{cases} \\[8pt]
+\text{effort}_{\text{out}} &= \max(0,\; \text{effort}_{\text{cmd}}) + \lvert f_{\text{comp}} \rvert
+\end{aligned}
+$$
+
+| 运行场景 | 上层输入的 `(w_cmd, effort_cmd)` | 最终下发给 `0x159` 的 `(w_out, effort_out)` |
+|---|---|---|
+| **单臂自由拖动 / 主从模式主臂** | `w_cmd = w_meas`, `effort_cmd = 0` | $w_{\text{out}} = w_{\text{meas}} + \dfrac{f_{\text{comp}}}{k_{p,\text{equiv}}} + \dfrac{\dot{w}_{\text{meas}}}{k_{v,\text{equiv}}}, \quad \text{effort}_{\text{out}} = \lvert f_{\text{comp}} \rvert$ |
+| **代码主动控制 / 主从从臂 / 双边力控** | `w_cmd`, `effort_cmd > 0` | $w_{\text{out}} = w_{\text{cmd}}, \quad \text{effort}_{\text{out}} = \text{effort}_{\text{cmd}} + \lvert f_{\text{comp}} \rvert$ |
+
+---
+
+### 4.3 夹爪摩擦力标定流程与启用方法
+
+#### 1. 使用独立 Web 专页标定（`gripper.html`）
+
+```bash
+# 终端 1：启动驱动
+ros2 launch piper_x_driver four_arms.launch.py
+
+# 终端 2：启动摩擦力标定工作台
+ros2 run piper_friction web --port 8090
+```
+
+浏览器打开 **`http://127.0.0.1:8090/gripper.html`**（或点击首页右上角 **“🦾 夹爪非周期摩擦标定专页 →”**）：
+1. 点击选择目标机械臂卡片（选中卡片高亮显示）；
+2. 确认扫描行程范围（默认 `0.003 ~ 0.080 m`）、扫描线速度（默认 `0.005 0.010 0.020 0.040 0.080 m/s`）与扫描力限幅（默认 `2.0 N`）；
+3. 点击 **“▶ 开始夹爪多速往复扫描采集”**（扫描期间机械臂六个关节保持原状不动，仅夹爪通过 `0x159` 独立往复开合，完成后自动拟合并将 `gripper:` 段合并写入 `config/arm_X_friction.yaml`）。
+
+也可直接使用命令行完成夹爪（`--joint 7`）扫描与拟合：
+
+```bash
+ros2 run piper_friction sweep \
+  --namespace /arm_1 --arm-id arm_1 --joint 7 \
+  --q-min 0.003 --q-max 0.080 \
+  --speeds 0.005 0.010 0.020 0.040 0.080 \
+  --gripper-effort 2.0 \
+  --output-csv /home/a/piper_x_ws/src/piper_friction/config/arm_1_sweep_j7.csv \
+  --fit-output /home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml
+```
+
+#### 2. 在驱动中启用夹爪摩擦力补偿
+
+1. 确保 [`src/piper_friction/config/arm_1_friction.yaml`](config/arm_1_friction.yaml)～[`arm_4_friction.yaml`](config/arm_4_friction.yaml) 中已包含标定生成的 `gripper:` 节点；
+2. 确保 [`src/piper_x_driver/config/arms.yaml`](../src/piper_x_driver/config/arms.yaml) 中对应机械臂的：
+   - `friction_config` 指向该 YAML 文件；
+   - `friction_scale` 大于 `0`（推荐 `0.85`；注意标定采集开始时会自动将 `friction_scale` 置 `0.0`，标定结束后可在 Web 页面点击 **“恢复 0.85”** 或在 `arms.yaml` 中设回 `0.85`）；
+3. 启动或重启驱动（`ros2 launch piper_x_driver four_arms.launch.py`），驱动即会根据本臂实测开度与速度在主动跟随（`effort > 0`）与被动捏合（`effort <= 0`）下自动应用非周期夹爪摩擦力补偿，并在 `/arm_X/control_state` 的 `gripper_friction` 字段中实时上报当前补偿力。
+

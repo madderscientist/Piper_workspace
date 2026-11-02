@@ -13,6 +13,7 @@ from piper_x_interfaces.srv import Enable, SetMode
 import rclpy
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
@@ -62,26 +63,31 @@ class TeachingNode(Node):
         self.holding = False
         self.retry_requested = False
         self._last_tick = time.monotonic()
+        realtime_sub_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
         for index in range(4):
             prefix = self.fleet.arms[index].namespace
             self.create_subscription(
                 JointState, prefix + '/joint_states_feedback',
-                lambda message, i=index: self._joints(i, message), 10)
+                lambda message, i=index: self._joints(i, message), realtime_sub_qos)
             self.create_subscription(
                 ArmStatus, prefix + '/arm_status',
-                lambda message, i=index: self._status(i, message), 10)
+                lambda message, i=index: self._status(i, message), realtime_sub_qos)
             self.create_subscription(
                 String, prefix + '/control_state',
-                lambda message, i=index: self._driver_control(i, message), 1)
+                lambda message, i=index: self._driver_control(i, message), realtime_sub_qos)
             self.power_clients.append(self.create_client(Enable, prefix + '/enable_srv'))
             self.mode_clients.append(self.create_client(SetMode, prefix + '/set_mode'))
-            self.mit_pubs.append(self.create_publisher(MitCommand, prefix + '/command/mit', 1))
+            self.mit_pubs.append(self.create_publisher(MitCommand, prefix + '/command/mit', 10))
             self.gripper_pubs.append(self.create_publisher(
-                GripperCommand, prefix + '/command/gripper', 1))
+                GripperCommand, prefix + '/command/gripper', 10))
             self.target_pubs.append(self.create_publisher(
-                JointState, f'/bilateral_teaching/arm_{index + 1}/target', 1))
+                JointState, f'/bilateral_teaching/arm_{index + 1}/target', 10))
         self.state_pub = self.create_publisher(String, '/bilateral_teaching/state', 10)
-        self.active_pub = self.create_publisher(Bool, '/bilateral_teaching/active', 1)
+        self.active_pub = self.create_publisher(Bool, '/bilateral_teaching/active', 10)
         self.create_service(Trigger, '/bilateral_teaching/start', self._start)
         self.create_service(Trigger, '/bilateral_teaching/stop', self._stop_service)
         self.create_service(SetMode, '/bilateral_teaching/set_mode', self._set_mode)

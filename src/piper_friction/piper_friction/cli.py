@@ -7,18 +7,62 @@ from typing import Sequence
 
 import rclpy
 
-from .collector import DEFAULT_SWEEP_KP, DEFAULT_SWEEP_SPEEDS, SweepCollectorNode, SweepConfig
+from .collector import (
+    DEFAULT_GRIPPER_EFFORT,
+    DEFAULT_SWEEP_KP,
+    DEFAULT_SWEEP_SPEEDS,
+    SweepCollectorNode,
+    SweepConfig,
+)
 from .identification import (
     IdentificationReport,
     identify_joint_friction,
     load_samples_csv,
     save_samples_csv,
 )
-from .model import ArmFrictionModel, load_friction_model, save_friction_model
+from .model import (
+    ArmFrictionModel,
+    GripperFrictionModel,
+    load_friction_model,
+    save_friction_model,
+)
 
 
 def format_report(report: IdentificationReport) -> str:
     m = report.model
+    if isinstance(m, GripperFrictionModel):
+        lines = [
+            '=== Gripper (J7) Non-Periodic Friction Identification Report ===',
+            'Stribeck + Viscous (Linear Stroke):',
+            f'  Fc (Coulomb)   = {m.fc:.5f} N',
+            f'  Fs (Static)    = {m.fs:.5f} N',
+            f'  vs (Stribeck)  = {m.vs:.5f} m/s',
+            f'  fv (Viscous)   = {m.fv:.5f} N/(m/s)',
+            f'  v0 (Smoothing) = {m.v0:.5f} m/s',
+            f'  vr (Decay)     = {m.vr:.5f} m/s',
+            f'  kp_equiv       = {m.kp_equiv:.2f} N/m',
+            f'  kv_equiv       = {m.kv_equiv:.2f} 1/s',
+            f'Non-Periodic Spatial Profile Knots ({len(m.w_grid)} knots):',
+        ]
+        if m.w_grid:
+            lines.append(
+                f'  Stroke span    = {m.w_grid[0] * 1000:.2f} .. {m.w_grid[-1] * 1000:.2f} mm'
+            )
+            lines.append(
+                f'  Bias range     = {min(m.bias_grid):+.4f} .. {max(m.bias_grid):+.4f} N'
+            )
+            lines.append(
+                f'  Modulation     = {min(m.modulation_grid):+.4f} .. {max(m.modulation_grid):+.4f} N'
+            )
+        lines.extend([
+            'Fit Residuals (RMSE):',
+            f'  Total steady RMSE = {report.rmse_total:.5f} N',
+            f'  Stribeck RMSE     = {report.rmse_stribeck:.5f} N',
+            f'  Bias Profile RMSE = {report.rmse_cogging:.5f} N',
+            f'  Mod Profile RMSE  = {report.rmse_modulation:.5f} N',
+        ])
+        return '\n'.join(lines)
+
     lines = [
         f'=== Joint J{report.joint} Friction Identification Report ===',
         f'Stribeck + Viscous:',
@@ -51,16 +95,16 @@ def format_report(report: IdentificationReport) -> str:
 
 def sweep_main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description='Execute multi-speed forward/reverse MIT sweeps via ROS 2 and save CSV samples.'
+        description='Execute multi-speed forward/reverse MIT or Gripper sweeps via ROS 2 and save CSV samples.'
     )
     parser.add_argument('--namespace', default='/arm_1', help='Target arm ROS namespace (default: /arm_1)')
     parser.add_argument('--arm-id', default='arm_1', help='Arm identifier for YAML output (default: arm_1)')
-    parser.add_argument('--joint', type=int, required=True, choices=range(1, 7), help='Joint index 1..6')
-    parser.add_argument('--q-min', type=float, required=True, help='Sweep minimum angle in rad')
-    parser.add_argument('--q-max', type=float, required=True, help='Sweep maximum angle in rad')
+    parser.add_argument('--joint', type=int, required=True, choices=range(1, 8), help='Joint index 1..6 (or 7 for gripper)')
+    parser.add_argument('--q-min', type=float, required=True, help='Sweep minimum angle (rad) or width (m)')
+    parser.add_argument('--q-max', type=float, required=True, help='Sweep maximum angle (rad) or width (m)')
     parser.add_argument(
         '--speeds', type=float, nargs='+', default=list(DEFAULT_SWEEP_SPEEDS),
-        help='Constant sweep speeds in rad/s',
+        help='Constant sweep speeds in rad/s (or m/s for joint 7)',
     )
     parser.add_argument('--repeats', type=int, default=1, help='Passes per speed (default: 1)')
     parser.add_argument(
@@ -68,6 +112,10 @@ def sweep_main(argv: Sequence[str] | None = None) -> int:
         help='Six-joint MIT kp gains during sweep',
     )
     parser.add_argument('--kd', type=float, nargs=6, default=None, help='Six-joint MIT kd gains')
+    parser.add_argument(
+        '--gripper-effort', type=float, default=DEFAULT_GRIPPER_EFFORT,
+        help='Gripper effort limit (0..5 N) when sweeping joint 7 (default: 2.0)',
+    )
     parser.add_argument('--settle-time', type=float, default=0.4, help='Endpoint settle duration in s')
     parser.add_argument('--output-csv', type=Path, required=True, help='Path to write recorded CSV samples')
     parser.add_argument(
@@ -85,6 +133,7 @@ def sweep_main(argv: Sequence[str] | None = None) -> int:
         repeats=args.repeats,
         kp=tuple(args.kp),
         kd=None if args.kd is None else tuple(args.kd),
+        gripper_effort=args.gripper_effort,
         settle_time=args.settle_time,
     )
 

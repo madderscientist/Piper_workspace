@@ -60,6 +60,9 @@ class Controller:
         self.gravity = (0.0,) * 6
         self.friction = (0.0,) * 6
         self.output_torque = (0.0,) * 6
+        self.gripper_friction = 0.0
+        self._gripper_assist_active = False
+        self._gripper_received = None
         self.hold_reason = ''
 
     def feedback(self, sample=None):
@@ -97,8 +100,11 @@ class Controller:
         self.mode = 'standby'
         self.mit_target = None
         self.mit_received = None
+        self._gripper_received = None
         self.debug_session = ''
         self.gravity = self.friction = self.output_torque = (0.0,) * 6
+        self.gripper_friction = 0.0
+        self._gripper_assist_active = False
         self.hold_reason = ''
 
     def start_mit(self):
@@ -148,6 +154,8 @@ class Controller:
             self.gravity_updated = self.clock()
         else:
             self.gravity = self.friction = self.output_torque = (0.0,) * 6
+            self.gripper_friction = 0.0
+            self._gripper_assist_active = False
 
     def require_mode(self, *modes):
         if self.mode not in modes:
@@ -333,10 +341,51 @@ class Controller:
         self.gravity, self.friction, self.output_torque = (
             gravity, friction, tuple(torques),
         )
+        external_grip_active = (
+            self._gripper_received is not None
+            and 0.0 <= now - self._gripper_received <= 0.2
+        )
+        if not external_grip_active:
+            if self.mit_target is None:
+                self._apply_gripper(float(sample.position[6]), 0.0, sample, explicit=False)
+            elif self._gripper_assist_active:
+                self.arm.grip(float(sample.position[6]), 0.0)
+                self.gripper_friction = 0.0
+                self._gripper_assist_active = False
+
+    def _apply_gripper(self, width_cmd, effort_cmd, sample, explicit=True):
+        width, effort = float(width_cmd), float(effort_cmd)
+        was_assist = self._gripper_assist_active
+        g_model = None if self.friction_model is None else self.friction_model.gripper
+        if (g_model is not None and self.friction_scale_applied > 0.0
+                and sample.position is not None):
+            width, effort, self.gripper_friction = g_model.compensate_command(
+                width, effort, float(sample.position[6]),
+                float(getattr(sample, 'gripper_velocity', 0.0)),
+                scale=self.friction_scale_applied,
+            )
+            self._gripper_assist_active = (effort_cmd <= 0.0 and effort > 0.0)
+        else:
+            self.gripper_friction = 0.0
+            self._gripper_assist_active = False
+        if effort <= 0.0 and not was_assist and (
+            not explicit
+            or (getattr(self.arm, '_real_sdk', lambda: False)()
+                and len(sample.enabled) >= 7 and not sample.enabled[6])
+        ):
+            return
+        if self._gripper_assist_active:
+            try:
+                self.arm.grip(width, effort, interpolate=False)
+                return
+            except TypeError:
+                pass
+        self.arm.grip(width, effort)
 
     def gripper(self, command):
-        self.healthy()
-        self.arm.grip(command.width, command.effort)
+        sample = self.healthy(enabled=False)
+        self._gripper_received = self.clock()
+        self._apply_gripper(command.width, command.effort, sample)
 
     def watchdog(self):
         """Return one feedback snapshot after enforcing the MIT watchdog."""

@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PiPER-X · 夹爪/示教手柄非周期摩擦力与位置偏置标定工作台</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./gripper.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="page-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">G</span>
+        <h1>夹爪 / 示教手柄非周期摩擦力标定工作台</h1>
+        <span class="version">PIPER-X · NON-PERIODIC SPATIAL PROFILE + STRIBECK</span>
+      </div>
+      <div class="header-right">
+        <a href="./index.html" class="btn-xs" style="text-decoration:none;font-weight:600;">← 返回六关节 J1~J6 标定</a>
+        <span class="transport-badge" id="conn-badge">
+          <span class="dot" id="conn-dot"></span>
+          <strong id="conn-text">检测 ROS 服务中…</strong>
+        </span>
+        <button type="button" id="btn-demo-gripper" class="btn-accent-soft" title="生成夹爪非周期连杆/导轨阻力与复位弹簧偏置示例数据并运行解耦拟合">⚡ 加载夹爪非周期示例数据</button>
+        <time class="clock" id="clock">--:--:--</time>
+      </div>
+    </header>
+
+    <section class="workflow-banner" aria-label="夹爪摩擦力标定全操作流程">
+      <div class="wf-step active" id="wf-step-1" data-step="1">
+        <div class="wf-num">①</div>
+        <div class="wf-body">
+          <strong>选择 CAN 口（单臂末端）</strong>
+          <span>查看夹爪实时开度 w、速度 dw 与实测力 f_meas</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-2" data-step="2">
+        <div class="wf-num">②</div>
+        <div class="wf-body">
+          <strong>配置行程区间与多档线速度</strong>
+          <span>避开两端硬限位碰撞区，设置开合速度与扫描力限幅</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-3" data-step="3">
+        <div class="wf-num">③</div>
+        <div class="wf-body">
+          <strong>正反往复匀速开合采集</strong>
+          <span>六关节保持原状不动，仅夹爪通过 0x159 独立扫描采集 0x2A8 反馈</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-4" data-step="4">
+        <div class="wf-num">④</div>
+        <div class="wf-body">
+          <strong>非周期半和/半差剖面解耦</strong>
+          <span>不强行套用正弦波：直接提取各位置弹簧偏置 F_bias(w) 与导轨摩擦 F_c(w)</span>
+        </div>
+      </div>
+      <span class="wf-arrow" aria-hidden="true">→</span>
+      <div class="wf-step" id="wf-step-5" data-step="5">
+        <div class="wf-num">⑤</div>
+        <div class="wf-body">
+          <strong>补偿试算与合并保存 YAML</strong>
+          <span>验证主动跟踪与自由捏合助推补偿，写入 arm_X_friction.yaml 的 gripper 段</span>
+        </div>
+      </div>
+    </section>
+
+    <div id="notice-bar" class="notice-bar" hidden role="status"></div>
+
+    <div class="workbench-grid">
+      <section class="column col-left" aria-label="步骤一至三：末端选择、扫描计划与采集控制">
+        <!-- 步骤 ① -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ①</span>
+              <h2>选择目标机械臂与夹爪 / 示教手柄实时状态</h2>
+            </div>
+            <span class="sub-badge" id="selected-arm-summary">can0 · /arm_1</span>
+          </header>
+          <p class="helper-note">
+            <strong>为什么夹爪不能用正弦谐波模型？</strong>
+            夹爪/示教手柄由有限行程的连杆、齿轮齿条与平行滑块导轨组成，传动比与导轨正压力随开度 <code>w</code> 呈<strong>非周期连续变化</strong>（例如两端紧、中间松，或带复位弹簧偏置）。本页直接采用<strong>非周期空间位置网格剖面 + Stribeck 模型</strong>解耦。
+          </p>
+
+          <div class="arm-selector" id="arm-selector" role="radiogroup" aria-label="选择 CAN 口与机械臂"></div>
+
+          <div class="telemetry-box">
+            <div class="telemetry-header">
+              <strong>当前选中末端（第 7 轴 `0x2A8`）实时状态</strong>
+              <div class="header-actions">
+                <span id="arm-friction-scale-badge" class="pill">驱动 friction_scale: 0.00</span>
+                <button type="button" id="btn-zero-friction-scale" class="btn-xs" title="标定前将驱动摩擦补偿倍率设为 0">标定置 0</button>
+                <button type="button" id="btn-restore-friction-scale" class="btn-xs" title="标定完成后将驱动摩擦补偿倍率恢复为 0.85">恢复 0.85</button>
+                <span id="arm-live-status" class="pill">等待遥测</span>
+              </div>
+            </div>
+            <table class="data-table compact" aria-label="夹爪实时状态表">
+              <thead>
+                <tr>
+                  <th>末端类型</th>
+                  <th>使能</th>
+                  <th>实测开度 w (mm / m)</th>
+                  <th>实测速度 dw (mm/s)</th>
+                  <th>实测力 f_meas (N)</th>
+                  <th>当前补偿 f_comp (N)</th>
+                  <th>标定状态</th>
+                </tr>
+              </thead>
+              <tbody id="live-gripper-tbody"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <!-- 步骤 ② -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ②</span>
+              <h2>配置夹爪扫描行程区间与多档开合线速度</h2>
+            </div>
+          </header>
+
+          <div class="form-grid">
+            <label>
+              <span>扫描最小开度 w_min (m，默认 0.003 m = 3 mm)</span>
+              <input type="number" id="input-w-min" value="0.003" min="0.001" max="0.090" step="0.001">
+            </label>
+            <label>
+              <span>扫描最大开度 w_max (m，默认 0.080 m = 80 mm)</span>
+              <input type="number" id="input-w-max" value="0.080" min="0.010" max="0.098" step="0.001">
+            </label>
+            <label>
+              <span>开合扫描线速度档位 (m/s，从极慢速 5mm/s 到快速 80mm/s)</span>
+              <input type="text" id="input-speeds" value="0.005 0.010 0.020 0.040 0.080">
+            </label>
+            <label>
+              <span>夹爪扫描力限幅 effort (N，0x159 驱动力上限，推荐 1.8~2.5)</span>
+              <input type="number" id="input-gripper-effort" value="2.0" min="0.5" max="5.0" step="0.1">
+            </label>
+            <label>
+              <span>每档往复次数 (repeats)</span>
+              <input type="number" id="input-repeats" value="1" min="1" max="5" step="1">
+            </label>
+            <label>
+              <span>换向停顿时间 settle (s)</span>
+              <input type="number" id="input-settle" value="0.3" min="0.0" max="2.0" step="0.05">
+            </label>
+            <label>
+              <span>CSV 采样保存路径</span>
+              <input type="text" id="input-output-csv" value="/home/a/piper_x_ws/src/piper_friction/config/arm_1_sweep_j7.csv">
+            </label>
+            <label>
+              <span>标定结果 YAML 保存路径（自动合并进整臂文件 `gripper:` 段）</span>
+              <input type="text" id="input-fit-output" value="/home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml">
+            </label>
+          </div>
+
+          <div class="cli-preview-box">
+            <div class="cli-preview-head">
+              <span>对应终端 CLI 命令（估计扫描耗时 <strong id="est-duration">—</strong>）：</span>
+              <button type="button" id="btn-copy-cli" class="btn-xs">复制命令</button>
+            </div>
+            <pre id="cli-command-preview"></pre>
+          </div>
+        </article>
+
+        <!-- 步骤 ③ -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ③</span>
+              <h2>执行夹爪往复等速扫描采集（或导入离线 CSV）</h2>
+            </div>
+            <span class="pill" id="sweep-phase-pill">空闲 (idle)</span>
+          </header>
+
+          <div class="action-bar">
+            <button type="button" id="btn-start-sweep" class="btn-primary">▶ 开始夹爪多速往复扫描采集</button>
+            <button type="button" id="btn-stop-sweep" class="btn-danger" disabled>⏹ 紧急停止扫描</button>
+          </div>
+
+          <div class="progress-panel">
+            <div class="progress-row">
+              <span>当前扫描状态：<strong id="prog-queue-text">未开始</strong></span>
+              <span>当前轨迹子段：<strong id="prog-seg-text">—</strong></span>
+              <span>已采样本：<strong id="prog-samples-text">0</strong> 帧</span>
+            </div>
+            <div class="progress-bar-track" aria-label="扫描进度条">
+              <div class="progress-bar-fill" id="prog-bar-fill" style="width: 0%"></div>
+            </div>
+            <div class="progress-row subtle-row">
+              <span>当前目标开度 w_des：<code id="prog-q-des">0.00 mm</code></span>
+              <span>当前目标速度 dw_des：<code id="prog-dq-des">0.00 mm/s</code></span>
+              <a href="/api/samples.csv" download="gripper_sweep_samples.csv" class="link-btn">⬇ 下载当前采样 CSV</a>
+            </div>
+          </div>
+
+          <div class="offline-bar">
+            <span>离线 / 演示数据入口：</span>
+            <button type="button" id="btn-demo-single" class="btn-xs">生成夹爪非周期示例数据并拟合</button>
+            <label class="file-upload-btn btn-xs">
+              📂 上传本地 CSV 文件拟合
+              <input type="file" id="input-csv-file" accept=".csv,text/csv" hidden>
+            </label>
+          </div>
+        </article>
+      </section>
+
+      <!-- 右栏：步骤 ④ ⑤ -->
+      <section class="column col-right" aria-label="步骤四至五：非周期剖面辨识图表、补偿试算与导出">
+        <!-- 步骤 ④ -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ④</span>
+              <h2>非周期位置偏置 F_bias(w) + 空间摩擦剖面 F_c(w) + Stribeck 拟合</h2>
+            </div>
+            <div class="header-actions">
+              <button type="button" id="btn-run-fit" class="btn-primary-sm">⚡ 重新拟合当前夹爪数据</button>
+            </div>
+          </header>
+
+          <div class="param-summary-grid" id="param-summary-grid">
+            <div class="param-box"><span>平均库仑摩擦 Fc</span><strong id="val-fc">—</strong><small>N (全行程动摩擦均值)</small></div>
+            <div class="param-box"><span>静摩擦峰值 Fs</span><strong id="val-fs">—</strong><small>N (慢速启动破静阻力)</small></div>
+            <div class="param-box"><span>Stribeck 速度 vs</span><strong id="val-vs">—</strong><small>mm/s (静→动拐点)</small></div>
+            <div class="param-box"><span>粘滞阻尼 fv</span><strong id="val-fv">—</strong><small>N/(m/s)</small></div>
+            <div class="param-box highlight"><span>内环等效刚度 kp</span><strong id="val-kp-equiv">—</strong><small>N/m (力矩偏置折算)</small></div>
+            <div class="param-box highlight"><span>外环速度增益 kv</span><strong id="val-kv-equiv">—</strong><small>1/s (速度超前折算)</small></div>
+            <div class="param-box"><span>总稳态拟合 RMSE</span><strong id="val-rmse">—</strong><small>N (越小越准)</small></div>
+          </div>
+
+          <div class="charts-stack">
+            <div class="chart-card">
+              <div class="chart-title-bar">
+                <strong>① 极低速开合实测力与非周期半和解耦：方向无关位置偏置 / 弹簧恢复力 F_bias(w)</strong>
+                <span class="legend">
+                  <i style="background:#93a8c2"></i>张开 f⁺(w)
+                  <i style="background:#c4a59b"></i>闭合 f⁻(w)
+                  <i style="background:#182537"></i>实测半和 (f⁺+f⁻)/2
+                  <i style="background:#245cbe"></i>非周期剖面 F̂_bias(w)
+                </span>
+              </div>
+              <canvas id="canvas-cogging" width="760" height="200"></canvas>
+            </div>
+
+            <div class="chart-card">
+              <div class="chart-title-bar">
+                <strong>② 极低速半差解耦：非周期连杆/导轨摩擦空间调制 ΔF_c(w)（正值代表该开度更紧涩）</strong>
+                <span class="legend">
+                  <i style="background:#60748a"></i>实测半差波动 (f⁺−f⁻)/2 − F̄
+                  <i style="background:#15714d"></i>非周期插值剖面 ΔF̂_c(w)
+                </span>
+              </div>
+              <canvas id="canvas-modulation" width="760" height="180"></canvas>
+            </div>
+
+            <div class="chart-card">
+              <div class="chart-title-bar">
+                <strong>③ 多速度 Stribeck 摩擦曲线 F(|dw|) 与空间波动衰减包络 w(dw)</strong>
+                <span class="legend">
+                  <i style="background:#245cbe"></i>稳态摩擦拟合 F(|dw|) (左轴 N)
+                  <i style="background:#d96b27"></i>空间波动包络 w(dw)=e^-(dw/vr)² (右轴 0~1)
+                </span>
+              </div>
+              <canvas id="canvas-stribeck" width="760" height="200"></canvas>
+            </div>
+          </div>
+
+          <div class="harmonics-section">
+            <h3>识别出的非周期空间位置剖面节点表（w_grid 分段线性插值表）</h3>
+            <div style="max-height: 220px; overflow-y: auto;">
+              <table class="data-table compact" aria-label="夹爪非周期空间剖面节点表">
+                <thead>
+                  <tr>
+                    <th>节点序号</th>
+                    <th>开度位置 w (mm)</th>
+                    <th>开度位置 w (m)</th>
+                    <th>位置偏置力 F_bias(w) (N)</th>
+                    <th>摩擦空间调制 ΔF_c(w) (N)</th>
+                    <th>局部总库仑摩擦 F_c(w) (N)</th>
+                  </tr>
+                </thead>
+                <tbody id="knots-tbody">
+                  <tr><td colspan="6" class="empty-cell">尚未运行拟合，请点击“加载夹爪非周期示例数据”或完成一次扫描采集</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </article>
+
+        <!-- 步骤 ⑤ -->
+        <article class="card">
+          <header class="card-header">
+            <div>
+              <span class="step-tag">步骤 ⑤</span>
+              <h2>夹爪非周期摩擦补偿试算与合并保存 YAML</h2>
+            </div>
+            <span class="sub-badge" id="calibrated-status-badge">未标定</span>
+          </header>
+
+          <div class="eval-panel">
+            <div class="eval-sliders">
+              <label>
+                <span>测试开度 w (<code id="lbl-eval-q">40.0 mm (0.040 m)</code>)</span>
+                <input type="range" id="slider-eval-q" min="0.003" max="0.080" step="0.0005" value="0.040">
+              </label>
+              <label>
+                <span>测试开合速度 dw (<code id="lbl-eval-dq">+15.0 mm/s</code>，正=张开，负=闭合)</span>
+                <input type="range" id="slider-eval-dq" min="-0.10" max="0.10" step="0.001" value="0.015">
+              </label>
+              <div class="scale-row">
+                <label>
+                  <span>位置偏置项比例 bias_scale (推荐 1.0)</span>
+                  <input type="number" id="input-cog-scale" value="1.0" min="0.0" max="1.5" step="0.05">
+                </label>
+                <label>
+                  <span>方向摩擦补偿比例 friction_scale (推荐 0.8~0.9)</span>
+                  <input type="number" id="input-fric-scale" value="0.85" min="0.0" max="1.5" step="0.05">
+                </label>
+              </div>
+            </div>
+
+            <div class="eval-results">
+              <div class="eval-item"><span>当前速度包络权重 w(dw)</span><strong id="eval-env">1.000</strong></div>
+              <div class="eval-item"><span>非周期位置偏置补偿 F_bias</span><strong id="eval-cog">0.0000 N</strong></div>
+              <div class="eval-item"><span>非周期空间摩擦调制 ΔF_c</span><strong id="eval-mod">0.0000 N</strong></div>
+              <div class="eval-item"><span>平均 Stribeck + 粘滞项</span><strong id="eval-stribeck">0.0000 N</strong></div>
+              <div class="eval-item"><span>统一目标位置超前 Δw</span><strong id="eval-dw-lead">+0.00 mm</strong></div>
+              <div class="eval-item total"><span>合成夹爪总补偿力 F_grip</span><strong id="eval-total">0.0000 N</strong></div>
+            </div>
+          </div>
+
+          <div class="yaml-export-box">
+            <div class="yaml-export-header">
+              <strong>当前选中机械臂 (<span id="yaml-arm-label">arm_1</span>) 整臂 + 夹爪标定参数 YAML</strong>
+              <div class="header-actions">
+                <button type="button" id="btn-save-yaml" class="btn-primary-sm">💾 合并保存至服务器路径</button>
+                <button type="button" id="btn-copy-yaml" class="btn-xs">复制 YAML</button>
+              </div>
+            </div>
+            <div class="yaml-path-row">
+              <label for="input-save-yaml-path">服务器保存路径：</label>
+              <input type="text" id="input-save-yaml-path" value="/home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml">
+            </div>
+            <div id="save-yaml-feedback" class="save-feedback" hidden role="status"></div>
+            <pre id="yaml-output-preview"># 完成夹爪拟合后，此处将生成包含 gripper 段的 YAML 标定参数</pre>
+          </div>
+        </article>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

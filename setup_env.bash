@@ -10,6 +10,7 @@ if [[ ! -f "${_piper_x_root}/.venv/bin/activate" ]]; then
     return 1
 fi
 source /opt/ros/humble/setup.bash || return
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 source "${_piper_x_root}/.venv/bin/activate" || return
 if [[ -f "${_piper_x_root}/install/local_setup.bash" ]]; then
     source "${_piper_x_root}/install/local_setup.bash" || return

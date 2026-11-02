@@ -22,6 +22,7 @@ import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
 from sensor_msgs.msg import JointState
@@ -31,7 +32,7 @@ import yaml
 
 from .backend import fresh, SdkArm
 from .controller import Controller, SLIDER_LOWER, SLIDER_UPPER
-from .configuration import default_config_path, FleetConfig
+from .configuration import bounded, default_config_path, FleetConfig
 
 
 _JOINT_NAMES = [f'joint{i}' for i in range(1, 7)] + ['gripper']
@@ -48,6 +49,7 @@ class DriverNode(Node):
             self.fleet.arms[0].id if namespace == '/' else '')
         self.declare_parameter('arm_id', default_arm)
         self.arm_config = self.fleet.arm(str(self.get_parameter('arm_id').value))
+        self._public_config = self.fleet.public(self.arm_config)
         if namespace not in ('/', self.arm_config.namespace):
             raise ValueError('Driver namespace does not match configured arm')
         self.arm: Any = SdkArm(self.arm_config.can_port)
@@ -78,14 +80,20 @@ class DriverNode(Node):
         self.create_service(SetMode, 'set_mode', self._mode)
         self.create_service(ConfigureArm, 'configure_arm', self._configure)
         self.create_service(DebugMit, 'debug_mit', self._debug)
-        for kind, topic, handler in (
-            (JointCommand, 'command/joints', self.control.joints),
-            (CartesianCommand, 'command/cartesian', self.control.cartesian),
-            (MitCommand, 'command/mit', self.control.mit),
-            (GripperCommand, 'command/gripper', self.control.gripper),
+        realtime_sub_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        for kind, topic, handler, qos in (
+            (JointCommand, 'command/joints', self.control.joints, 10),
+            (CartesianCommand, 'command/cartesian', self.control.cartesian, 10),
+            (MitCommand, 'command/mit', self.control.mit, realtime_sub_qos),
+            (GripperCommand, 'command/gripper', self.control.gripper, realtime_sub_qos),
         ):
-            self.create_subscription(kind, topic, partial(self._command, handler), 1)
-        self.create_subscription(Bool, '/bilateral_teaching/active', self._teaching, 1)
+            self.create_subscription(kind, topic, partial(self._command, handler), qos)
+        self.create_subscription(
+            Bool, '/bilateral_teaching/active', self._teaching, realtime_sub_qos)
         self.teaching_start_client = self.create_client(Trigger, '/bilateral_teaching/start')
         try:
             self.control.start_mit()
@@ -127,6 +135,17 @@ class DriverNode(Node):
                     raise ValueError('Stop MIT/teaching and confirm all seven axes disabled '
                                      'before changing the end effector')
             raw_friction_scale = getattr(request, 'friction_scale', -1.0)
+            if raw_friction_scale < -1.0:
+                # 标定过程临时覆盖运行时 friction_scale（如 -2.0 表示临时置 0，或 -(2.0 + s)），不写盘修改 arms.yaml
+                temp_scale = bounded(-raw_friction_scale - 2.0, 'friction_scale', 0, 1)
+                self.control.friction_scale = temp_scale
+                if temp_scale == 0.0:
+                    self.control.friction_scale_applied = 0.0
+                self.last_error = ''
+                response.success = True
+                response.message = 'Temporary runtime friction_scale applied without modifying arms.yaml'
+                self._publish_control_state()
+                return response
             friction_scale = (
                 self.arm_config.friction_scale
                 if raw_friction_scale == -1.0
@@ -136,6 +155,7 @@ class DriverNode(Node):
                 self.arm_config, request.end_effector, request.gravity_scale, friction_scale)
             self.fleet = updated
             self.arm_config = updated.arm(self.arm_config.id)
+            self._public_config = updated.public(self.arm_config)
             self.control.effector = updated.effectors[self.arm_config.end_effector]
             self.control.gravity_scale = self.arm_config.gravity_scale
             if self.arm_config.gravity_scale == 0.0:
@@ -275,7 +295,7 @@ class DriverNode(Node):
 
     def _publish_control_state(self, sample=None):
         self.control_pub.publish(String(data=json.dumps({
-            'configuration': self.fleet.public(self.arm_config),
+            'configuration': self._public_config,
             'mode': self.control.mode,
             'mit_ready': self.control.mode == 'mit' and self.control.mit_ready,
             'debug_active': bool(self.control.debug_session),
@@ -283,6 +303,13 @@ class DriverNode(Node):
             'joint_lower': list(SLIDER_LOWER), 'joint_upper': list(SLIDER_UPPER),
             'gravity_torque': list(self.control.gravity),
             'friction_torque': list(self.control.friction),
+            'gripper_friction': float(self.control.gripper_friction),
+            'gripper_velocity': (
+                0.0 if sample is None else float(getattr(sample, 'gripper_velocity', 0.0))
+            ),
+            'gripper_force': (
+                0.0 if sample is None else float(getattr(sample, 'gripper_force', 0.0))
+            ),
             'output_torque': list(self.control.output_torque),
             'gravity_scale_applied': self.control.gravity_scale_applied,
             'friction_scale_applied': self.control.friction_scale_applied,

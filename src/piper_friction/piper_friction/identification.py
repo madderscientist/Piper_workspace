@@ -11,7 +11,7 @@ from piper_x_driver.gravity import joint_inertias
 from scipy.optimize import least_squares, minimize_scalar
 from scipy.signal import detrend
 
-from .model import JointFrictionModel, SpatialHarmonic
+from .model import GripperFrictionModel, JointFrictionModel, SpatialHarmonic
 
 _ANCHOR_INERTIAS = joint_inertias((0.0, 0.90, -1.50, 0.0, 0.0, 0.0))
 
@@ -49,10 +49,10 @@ class DecompositionResult:
 
 @dataclass(frozen=True)
 class IdentificationReport:
-    """Identified joint friction model alongside fit diagnostics."""
+    """Identified joint or gripper friction model alongside fit diagnostics."""
 
     joint: int
-    model: JointFrictionModel
+    model: JointFrictionModel | GripperFrictionModel
     decomposition: DecompositionResult
     rmse_total: float
     rmse_stribeck: float
@@ -285,11 +285,13 @@ def decompose_half_sum_diff(
     grid_step: float = 0.001,
     trim_ratio: float = 0.1,
     inertia_scale: float = 1.0,
+    grouped: dict[float, dict[str, list[list[SweepSample]]]] | None = None,
 ) -> DecompositionResult:
     """Interpolate forward/reverse sweeps onto a shared angle grid and decouple half-sum/diff."""
     if grid_step <= 0 or not math.isfinite(grid_step):
         raise ValueError('grid_step must be finite and positive')
-    grouped = extract_steady_sweeps(samples, trim_ratio=trim_ratio, inertia_scale=inertia_scale)
+    if grouped is None:
+        grouped = extract_steady_sweeps(samples, trim_ratio=trim_ratio, inertia_scale=inertia_scale)
     valid_speeds = sorted(
         speed for speed, dirs in grouped.items() if dirs['pos'] and dirs['neg']
     )
@@ -357,7 +359,10 @@ def decompose_half_sum_diff(
         p_w1 = np.array([x[1] for x in pos_samples], dtype=float)
         n_vals = np.array([x[0] for x in neg_samples], dtype=float)
         n_w1 = np.array([x[1] for x in neg_samples], dtype=float)
-        if speed != base_speed and (float(np.sum(p_w1)) < 12.0 or float(np.sum(n_w1)) < 12.0):
+        min_weight_sum = 4.0 if (theta_max - theta_min) < 0.15 else 12.0
+        if speed != base_speed and (
+            float(np.sum(p_w1)) < min_weight_sum or float(np.sum(n_w1)) < min_weight_sum
+        ):
             continue
         p_ws = p_w1 ** 4
         n_ws = n_w1 ** 4
@@ -382,12 +387,15 @@ def decompose_half_sum_diff(
             half_sum = np.zeros_like(theta_grid)
             half_diff = np.full_like(theta_grid, f_mean)
 
-        measured_dqs = [
-            abs(s.dq) if abs(s.dq) > 1e-5 else abs(s.dq_des)
+        all_seg_samples = [
+            s
             for seg in grouped[speed]['pos'] + grouped[speed]['neg']
             for s in seg
         ]
-        v_meas = float(np.mean(measured_dqs)) if measured_dqs else float(speed)
+        if any(abs(s.dq) > 1e-5 for s in all_seg_samples):
+            v_meas = float(np.mean([abs(s.dq) for s in all_seg_samples]))
+        else:
+            v_meas = float(speed)
         speeds_out.append(v_meas)
         half_sums.append(half_sum)
         half_diffs.append(half_diff)
@@ -662,6 +670,248 @@ def fit_ripple_envelope(
     return vr, scaled_harmonics, normalized_scales
 
 
+def _smooth_1d(values: np.ndarray, window: int = 5) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    w = min(window, len(arr))
+    if w < 3:
+        return arr.copy()
+    if w % 2 == 0:
+        w -= 1
+    pad = w // 2
+    padded = np.pad(arr, (pad, pad), mode='edge')
+    kernel = np.hanning(w + 2)[1:-1]
+    kernel = kernel / np.sum(kernel)
+    return np.convolve(padded, kernel, mode='valid')
+
+
+def _fit_gripper_stribeck(
+    speeds: np.ndarray,
+    mean_frictions: np.ndarray,
+    delta: float = 2.0,
+) -> tuple[float, float, float, float]:
+    """Fit gripper (fc, fs, vs, fv) in linear stroke units (m/s, N)."""
+    v = np.asarray(speeds, dtype=float)
+    f = np.maximum(0.0, np.asarray(mean_frictions, dtype=float))
+    if len(v) == 0:
+        raise ValueError('At least one speed point is required to fit gripper Stribeck parameters')
+    if len(v) == 1:
+        val = float(f[0])
+        return val, val, 0.015, 0.0
+    if len(v) == 2:
+        slope = max(0.0, float((f[1] - f[0]) / max(1e-6, v[1] - v[0])))
+        fc = max(0.0, float(f[0] - slope * v[0]))
+        return fc, max(fc, float(f[0])), 0.015, slope
+
+    f_min = float(np.min(f))
+    f_max = float(np.max(f))
+    v_min = float(np.min(v))
+    low_mask = v <= max(0.025, 2.5 * v_min)
+    f_low_min = float(np.min(f[low_mask])) if np.any(low_mask) else f_min
+    f_low_max = float(np.max(f[low_mask])) if np.any(low_mask) else f_max
+
+    fc_lower = max(0.0, 0.55 * f_low_min)
+    fc_upper = max(fc_lower + 1e-3, f_low_max * 1.05)
+    df_upper = max(0.02, (f_low_max - fc_lower) * 1.5)
+    vs_lower = max(0.002, 0.8 * v_min)
+    vs_upper = max(vs_lower + 0.005, min(0.08, float(np.max(v)) * 0.9))
+    fv_upper = 20.0
+
+    p0 = np.array([
+        0.90 * f_low_min,
+        max(0.01, f_low_max - 0.90 * f_low_min),
+        min(vs_upper - 1e-4, max(vs_lower + 1e-4, 0.015)),
+        max(0.0, min(fv_upper * 0.5, (f[-1] - f_low_min) / max(0.02, float(v[-1])))),
+    ])
+    lower = np.array([fc_lower, 0.0, vs_lower, 0.0])
+    upper = np.array([fc_upper, df_upper, vs_upper, fv_upper])
+    p0 = np.clip(p0, lower + 1e-6, upper - 1e-6)
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        fc, df, vs, fv = params
+        pred = fc + df * np.exp(-((v / vs) ** delta)) + fv * v
+        return pred - f
+
+    result = least_squares(
+        residuals, p0, bounds=(lower, upper),
+        loss='soft_l1', f_scale=max(0.01, 0.05 * max(0.1, f_low_min)),
+    )
+    fc, df, vs, fv = map(float, result.x)
+    return fc, fc + df, vs, fv
+
+
+def identify_gripper_friction(
+    samples: Sequence[SweepSample],
+    *,
+    grid_step: float = 0.0005,
+    trim_ratio: float = 0.08,
+    num_knots: int = 25,
+    delta: float = 2.0,
+    v0: float | None = None,
+) -> IdentificationReport:
+    """Identify non-periodic spatial profile + Stribeck model for the gripper (joint=7)."""
+    if not samples:
+        raise ValueError('Cannot identify gripper friction from empty sample sequence')
+    resolved_v0 = 0.002 if v0 is None else float(v0)
+    eff_grid_step = min(float(grid_step), 0.001)
+
+    grouped = extract_steady_sweeps(samples, trim_ratio=trim_ratio, inertia_scale=0.0)
+    decomp = decompose_half_sum_diff(
+        samples, grid_step=eff_grid_step, trim_ratio=trim_ratio, inertia_scale=0.0, grouped=grouped,
+    )
+    slow_indices = [
+        i for i, s in enumerate(decomp.speeds)
+        if s <= max(0.025, 2.2 * float(decomp.speeds[0]))
+    ] or [0]
+
+    # 1. 非周期半和解耦（不 detrend）：完整保留复位弹簧与连杆位置偏置 F_bias(w)
+    raw_bias = _smooth_1d(np.mean([decomp.half_sums[i] for i in slow_indices], axis=0), window=5)
+    # 2. 非周期半差解耦：保留连杆传动比与导轨紧度随开度变化的摩擦波动 dF_c(w)
+    raw_mod = _smooth_1d(
+        np.mean(
+            [decomp.half_diffs[i] - float(np.mean(decomp.half_diffs[i])) for i in slow_indices],
+            axis=0,
+        ),
+        window=5,
+    )
+
+    # 3. 拟合空间摩擦波动随速度衰减包络 vr
+    denom = float(np.dot(raw_mod, raw_mod))
+    raw_scales = np.ones(len(decomp.speeds), dtype=float)
+    vr = 0.08
+    s0 = 1.0
+    if denom > 1e-10 and len(decomp.speeds) >= 2:
+        for idx in range(len(decomp.speeds)):
+            d_center = decomp.half_diffs[idx] - float(np.mean(decomp.half_diffs[idx]))
+            raw_scales[idx] = max(0.0, float(np.dot(d_center, raw_mod)) / denom)
+        if float(np.max(raw_scales)) > 1e-5:
+            v = np.asarray(decomp.speeds, dtype=float)
+            min_vr = max(0.015, float(v[0]) * 1.4)
+            max_vr = max(min_vr + 0.02, float(np.max(v)) * 1.5, 0.12)
+            p0 = np.array([1.0, min(max_vr - 0.005, max(min_vr + 0.005, float(np.median(v))))])
+            lower = np.array([0.75, min_vr])
+            upper = np.array([1.35, max_vr])
+            p0 = np.clip(p0, lower + 1e-6, upper - 1e-6)
+            opt = least_squares(
+                lambda p: p[0] * np.exp(-((v / p[1]) ** 2)) - raw_scales,
+                p0, bounds=(lower, upper),
+            )
+            s0, vr = float(opt.x[0]), float(opt.x[1])
+            raw_mod = raw_mod * s0
+            raw_scales = raw_scales / max(1e-9, s0)
+
+    # 4. 下采样至非周期开度节点表 w_grid
+    k = max(5, min(int(num_knots), len(decomp.theta_grid)))
+    w_knots = np.linspace(float(decomp.theta_grid[0]), float(decomp.theta_grid[-1]), k)
+    bias_knots = np.interp(w_knots, decomp.theta_grid, raw_bias)
+    mod_knots = np.interp(w_knots, decomp.theta_grid, raw_mod)
+
+    # 5. 拟合 Stribeck 速度参数 (fc, fs, vs, fv)
+    fc, fs, vs, fv = _fit_gripper_stribeck(decomp.speeds, decomp.mean_frictions, delta=delta)
+
+    # 6. 联合估计固件串级位置-速度内环参数 kp_equiv (N/m) 与 kv_equiv (1/s)
+    #    扣除 ROS + 200Hz 插值器的 25ms 传输延迟 (0.025 * |dq_des|) 后，
+    #    按 |q_des - q|_fw = dw_0 + |dq_des| / kv_equiv 回归得到 kv_equiv 与 kp_equiv = median(|tau|) / dw_0
+    steady_samples = [
+        s
+        for dirs in grouped.values()
+        for seg in dirs['pos'] + dirs['neg']
+        for s in seg
+    ]
+    spd_list: list[float] = []
+    err_list: list[float] = []
+    tau_list: list[float] = []
+    for spd_val, dirs in sorted(grouped.items()):
+        seg_pts = [s for seg in dirs['pos'] + dirs['neg'] for s in seg]
+        if len(seg_pts) >= 5:
+            spd_list.append(float(spd_val))
+            raw_err = float(np.median([abs(s.q_des - s.q) for s in seg_pts]))
+            err_list.append(max(1e-4, raw_err - 0.025 * float(spd_val)))
+            tau_list.append(float(np.median([abs(s.tau_meas) for s in seg_pts])))
+
+    kp_equiv = 45.0
+    kv_equiv = 12.5
+    if len(spd_list) >= 2:
+        spds_arr = np.asarray(spd_list, dtype=float)
+        errs_arr = np.asarray(err_list, dtype=float)
+        weights = 1.0 / np.maximum(0.005, spds_arr)
+        w_sqrt = np.sqrt(weights)
+        design = np.column_stack([w_sqrt, w_sqrt * spds_arr])
+        coeffs, _, _, _ = np.linalg.lstsq(design, w_sqrt * errs_arr, rcond=None)
+        dw_0 = float(coeffs[0])
+        inv_kv = float(coeffs[1])
+        if inv_kv > 1e-4:
+            kv_equiv = float(np.clip(1.0 / inv_kv, 2.0, 100.0))
+        low_errs = [e - s / kv_equiv for s, e in zip(spd_list[:2], err_list[:2])]
+        dw_0_est = max(dw_0, float(np.median(low_errs)), 2.0e-4)
+        med_tau = float(np.median(tau_list[:2])) if len(tau_list) >= 2 else float(np.median(tau_list))
+        if med_tau > 1e-3:
+            # 稳态扫描中固件 PI 积分器使表观刚度 med_tau / dw_0 放大约 6 倍；
+            # 还原瞬态比例饱和刚度 kp_equiv，使主臂每 20ms 重置起点时 f_comp / kp_equiv 达到瞬态完全饱和
+            kp_equiv = float(np.clip((med_tau / dw_0_est) / 6.0, 15.0, 200.0))
+    elif steady_samples:
+        kp_ratios = [
+            abs(s.tau_meas) / max(1e-4, abs(s.q_des - s.q) - (0.025 + 1.0 / kv_equiv) * abs(s.dq_des))
+            for s in steady_samples
+            if abs(s.q_des - s.q) >= 2e-4 and abs(s.tau_meas) >= 0.05
+        ]
+        if len(kp_ratios) >= 8:
+            kp_equiv = float(np.clip(np.median(kp_ratios) / 6.0, 15.0, 200.0))
+
+    model = GripperFrictionModel(
+        fc=fc,
+        fs=fs,
+        vs=vs,
+        delta=delta,
+        fv=fv,
+        v0=resolved_v0,
+        vr=vr,
+        kp_equiv=kp_equiv,
+        kv_equiv=kv_equiv,
+        w_grid=tuple(float(x) for x in w_knots),
+        bias_grid=tuple(float(x) for x in bias_knots),
+        modulation_grid=tuple(float(x) for x in mod_knots),
+    )
+    decomp = DecompositionResult(
+        theta_grid=decomp.theta_grid,
+        speeds=decomp.speeds,
+        half_sums=decomp.half_sums,
+        half_diffs=decomp.half_diffs,
+        mean_frictions=decomp.mean_frictions,
+        ripple_scales=raw_scales,
+    )
+
+    pred_stribeck = np.array([model.stribeck_magnitude(float(s)) for s in decomp.speeds])
+    rmse_stribeck = float(np.sqrt(np.mean((pred_stribeck - decomp.mean_frictions) ** 2)))
+
+    env0 = model.envelope(float(decomp.speeds[0]))
+    bias_pred0 = np.array([model.bias_force(float(w)) for w in decomp.theta_grid])
+    mod_pred0 = np.array([env0 * model.modulation_force(float(w)) for w in decomp.theta_grid])
+    bias_actual0 = decomp.half_sums[0]
+    mod_actual0 = decomp.half_diffs[0] - float(np.mean(decomp.half_diffs[0]))
+    rmse_cogging = float(np.sqrt(np.mean((bias_pred0 - bias_actual0) ** 2)))
+    rmse_modulation = float(np.sqrt(np.mean((mod_pred0 - mod_actual0) ** 2)))
+
+    if steady_samples:
+        err_sq = np.array([
+            (model.force(s.q, s.dq if abs(s.dq) > 1e-6 else s.dq_des) - s.tau_residual) ** 2
+            for s in steady_samples
+        ], dtype=float)
+        ws4 = np.array([max(1e-6, s.weight) ** 4 for s in steady_samples], dtype=float)
+        rmse_total = float(np.sqrt(np.sum(err_sq * ws4) / np.sum(ws4)))
+    else:
+        rmse_total = 0.0
+
+    return IdentificationReport(
+        joint=7,
+        model=model,
+        decomposition=decomp,
+        rmse_total=rmse_total,
+        rmse_stribeck=rmse_stribeck,
+        rmse_cogging=rmse_cogging,
+        rmse_modulation=rmse_modulation,
+    )
+
+
 def identify_joint_friction(
     samples: Sequence[SweepSample],
     *,
@@ -673,21 +923,30 @@ def identify_joint_friction(
     v0: float | None = None,
     inertia_scale: float = 1.0,
 ) -> IdentificationReport:
-    """Run the full 4-step friction and periodic ripple identification pipeline."""
+    """Run the full 4-step friction and periodic/non-periodic identification pipeline."""
     if not samples:
         raise ValueError('Cannot identify friction from empty sample sequence')
     joints = {s.joint for s in samples}
     if len(joints) != 1:
         raise ValueError(f'Samples must belong to a single joint, got {sorted(joints)}')
     joint_idx = next(iter(joints))
+    if joint_idx == 7:
+        return identify_gripper_friction(
+            samples,
+            grid_step=min(grid_step, 0.0005),
+            trim_ratio=min(trim_ratio, 0.08),
+            delta=delta,
+            v0=v0,
+        )
     resolved_v0 = (
         DEFAULT_JOINT_V0[joint_idx - 1]
         if v0 is None and 1 <= joint_idx <= 6
         else (0.005 if v0 is None else float(v0))
     )
 
+    grouped = extract_steady_sweeps(samples, trim_ratio=trim_ratio, inertia_scale=inertia_scale)
     decomp = decompose_half_sum_diff(
-        samples, grid_step=grid_step, trim_ratio=trim_ratio, inertia_scale=inertia_scale,
+        samples, grid_step=grid_step, trim_ratio=trim_ratio, inertia_scale=inertia_scale, grouped=grouped,
     )
     slow_indices = [i for i, v in enumerate(decomp.speeds) if v <= 0.16] or [0]
     coh_sum = np.mean([decomp.half_sums[i] for i in slow_indices], axis=0)
@@ -740,7 +999,6 @@ def identify_joint_friction(
     rmse_cogging = float(np.sqrt(np.mean((cog_pred0 - cog_actual0) ** 2)))
     rmse_modulation = float(np.sqrt(np.mean((mod_pred0 - mod_actual0) ** 2)))
 
-    grouped = extract_steady_sweeps(samples, trim_ratio=trim_ratio, inertia_scale=inertia_scale)
     steady_samples = [
         s
         for dirs in grouped.values()

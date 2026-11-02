@@ -42,7 +42,7 @@ arms:
   - 0.3
   - 0.24
   - 0.06
-  friction_scale: 0.85
+  friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_1_gravity.yaml
 - id: arm_2
@@ -66,7 +66,7 @@ arms:
   - 0.3
   - 0.24
   - 0.06
-  friction_scale: 0.85
+  friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_2_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_2_gravity.yaml
 - id: arm_3
@@ -90,7 +90,7 @@ arms:
   - 0.29
   - 0.24
   - 0.05
-  friction_scale: 0.85
+  friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_3_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_3_gravity.yaml
 - id: arm_4
@@ -114,6 +114,6 @@ arms:
   - 0.29
   - 0.24
   - 0.05
-  friction_scale: 0.85
+  friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_4_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_4_gravity.yaml

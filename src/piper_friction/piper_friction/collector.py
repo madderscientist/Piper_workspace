@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Sequence
 
 from piper_x_driver.gravity import ArmGravityModel, gravity_torques, load_gravity_model, max_critical_kd
-from piper_x_interfaces.msg import ArmStatus, MitCommand
+from piper_x_interfaces.msg import ArmStatus, GripperCommand, MitCommand
 from piper_x_interfaces.srv import ConfigureArm, Enable, SetMode
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 
@@ -18,12 +19,14 @@ from .identification import SweepSample
 
 JOINT_NAMES = tuple(f'joint{i}' for i in range(1, 7)) + ('gripper',)
 DEFAULT_SWEEP_SPEEDS = (0.03, 0.06, 0.12, 0.25, 0.5, 1.0, 1.5)
+DEFAULT_GRIPPER_SPEEDS = (0.005, 0.01, 0.02, 0.04, 0.08)
 DEFAULT_SWEEP_KP = (30.0, 30.0, 30.0, 8.0, 6.0, 6.0)
+DEFAULT_GRIPPER_EFFORT = 2.0
 SAFE_ANCHOR_POSE = (0.0, 0.90, -1.50, 0.0, 0.0, 0.0)
 
 
 def resolve_safe_anchor(initial_position: Sequence[float], joint: int) -> tuple[float, ...]:
-    """Return safe raised 6-joint anchor pose, keeping J1 at current yaw when testing J2..J6."""
+    """Return safe raised 6-joint anchor pose, keeping J1 at current yaw when testing J2..J7."""
     anchor = list(SAFE_ANCHOR_POSE)
     if len(initial_position) >= 6 and joint != 1:
         anchor[0] = float(initial_position[0])
@@ -32,7 +35,7 @@ def resolve_safe_anchor(initial_position: Sequence[float], joint: int) -> tuple[
 
 @dataclass(frozen=True)
 class SweepConfig:
-    """Configuration for a single-joint multi-speed forward/reverse sweep."""
+    """Configuration for a single-joint (1..6) or gripper (7) multi-speed sweep."""
 
     namespace: str = '/arm_1'
     joint: int = 1
@@ -42,14 +45,15 @@ class SweepConfig:
     repeats: int = 1
     kp: tuple[float, ...] = DEFAULT_SWEEP_KP
     kd: tuple[float, ...] | None = None
+    gripper_effort: float = DEFAULT_GRIPPER_EFFORT
     approach_speed: float = 0.4
     settle_time: float = 0.4
     rate_hz: float = 100.0
     use_safe_anchor: bool = True
 
     def __post_init__(self) -> None:
-        if not 1 <= self.joint <= 6:
-            raise ValueError(f'joint must be in 1..6, got {self.joint}')
+        if not 1 <= self.joint <= 7:
+            raise ValueError(f'joint must be in 1..7 (7 for gripper), got {self.joint}')
         if not math.isfinite(self.q_min) or not math.isfinite(self.q_max) or self.q_max <= self.q_min:
             raise ValueError('q_min and q_max must be finite with q_max > q_min')
         if not self.speeds or any(not math.isfinite(s) or s <= 0 for s in self.speeds):
@@ -62,6 +66,8 @@ class SweepConfig:
             object.__setattr__(self, 'kd', max_critical_kd(self.kp))
         elif len(self.kd) != 6 or any(not math.isfinite(v) or v < 0 for v in self.kd):
             raise ValueError('kd requires six non-negative finite values')
+        if not math.isfinite(self.gripper_effort) or not 0 < self.gripper_effort <= 5.0:
+            raise ValueError('gripper_effort must be in (0, 5.0]')
         if self.approach_speed <= 0 or not math.isfinite(self.approach_speed):
             raise ValueError('approach_speed must be finite and positive')
         if self.settle_time < 0 or not math.isfinite(self.settle_time):
@@ -221,10 +227,16 @@ class SweepCollectorNode(Node):
         self.latest_position: tuple[float, ...] | None = None
         self.latest_velocity: tuple[float, ...] = (0.0,) * 6
         self.latest_torque: tuple[float, ...] = (0.0,) * 6
+        self.latest_gripper_velocity: float = 0.0
+        self.latest_gripper_force: float = 0.0
+        self._has_ctrl_grip_vel: bool = False
+        self._prev_grip_sample: tuple[float, float] | None = None
         self.latest_status: ArmStatus | None = None
         self.effector_kwargs: dict[str, object] = {}
         self.arm_end_effector: str = 'teaching_handle'
         self.arm_gravity_scale: float = 1.0
+        self.arm_friction_scale: float = 0.85
+        self._saved_friction_scale: float | None = None
         self.applied_gravity_torques: tuple[float, ...] | None = None
         self.gravity_model: ArmGravityModel | None = None
         self._loaded_gravity_path: str = ''
@@ -241,10 +253,19 @@ class SweepCollectorNode(Node):
         self._segment_velocities: list[tuple[float, float]] = []
         self.samples: list[SweepSample] = []
 
-        self.create_subscription(JointState, f'{prefix}/joint_states_feedback', self._on_joints, 10)
-        self.create_subscription(ArmStatus, f'{prefix}/arm_status', self._on_status, 10)
-        self.create_subscription(String, f'{prefix}/control_state', self._on_control_state, 10)
-        self.mit_pub = self.create_publisher(MitCommand, f'{prefix}/command/mit', 1)
+        realtime_sub_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.create_subscription(
+            JointState, f'{prefix}/joint_states_feedback', self._on_joints, realtime_sub_qos)
+        self.create_subscription(
+            ArmStatus, f'{prefix}/arm_status', self._on_status, realtime_sub_qos)
+        self.create_subscription(
+            String, f'{prefix}/control_state', self._on_control_state, realtime_sub_qos)
+        self.mit_pub = self.create_publisher(MitCommand, f'{prefix}/command/mit', 10)
+        self.gripper_pub = self.create_publisher(GripperCommand, f'{prefix}/command/gripper', 10)
         self.config_client = self.create_client(ConfigureArm, f'{prefix}/configure_arm')
         self.enable_client = self.create_client(Enable, f'{prefix}/enable_srv')
         self.mode_client = self.create_client(SetMode, f'{prefix}/set_mode')
@@ -255,20 +276,39 @@ class SweepCollectorNode(Node):
         if len(names) != 7 or set(names) != set(JOINT_NAMES) or len(message.position) != 7:
             return
         order = [names.index(name) for name in JOINT_NAMES]
+        now = time.monotonic()
         self.latest_position = tuple(float(message.position[i]) for i in order)
         if len(message.velocity) >= 6:
             self.latest_velocity = tuple(float(message.velocity[i]) for i in order[:6])
+        if len(message.velocity) >= 7:
+            self.latest_gripper_velocity = float(message.velocity[order[6]])
+        elif not self._has_ctrl_grip_vel and self._prev_grip_sample is not None:
+            dt = now - self._prev_grip_sample[0]
+            if 1e-4 <= dt <= 0.5:
+                self.latest_gripper_velocity = (
+                    self.latest_position[6] - self._prev_grip_sample[1]
+                ) / dt
+        self._prev_grip_sample = (now, self.latest_position[6])
         if len(message.effort) >= 6:
             self.latest_torque = tuple(float(message.effort[i]) for i in order[:6])
+        if len(message.effort) >= 7:
+            self.latest_gripper_force = float(message.effort[order[6]])
 
         if self.phase == 'running' and self.anchor_position is not None:
-            now = time.monotonic()
             j_idx = self.config.joint - 1
             if abs(self.current_dq_des) > 1e-6:
-                self._segment_velocities.append((now, self.latest_velocity[j_idx]))
+                if self.config.joint == 7:
+                    dq_meas = self.latest_gripper_velocity
+                    tau_meas = self.latest_gripper_force
+                else:
+                    dq_meas = self.latest_velocity[j_idx]
+                    tau_meas = self.latest_torque[j_idx]
+                self._segment_velocities.append((now, dq_meas))
                 conf = sample_velocity_confidence(self._segment_velocities, self.current_dq_des)
                 if conf > 0.0:
-                    if (self.applied_gravity_torques is not None
+                    if self.config.joint == 7:
+                        g_val = 0.0
+                    elif (self.applied_gravity_torques is not None
                             and len(self.applied_gravity_torques) >= 6):
                         g_val = float(self.applied_gravity_torques[j_idx])
                     else:
@@ -282,8 +322,8 @@ class SweepCollectorNode(Node):
                         t=now - self.sweep_started,
                         joint=self.config.joint,
                         q=self.latest_position[j_idx],
-                        dq=self.latest_velocity[j_idx],
-                        tau_meas=self.latest_torque[j_idx],
+                        dq=dq_meas,
+                        tau_meas=tau_meas,
                         q_des=self.current_q_des,
                         dq_des=self.current_dq_des,
                         tau_gravity=g_val,
@@ -301,11 +341,18 @@ class SweepCollectorNode(Node):
                 self.arm_end_effector = cfg['end_effector']
             if isinstance(cfg.get('gravity_scale'), (int, float)):
                 self.arm_gravity_scale = float(cfg['gravity_scale'])
+            if isinstance(cfg.get('friction_scale'), (int, float)):
+                self.arm_friction_scale = float(cfg['friction_scale'])
             if isinstance(state.get('gravity_scale_applied'), (int, float)):
                 self.arm_gravity_scale = float(state['gravity_scale_applied'])
             g_vec = state.get('gravity_torque')
             if isinstance(g_vec, list) and len(g_vec) >= 6:
                 self.applied_gravity_torques = tuple(float(x) for x in g_vec[:6])
+            if isinstance(state.get('gripper_velocity'), (int, float)):
+                self.latest_gripper_velocity = float(state['gripper_velocity'])
+                self._has_ctrl_grip_vel = True
+            if isinstance(state.get('gripper_force'), (int, float)):
+                self.latest_gripper_force = float(state['gripper_force'])
             if isinstance(cfg.get('gravity_config'), str):
                 g_cfg = cfg['gravity_config'].strip()
                 if g_cfg and g_cfg != self._loaded_gravity_path and Path(g_cfg).is_file():
@@ -321,6 +368,12 @@ class SweepCollectorNode(Node):
             pass
 
     def _publish_mit(self, q_joint: float, dq_joint: float, anchor_blend: float = 1.0) -> None:
+        if self.config.joint == 7:
+            self.gripper_pub.publish(GripperCommand(
+                width=max(0.0, min(0.1, float(q_joint))),
+                effort=float(self.config.gripper_effort),
+            ))
+            return
         assert self.anchor_position is not None
         assert self.config.kd is not None
         if self.initial_position is not None and anchor_blend < 1.0:
@@ -342,7 +395,20 @@ class SweepCollectorNode(Node):
         msg.torque = [0.0] * 6
         self.mit_pub.publish(msg)
 
+    def _restore_friction_scale(self) -> None:
+        if (self._saved_friction_scale is not None
+                and self.config_client.service_is_ready()):
+            self.config_client.call_async(
+                ConfigureArm.Request(
+                    end_effector=self.arm_end_effector,
+                    gravity_scale=self.arm_gravity_scale,
+                    friction_scale=-2.0 - self._saved_friction_scale,
+                )
+            )
+            self._saved_friction_scale = None
+
     def _fail(self, reason: str) -> None:
+        self._restore_friction_scale()
         self.error = reason
         self.phase = 'failed'
         self.get_logger().error(reason)
@@ -360,21 +426,23 @@ class SweepCollectorNode(Node):
             return
 
         if self.phase == 'waiting_feedback':
-            self.initial_position = self.latest_position[:6]
-            self.anchor_position = (
-                resolve_safe_anchor(self.initial_position, self.config.joint)
+            self.initial_position = self.latest_position[:7]
+            base_anchor = (
+                resolve_safe_anchor(self.initial_position[:6], self.config.joint)
                 if self.config.use_safe_anchor
-                else self.initial_position
+                else self.initial_position[:6]
             )
+            self.anchor_position = base_anchor + (self.initial_position[6],)
             self.current_q_des = self.initial_position[self.config.joint - 1]
             self.current_dq_des = 0.0
-            # 进入摩擦力标定程序时，先将驱动的 friction_scale 设为 0.0，防止已标定的摩擦力影响采样
+            # 进入摩擦力标定程序时，仅在驱动内存中临时将 friction_scale 设为 0.0（不改写 arms.yaml）
             if self.config_client.service_is_ready():
+                self._saved_friction_scale = self.arm_friction_scale
                 self._pending_future = self.config_client.call_async(
                     ConfigureArm.Request(
                         end_effector=self.arm_end_effector,
                         gravity_scale=self.arm_gravity_scale,
-                        friction_scale=0.0,
+                        friction_scale=-2.0,
                     )
                 )
                 self.phase = 'zeroing_friction'
@@ -445,11 +513,17 @@ class SweepCollectorNode(Node):
             self.current_dq_des = 0.0
             self._segment_velocities = []
             self._publish_mit(self.current_q_des, 0.0)
+            if self.config.joint == 7:
+                self.gripper_pub.publish(GripperCommand(width=float(self.current_q_des), effort=0.0))
+            self._restore_friction_scale()
             self.phase = 'completed'
             self.completed = True
 
     def _check_enable_or_mit(self) -> None:
         assert self.latest_status is not None
+        if self.config.joint == 7:
+            self._start_schedule()
+            return
         if not all(self.latest_status.motor_enabled):
             if not self.enable_client.service_is_ready():
                 return
@@ -478,9 +552,13 @@ class SweepCollectorNode(Node):
         j_idx = self.config.joint - 1
         q_init = init_p[j_idx]
         q_ret = self.anchor_position[j_idx]
-        anchor_travel = max(
-            (abs(self.anchor_position[i] - init_p[i]) for i in range(6) if i != j_idx),
-            default=0.0,
+        anchor_travel = (
+            0.0
+            if self.config.joint == 7
+            else max(
+                (abs(self.anchor_position[i] - init_p[i]) for i in range(6) if i != j_idx),
+                default=0.0,
+            )
         )
         self.schedule = build_sweep_schedule(
             q_init, self.config, anchor_travel=anchor_travel, q_return=q_ret,
