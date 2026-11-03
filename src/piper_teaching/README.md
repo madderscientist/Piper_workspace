@@ -7,7 +7,7 @@
 | 1 → 3 / 1 ↔ 3 | `arm_1` / `arm_3` | `can0` 示教手柄 / `can2` 夹爪 | `arm_1` 主臂（重力补偿）控制 `arm_3` 从臂（重力补偿+MIT） | 六关节和末端开度双向跟随 |
 | 2 → 4 / 2 ↔ 4 | `arm_2` / `arm_4` | `can1` 示教手柄 / `can3` 夹爪 | `arm_2` 主臂（重力补偿）控制 `arm_4` 从臂（重力补偿+MIT） | 六关节和末端开度双向跟随 |
 
-示教节点不打开 CAN，不直接创建 SDK 对象；重力补偿统一在底层驱动中折合到 `target position`（`p_des = position + gravity / kp`），示教不重复计算。
+示教节点以 **200 Hz（周期 `5 ms`）** 运行，与底层 `piper_x_driver`（200 Hz）及硬件 CAN 反馈（200 Hz）严格同频；不直接打开 CAN 或创建 SDK 对象，重力与摩擦力补偿统一在底层驱动中实时计算。
 
 ## 1. 预览与启动
 
@@ -67,4 +67,4 @@ ros2 service call /bilateral_teaching/stop std_srvs/srv/Trigger '{}'
 | `feedback_timeout` | `1.0 s` | 反馈时效窗口 |
 | `engage_speed_deg_s` | `24 °/s` | engage 阶段最大关节目标变化率 |
 
-更多接口说明见 [ROS API](../../docs/02-ros-api.md#5-四臂双向示教)。
+更多底层接口说明见 [驱动与 ROS 接口文档](../piper_x_driver/README.md#6-对外暴露的-ros-2-接口与完整字段契约)。

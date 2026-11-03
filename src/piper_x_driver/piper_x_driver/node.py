@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 from can import CanError
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, WrenchStamped
 from piper_x_interfaces.msg import (
     ArmStatus, CartesianCommand, GripperCommand, JointCommand, MitCommand,
 )
@@ -31,7 +31,7 @@ from std_srvs.srv import Trigger
 import yaml
 
 from .backend import fresh, SdkArm
-from .controller import Controller, SLIDER_LOWER, SLIDER_UPPER
+from .controller import Controller, RateMeter, SLIDER_LOWER, SLIDER_UPPER
 from .configuration import bounded, default_config_path, FleetConfig
 
 
@@ -48,8 +48,22 @@ class DriverNode(Node):
             (arm.id for arm in self.fleet.arms if arm.namespace == namespace),
             self.fleet.arms[0].id if namespace == '/' else '')
         self.declare_parameter('arm_id', default_arm)
+        self.declare_parameter('rate_hz', 200.0)
+        self.declare_parameter('telemetry_hz', 200.0)
+        self.rate_hz = bounded(
+            float(self.get_parameter('rate_hz').value), 'rate_hz', 10.0, 1000.0,
+        )
+        self.telemetry_hz = bounded(
+            float(self.get_parameter('telemetry_hz').value),
+            'telemetry_hz',
+            10.0,
+            self.rate_hz,
+        )
         self.arm_config = self.fleet.arm(str(self.get_parameter('arm_id').value))
         self._public_config = self.fleet.public(self.arm_config)
+        self._public_config_prefix = (
+            '{"configuration": ' + json.dumps(self._public_config, allow_nan=False) + ', '
+        )
         if namespace not in ('/', self.arm_config.namespace):
             raise ValueError('Driver namespace does not match configured arm')
         self.arm: Any = SdkArm(self.arm_config.can_port)
@@ -73,17 +87,38 @@ class DriverNode(Node):
         self.joints_pub = self.create_publisher(JointState, 'joint_states_feedback', 10)
         self.status_pub = self.create_publisher(ArmStatus, 'arm_status', 10)
         self.pose_pub = self.create_publisher(PoseStamped, 'end_pose_stamped', 10)
+        self.wrench_pub = self.create_publisher(WrenchStamped, 'end_wrench_stamped', 10)
         self.control_pub = self.create_publisher(String, 'control_state', 10)
+        self._joint_msg = JointState(name=_JOINT_NAMES)
+        self._pose_msg = PoseStamped()
+        self._pose_msg.header.frame_id = 'base_link'
+        self._wrench_msg = WrenchStamped()
+        self._wrench_msg.header.frame_id = 'gripper'
+        self._status_msg = ArmStatus()
+        self._control_msg = String()
+        self._loop_rate = RateMeter()
+        self._can_rx_rate = RateMeter()
+        self._joints_pub_rate = RateMeter()
+        self._wrench_pub_rate = RateMeter()
+        self._pose_pub_rate = RateMeter()
+        self._status_pub_rate = RateMeter()
+        self._control_pub_rate = RateMeter()
+        self._last_can_rx_updates = getattr(self.arm, 'can_rx_updates', 0)
+        self._last_control_state_pub = 0.0
+        self._last_state_key = None
+        self._last_err_code = None
         self.create_service(Enable, 'enable_srv', self._enable, callback_group=self.power_group)
         self.create_service(CalibrateEffector, 'calibrate_effector', self._calibrate_effector,
                             callback_group=self.power_group)
-        self.create_service(SetMode, 'set_mode', self._mode)
-        self.create_service(ConfigureArm, 'configure_arm', self._configure)
-        self.create_service(DebugMit, 'debug_mit', self._debug)
+        self._sync_services = (
+            self.create_service(SetMode, 'set_mode', self._mode),
+            self.create_service(ConfigureArm, 'configure_arm', self._configure),
+            self.create_service(DebugMit, 'debug_mit', self._debug),
+        )
         realtime_sub_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=5,
         )
         for kind, topic, handler, qos in (
             (JointCommand, 'command/joints', self.control.joints, 10),
@@ -99,8 +134,11 @@ class DriverNode(Node):
             self.control.start_mit()
         except (ValueError, RuntimeError, CanError) as error:
             self._error(error)
-        self.create_timer(0.02, self._publish)
-        self.get_logger().info('REAL HARDWARE: started in MIT mode with gravity compensation')
+        self._main_timer = self.create_timer(1.0 / self.telemetry_hz, self._publish)
+        self.get_logger().info(
+            f'REAL HARDWARE: started in MIT mode with gravity compensation '
+            f'(inner={self.rate_hz:g} Hz, telemetry={self.telemetry_hz:g} Hz)'
+        )
 
     def _error(self, error):
         message = str(error)
@@ -138,9 +176,7 @@ class DriverNode(Node):
             if raw_friction_scale < -1.0:
                 # 标定过程临时覆盖运行时 friction_scale（如 -2.0 表示临时置 0，或 -(2.0 + s)），不写盘修改 arms.yaml
                 temp_scale = bounded(-raw_friction_scale - 2.0, 'friction_scale', 0, 1)
-                self.control.friction_scale = temp_scale
-                if temp_scale == 0.0:
-                    self.control.friction_scale_applied = 0.0
+                self.control.reconfigure(friction_scale=temp_scale)
                 self.last_error = ''
                 response.success = True
                 response.message = 'Temporary runtime friction_scale applied without modifying arms.yaml'
@@ -156,15 +192,17 @@ class DriverNode(Node):
             self.fleet = updated
             self.arm_config = updated.arm(self.arm_config.id)
             self._public_config = updated.public(self.arm_config)
-            self.control.effector = updated.effectors[self.arm_config.end_effector]
-            self.control.gravity_scale = self.arm_config.gravity_scale
-            if self.arm_config.gravity_scale == 0.0:
-                self.control.gravity_scale_applied = 0.0
-            self.control.gravity_model = updated.gravity_model(self.arm_config)
-            self.control.friction_scale = self.arm_config.friction_scale
-            if self.arm_config.friction_scale == 0.0:
-                self.control.friction_scale_applied = 0.0
-            self.control.friction_model = updated.friction_model(self.arm_config)
+            self._public_config_prefix = (
+                '{"configuration": ' + json.dumps(self._public_config, allow_nan=False) + ', '
+            )
+            self.control.reconfigure(
+                effector=updated.effectors[self.arm_config.end_effector],
+                gravity_scale=self.arm_config.gravity_scale,
+                gravity_model=updated.gravity_model(self.arm_config),
+                friction_scale=self.arm_config.friction_scale,
+                friction_model=updated.friction_model(self.arm_config),
+                update_models=True,
+            )
             self.last_error = ''
             response.success = True
             response.message = 'Configuration saved and applied; no power or mode change'
@@ -221,6 +259,12 @@ class DriverNode(Node):
     def _calibration_block_reason(self, sample=None):
         if self.calibration_active:
             return 'Effector calibration in progress; do not repeat the request'
+        if self.power_request is not None or self.teaching_active:
+            return 'Stop teaching and wait for power requests to finish before calibration'
+        if (self.control.mode != 'standby' or self.control.debug_session
+                or (self.control.mit_received is not None
+                    and self.control.clock() - self.control.mit_received <= 0.2)):
+            return 'Stop MIT/other controllers and select standby before calibration'
         try:
             self._calibration_feedback(sample)
         except (ValueError, RuntimeError, CanError) as error:
@@ -294,8 +338,27 @@ class DriverNode(Node):
             future.set_exception(error)
 
     def _publish_control_state(self, sample=None):
-        self.control_pub.publish(String(data=json.dumps({
-            'configuration': self._public_config,
+        now = time.monotonic()
+        self._control_pub_rate.mark(now)
+        self._last_control_state_pub = now
+        ctrl_now = self.control.clock()
+        rates = {
+            'target_hz': float(self.rate_hz),
+            'telemetry_target_hz': float(self.telemetry_hz),
+            'can_rx_hz': self._can_rx_rate.hz(now),
+            'loop_hz': self._loop_rate.hz(now),
+            'comp_hz': self.control.comp_rate.hz(ctrl_now),
+            'cmd_tx_hz': self.control.cmd_tx_rate.hz(ctrl_now),
+            'mit_tx_hz': self.control.mit_tx_rate.hz(ctrl_now),
+            'grip_tx_hz': self.control.grip_tx_rate.hz(ctrl_now),
+            'ros_cmd_hz': self.control.ros_cmd_rate.hz(ctrl_now),
+            'joints_pub_hz': self._joints_pub_rate.hz(now),
+            'wrench_pub_hz': self._wrench_pub_rate.hz(now),
+            'pose_pub_hz': self._pose_pub_rate.hz(now),
+            'status_pub_hz': self._status_pub_rate.hz(now),
+            'control_pub_hz': self._control_pub_rate.hz(now),
+        }
+        body = json.dumps({
             'mode': self.control.mode,
             'mit_ready': self.control.mode == 'mit' and self.control.mit_ready,
             'debug_active': bool(self.control.debug_session),
@@ -311,6 +374,11 @@ class DriverNode(Node):
                 0.0 if sample is None else float(getattr(sample, 'gripper_force', 0.0))
             ),
             'output_torque': list(self.control.output_torque),
+            'inertia_torque': list(self.control.inertia_torque),
+            'external_torque': list(self.control.external_torque),
+            'end_wrench': list(self.control.end_wrench),
+            'end_force': list(self.control.end_force),
+            'end_torque': list(self.control.end_torque),
             'gravity_scale_applied': self.control.gravity_scale_applied,
             'friction_scale_applied': self.control.friction_scale_applied,
             'holding': bool(self.control.hold_reason),
@@ -318,7 +386,10 @@ class DriverNode(Node):
             'calibration_active': self.calibration_active,
             'calibration_blocked_reason': self._calibration_block_reason(sample),
             'last_error': self.last_error,
-        }, allow_nan=False)))
+            'rates': rates,
+        }, allow_nan=False)
+        self._control_msg.data = self._public_config_prefix + body[1:]
+        self.control_pub.publish(self._control_msg)
 
     async def _enable(self, request, response):
         if request.enable_request and self.calibration_active:
@@ -378,14 +449,7 @@ class DriverNode(Node):
         try:
             if self.calibration_active:
                 raise ValueError('Wait for effector calibration to finish before changing modes')
-            if request.mode != 'drag' and hasattr(self.arm, 'leave_drag'):
-                self.arm.leave_drag()
-            if (request.mode == 'mit' and not self.control.debug_session
-                    and (self.control.mit_target is None or self.control.mit_received is None
-                         or self.control.clock() - self.control.mit_received > 0.2)):
-                sample = self.control.healthy()
-                self.control.mit(self.control._gravity_command(sample))
-            self.control.set_mode(request.mode)
+            self.control.set_mode(request.mode, preload_mit=True)
             self.last_error = ''
             response.success = True
             response.message = 'Request sent; inspect ctrl_mode/mode_feedback/teach_status'
@@ -395,12 +459,35 @@ class DriverNode(Node):
         self._publish_control_state()
         return response
 
+    def _record_can_rx(self, sample, now: float) -> None:
+        rx_updates = getattr(self.arm, 'can_rx_updates', None)
+        if rx_updates is not None and getattr(self.arm, '_real_sdk', lambda: False)():
+            if rx_updates != self._last_can_rx_updates:
+                self._last_can_rx_updates = rx_updates
+                self._can_rx_rate.mark(now)
+        elif sample is not None and sample.position is not None and fresh(sample.age[:4]):
+            self._can_rx_rate.mark(now)
+
+    def _fast_control_step(self) -> None:
+        """Inner control step: run MIT watchdog, gravity/friction compensation, and CAN TX only."""
+        now = time.monotonic()
+        self._loop_rate.mark(now)
+        try:
+            sample = self.control.watchdog(compute_wrench=False)
+            self._record_can_rx(sample, now)
+        except (ValueError, RuntimeError, CanError) as error:
+            self._error(error)
+
     def _publish(self):
-        if self.teaching_active and time.monotonic() - self.teaching_received > 0.3:
+        now = time.monotonic()
+        self._loop_rate.mark(now)
+        if self.teaching_active and now - self.teaching_received > 0.3:
             self.teaching_active = False
             self.get_logger().error('Teaching heartbeat expired')
         try:
             sample = self.control.watchdog()
+            if 'retaining last MIT output' in self.last_error:
+                self.last_error = ''
         except (ValueError, RuntimeError, CanError) as error:
             self._error(error)
             try:
@@ -409,10 +496,38 @@ class DriverNode(Node):
                 self._error(f'{error}; feedback unavailable: {feedback_error}')
                 self._publish_control_state()
                 return
-        self._publish_control_state(sample)
+        self._record_can_rx(sample, now)
+
+        state_key = (
+            self.control.mode,
+            self.control.mit_ready,
+            bool(self.control.hold_reason),
+            self.last_error,
+            bool(self.control.debug_session),
+            self.calibration_active,
+            sample.enabled,
+        )
+        publish_slow = (
+            self._last_control_state_pub == 0.0
+            or state_key != self._last_state_key
+            or now - self._last_control_state_pub >= 0.0195
+        )
+        if publish_slow:
+            self._last_state_key = state_key
+            self._publish_control_state(sample)
+
         stamp = self.get_clock().now().to_msg()
-        if sample.status is not None and 0 <= sample.age[4] <= 1.0:
-            message = ArmStatus(**sample.status)
+        if publish_slow and sample.status is not None and 0 <= sample.age[4] <= 1.0:
+            message = self._status_msg
+            st = sample.status
+            message.ctrl_mode = st['ctrl_mode']
+            message.arm_status = st['arm_status']
+            message.mode_feedback = st['mode_feedback']
+            message.teach_status = st['teach_status']
+            message.motion_status = st['motion_status']
+            message.trajectory_num = st['trajectory_num']
+            err = st['err_code']
+            message.err_code = err
             message.header.stamp = stamp
             message.feedback_age = list(sample.age)
             message.motor_enabled = list(sample.enabled[:6])
@@ -421,42 +536,50 @@ class DriverNode(Node):
             message.gripper_valid = 0 <= sample.age[3] <= 1.0
             message.teaching_active = self.teaching_active
             message.last_error = self.last_error
-            for index in range(6):
-                setattr(message, f'joint_{index + 1}_angle_limit',
-                        bool(message.err_code & (1 << (index + 8))))
-                setattr(message, f'communication_status_joint_{index + 1}',
-                        bool(message.err_code & (1 << index)))
+            if err != self._last_err_code:
+                self._last_err_code = err
+                for idx in range(6):
+                    setattr(message, f'joint_{idx + 1}_angle_limit', bool(err & (1 << (idx + 8))))
+                    setattr(message, f'communication_status_joint_{idx + 1}', bool(err & (1 << idx)))
             self.status_pub.publish(message)
+            self._status_pub_rate.mark(now)
         if sample.position is not None and fresh(sample.age[:4]):
-            message = JointState()
-            message.header.stamp = stamp
-            message.name = _JOINT_NAMES
-            message.position = list(sample.position)
-            message.velocity, message.effort = list(sample.velocity), list(sample.torque)
-            self.joints_pub.publish(message)
-        if sample.pose is not None:
-            message = PoseStamped()
-            message.header.stamp, message.header.frame_id = stamp, 'base_link'
-            (message.pose.position.x, message.pose.position.y,
-             message.pose.position.z) = sample.pose[:3]
+            j_msg = self._joint_msg
+            j_msg.header.stamp = stamp
+            j_msg.position = list(sample.position)
+            j_msg.velocity, j_msg.effort = list(sample.velocity), list(sample.torque)
+            self.joints_pub.publish(j_msg)
+            self._joints_pub_rate.mark(now)
+        if publish_slow and sample.pose is not None:
+            p_msg = self._pose_msg
+            p_msg.header.stamp = stamp
+            (p_msg.pose.position.x, p_msg.pose.position.y,
+             p_msg.pose.position.z) = sample.pose[:3]
             rx, ry, rz = (0.5 * v for v in sample.pose[3:])
             cx, sx = math.cos(rx), math.sin(rx)
             cy, sy = math.cos(ry), math.sin(ry)
             cz, sz = math.cos(rz), math.sin(rz)
-            message.pose.orientation.x = float(sx * cy * cz - cx * sy * sz)
-            message.pose.orientation.y = float(cx * sy * cz + sx * cy * sz)
-            message.pose.orientation.z = float(cx * cy * sz - sx * sy * cz)
-            message.pose.orientation.w = float(cx * cy * cz + sx * sy * sz)
-            self.pose_pub.publish(message)
+            p_msg.pose.orientation.x = float(sx * cy * cz - cx * sy * sz)
+            p_msg.pose.orientation.y = float(cx * sy * cz + sx * cy * sz)
+            p_msg.pose.orientation.z = float(cx * cy * sz - sx * sy * cz)
+            p_msg.pose.orientation.w = float(cx * cy * cz + sx * sy * sz)
+            self.pose_pub.publish(p_msg)
+            self._pose_pub_rate.mark(now)
+        if (self.control.mode == 'mit' and self.control.mit_ready
+                and sample.position is not None and fresh(sample.age[:3])):
+            wrench_msg = self._wrench_msg
+            wrench_msg.header.stamp = stamp
+            (wrench_msg.wrench.force.x, wrench_msg.wrench.force.y,
+             wrench_msg.wrench.force.z) = self.control.end_force
+            (wrench_msg.wrench.torque.x, wrench_msg.wrench.torque.y,
+             wrench_msg.wrench.torque.z) = self.control.end_torque
+            self.wrench_pub.publish(wrench_msg)
+            self._wrench_pub_rate.mark(now)
 
     def destroy_node(self):
         try:
-            if self.control.mode != 'drag' and (self.control.mode == 'mit' or self.arm._powered):
-                self.arm._enter_drag()
-                self.control._clear_power_state()
-                self.control.mode = 'drag'
-                if self.context.ok():
-                    self._publish_control_state()
+            if self.control.shutdown_to_drag() and self.context.ok():
+                self._publish_control_state()
         except (ValueError, RuntimeError, CanError) as error:
             self._error(f'Driver shutdown: {error}; actual motor power unconfirmed')
         self.calibration_worker.shutdown(wait=True)
@@ -485,6 +608,9 @@ def main(args=None):
     executor = None
     try:
         node = DriverNode()
+        if getattr(node, '_main_timer', None) is not None:
+            node.destroy_timer(node._main_timer)
+            node._main_timer = None
         executor = SingleThreadedExecutor()
         executor.add_node(node)
         if node.arm_config.id == node.fleet.arms[0].id:
@@ -492,16 +618,53 @@ def main(args=None):
                 tty_fd = os.open('/dev/tty', os.O_RDONLY | os.O_NONBLOCK)
             except OSError:
                 tty_fd = None
+        subs = list(node.subscriptions)
+        sync_srvs = getattr(node, '_sync_services', ())
+        period = 1.0 / node.rate_hz
+        telemetry_stride = max(1, round(node.rate_hz / node.telemetry_hz))
+        spin_stride = max(1, round(node.rate_hz / 100.0))
+        next_tick = time.monotonic()
+        step = 0
         while rclpy.ok() and not shutdown_requested:
-            if tty_fd is not None and select.select([tty_fd], [], [], 0.0)[0]:
-                try:
-                    if any(ch in os.read(tty_fd, 1024) for ch in (b'\n', b'\r')):
-                        if node.teaching_start_client.service_is_ready():
-                            node.get_logger().info('Enter pressed: requesting teaching retry')
-                            node.teaching_start_client.call_async(Trigger.Request())
-                except OSError:
-                    pass
-            executor.spin_once(timeout_sec=0.1)
+            for sub in subs:
+                while True:
+                    with sub.handle:
+                        msg_info = sub.handle.take_message(sub.msg_type, sub.raw)
+                    if msg_info is None:
+                        break
+                    sub.callback(msg_info[0])
+            for srv in sync_srvs:
+                while True:
+                    with srv.handle:
+                        req_and_hdr = srv.handle.service_take_request(srv.srv_type.Request)
+                    if req_and_hdr is None or req_and_hdr[0] is None:
+                        break
+                    req_msg, hdr = req_and_hdr
+                    if req_msg is not None and hdr is not None:
+                        resp_msg = srv.callback(req_msg, srv.srv_type.Response())
+                        srv.send_response(resp_msg, hdr)
+            if step % telemetry_stride == 0:
+                node._publish()
+            else:
+                node._fast_control_step()
+            step += 1
+            if step % spin_stride == 0 or node.power_request is not None or node.calibration_active:
+                if tty_fd is not None and select.select([tty_fd], [], [], 0.0)[0]:
+                    try:
+                        if any(ch in os.read(tty_fd, 1024) for ch in (b'\n', b'\r')):
+                            if node.teaching_start_client.service_is_ready():
+                                node.get_logger().info('Enter pressed: requesting teaching retry')
+                                node.teaching_start_client.call_async(Trigger.Request())
+                    except OSError:
+                        pass
+                executor.spin_once(timeout_sec=0.0)
+            next_tick += period
+            now = time.monotonic()
+            sleep_s = next_tick - now
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+            elif now - next_tick > 0.02:
+                next_tick = now
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:

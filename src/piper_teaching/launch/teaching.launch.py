@@ -23,6 +23,8 @@ def _teaching(context):
     mode = LaunchConfiguration('mode').perform(context).strip()
     if mode:
         parameters.append({'mode': mode})
+    if 'rate_hz' in context.launch_configurations:
+        parameters.append({'rate_hz': float(LaunchConfiguration('rate_hz').perform(context))})
     return [
         Node(
             package='piper_teaching', executable='bilateral_teaching', output='screen',
@@ -36,6 +38,7 @@ def generate_launch_description():
         DeclareLaunchArgument('mode', default_value=''),
         DeclareLaunchArgument('dry_run', default_value='true'),
         DeclareLaunchArgument('auto_start', default_value='true'),
+        DeclareLaunchArgument('rate_hz', default_value='200.0'),
         DeclareLaunchArgument('config_file', default_value=str(default_config_path())),
         OpaqueFunction(function=_teaching),
     ])

@@ -201,6 +201,9 @@ class JointFrictionModel:
         )
 
 
+_DEFAULT_JOINT_FRICTION = JointFrictionModel()
+
+
 @dataclass(frozen=True)
 class GripperFrictionModel:
     """Non-periodic spatial profile + Stribeck friction model for the gripper / teaching handle.
@@ -399,7 +402,7 @@ class ArmFrictionModel:
     def joint(self, index: int) -> JointFrictionModel:
         if not 1 <= index <= 6:
             raise ValueError(f'Joint index must be in 1..6, got {index}')
-        return self.joints.get(index, JointFrictionModel())
+        return self.joints.get(index, _DEFAULT_JOINT_FRICTION)
 
     def with_joint(
         self, index: int, model: JointFrictionModel | GripperFrictionModel,

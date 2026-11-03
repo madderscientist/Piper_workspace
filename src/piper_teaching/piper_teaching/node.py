@@ -33,8 +33,10 @@ class TeachingNode(Node):
         self.fleet = FleetConfig(str(self.get_parameter('config_file').value))
         self.declare_parameter('dry_run', True)
         self.declare_parameter('auto_start', True)
+        self.declare_parameter('rate_hz', 200.0)
         self.dry_run = bool(self.get_parameter('dry_run').value)
         self.auto_start = bool(self.get_parameter('auto_start').value)
+        self.rate_hz = max(10.0, min(1000.0, float(self.get_parameter('rate_hz').value)))
         defaults = TeachingConfig()
         values = {}
         for name in defaults.__dataclass_fields__:
@@ -63,10 +65,17 @@ class TeachingNode(Node):
         self.holding = False
         self.retry_requested = False
         self._last_tick = time.monotonic()
+        self._last_state_pub = 0.0
+        self._last_state_key = None
+        self._mit_msgs = [MitCommand() for _ in range(4)]
+        self._grip_msgs = [GripperCommand() for _ in range(4)]
+        self._target_msgs = [JointState(name=list(JOINT_NAMES)) for _ in range(4)]
+        self._active_msg = Bool()
+        self._state_msg = String()
         realtime_sub_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=5,
         )
         for index in range(4):
             prefix = self.fleet.arms[index].namespace
@@ -91,9 +100,20 @@ class TeachingNode(Node):
         self.create_service(Trigger, '/bilateral_teaching/start', self._start)
         self.create_service(Trigger, '/bilateral_teaching/stop', self._stop_service)
         self.create_service(SetMode, '/bilateral_teaching/set_mode', self._set_mode)
-        self.create_timer(0.02, self._tick)
+        self.create_timer(1.0 / self.rate_hz, self._tick)
 
     def _joints(self, index, message):
+        if tuple(message.name) == JOINT_NAMES and len(message.position) == 7:
+            self.positions[index] = tuple(message.position)
+            if len(message.velocity) >= 6:
+                vel = tuple(float(v) for v in message.velocity[:6])
+                self.velocities[index] = (
+                    vel if all(math.isfinite(v) for v in vel) else (0.0,) * 6
+                )
+            else:
+                self.velocities[index] = (0.0,) * 6
+            self.joint_received[index] = time.monotonic()
+            return
         names = list(message.name)
         if len(names) != 7 or set(names) != set(JOINT_NAMES) or len(message.position) != 7:
             self.get_logger().error(f'arm_{index + 1}: seven unique positions required')
@@ -220,20 +240,22 @@ class TeachingNode(Node):
 
     def _send(self, samples, targets, kp, velocities=((0.0,) * 6,) * 4):
         kp_list, kd_list = list(kp), list(self.config.kd)
+        zero_6 = [0.0] * 6
         for index, (sample, target, velocity) in enumerate(zip(samples, targets, velocities)):
             free_master = self.config.mode == 'master_slave' and index in MASTER_INDICES
             follow = self.coupling.engaged and not free_master
             zero_gain = self.coupling.engaged and free_master
-            self.mit_pubs[index].publish(MitCommand(
-                position=list(target[:6]), velocity=list(velocity[:6]),
-                kp=[0.0] * 6 if zero_gain else kp_list,
-                kd=[0.0] * 6 if zero_gain else kd_list,
-                torque=[0.0] * 6,
-            ))
-            self.gripper_pubs[index].publish(GripperCommand(
-                width=target[6] if follow else sample.position[6],
-                effort=self.config.gripper_effort if follow else 0.0,
-            ))
+            m_msg = self._mit_msgs[index]
+            m_msg.position = list(target[:6])
+            m_msg.velocity = list(velocity[:6])
+            m_msg.kp = zero_6 if zero_gain else kp_list
+            m_msg.kd = zero_6 if zero_gain else kd_list
+            m_msg.torque = zero_6
+            self.mit_pubs[index].publish(m_msg)
+            g_msg = self._grip_msgs[index]
+            g_msg.width = float(target[6] if follow else sample.position[6])
+            g_msg.effort = float(self.config.gripper_effort if follow else 0.0)
+            self.gripper_pubs[index].publish(g_msg)
 
     def _tick(self):
         now = time.monotonic()
@@ -317,19 +339,29 @@ class TeachingNode(Node):
                 if self.phase in ('enabling', 'starting'):
                     self.deadline += elapsed
         if refs is not None:
-            for publisher, target in zip(self.target_pubs, refs):
-                publisher.publish(JointState(
-                    name=list(JOINT_NAMES), position=list(target)))
-        self.active_pub.publish(Bool(data=self.phase in ('engaging', 'active')))
-        self.state_pub.publish(String(data=json.dumps({
-            'dry_run': self.dry_run, 'mode': self.config.mode,
-            'phase': self.phase, 'reason': self.reason,
-            'holding': self.holding,
-            'start_block_reason': block, 'references': refs, 'pairs': [[1, 3], [2, 4]],
-            'master_arms': [1, 2] if self.config.mode == 'master_slave' else [],
-            'slave_arms': [3, 4] if self.config.mode == 'master_slave' else [],
-            'engage_max_error_deg': self.coupling.engage_error_deg,
-        })))
+            for publisher, t_msg, target in zip(self.target_pubs, self._target_msgs, refs):
+                t_msg.position = list(target)
+                publisher.publish(t_msg)
+        state_key = (self.phase, self.holding, self.reason, block, self.config.mode)
+        if (
+            self._last_state_pub == 0.0
+            or state_key != self._last_state_key
+            or now - self._last_state_pub >= 0.0195
+        ):
+            self._last_state_pub = now
+            self._last_state_key = state_key
+            self._active_msg.data = self.phase in ('engaging', 'active')
+            self.active_pub.publish(self._active_msg)
+            self._state_msg.data = json.dumps({
+                'dry_run': self.dry_run, 'mode': self.config.mode,
+                'phase': self.phase, 'reason': self.reason,
+                'holding': self.holding,
+                'start_block_reason': block, 'references': refs, 'pairs': [[1, 3], [2, 4]],
+                'master_arms': [1, 2] if self.config.mode == 'master_slave' else [],
+                'slave_arms': [3, 4] if self.config.mode == 'master_slave' else [],
+                'engage_max_error_deg': self.coupling.engage_error_deg,
+            })
+            self.state_pub.publish(self._state_msg)
 
 
 def main(args=None):
@@ -349,6 +381,8 @@ def main(args=None):
     executor = None
     try:
         node = TeachingNode()
+        for tmr in list(node.timers):
+            node.destroy_timer(tmr)
         executor = SingleThreadedExecutor()
         executor.add_node(node)
         try:
@@ -356,14 +390,35 @@ def main(args=None):
             node.get_logger().info('Press Enter at any time to retry initialization')
         except OSError:
             tty_fd = None
+        subs = list(node.subscriptions)
+        period = 1.0 / node.rate_hz
+        spin_stride = max(1, round(node.rate_hz / 50.0))
+        next_tick = time.monotonic()
+        step = 0
         while rclpy.ok() and not shutdown_requested:
-            if tty_fd is not None and select.select([tty_fd], [], [], 0.0)[0]:
-                try:
-                    if any(ch in os.read(tty_fd, 1024) for ch in (b'\n', b'\r')):
-                        node.request_retry()
-                except OSError:
-                    pass
-            executor.spin_once(timeout_sec=0.1)
+            for sub in subs:
+                while True:
+                    with sub.handle:
+                        msg_info = sub.handle.take_message(sub.msg_type, sub.raw)
+                    if msg_info is None:
+                        break
+                    sub.callback(msg_info[0])
+            node._tick()
+            step += 1
+            if step % spin_stride == 0 or node.pending:
+                if tty_fd is not None and select.select([tty_fd], [], [], 0.0)[0]:
+                    try:
+                        if any(ch in os.read(tty_fd, 1024) for ch in (b'\n', b'\r')):
+                            node.request_retry()
+                    except OSError:
+                        pass
+                executor.spin_once(timeout_sec=0.0)
+            next_tick += period
+            now = time.monotonic()
+            if next_tick > now:
+                time.sleep(next_tick - now)
+            elif now - next_tick > 0.05:
+                next_tick = now
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:

@@ -70,7 +70,13 @@ def test_real_ros_mit_debug_configuration_persistence_and_deadman(tmp_path, angl
         assert response.success
         spin_until(executor, lambda: driver.control.mit_ready)
         profile = driver.fleet.effectors['teaching_handle']
-        expected = gravity_torques(driver.arm.position[:6], profile.mass_kg, profile.com_m)
+        expected = (
+            gravity_torques(driver.arm.position[:6], profile.mass_kg, profile.com_m)
+            if driver.control.gravity_model is None
+            else driver.control.gravity_model.torques(
+                driver.arm.position[:6], profile.mass_kg, profile.com_m
+            )
+        )
         assert driver.control.gravity == pytest.approx(expected)
         response = call(config, ConfigureArm.Request(
             end_effector='teaching_handle', gravity_scale=0.4))

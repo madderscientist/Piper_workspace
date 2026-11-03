@@ -133,6 +133,12 @@ class SdkArm:
                     daemon=True,
                 )
                 self._grip_thread.start()
+                # Stop SDK background FPS counter lock contention after startup check completes.
+                for dev in (self.robot, self.gripper):
+                    ctx = getattr(dev, '_ctx', None)
+                    fps_mgr = getattr(ctx, 'fps', None)
+                    if fps_mgr is not None:
+                        fps_mgr.increment = lambda *_: None
         except (RuntimeError, ValueError, OSError, CanError):
             self.robot.disconnect()
             raise
@@ -146,6 +152,8 @@ class SdkArm:
         self.mit_output = None
         self._grip_history: deque[tuple[float, float]] = deque(maxlen=16)
         self._grip_vel: float = 0.0
+        self._last_joint_rx_stamp: float | None = None
+        self.can_rx_updates: int = 0
         self._grip_cond = threading.Condition()
         self._grip_stop = False
         self._grip_thread: threading.Thread | None = None
@@ -184,27 +192,50 @@ class SdkArm:
     def snapshot(self):
         parser = self.robot._parser
         parts = [getattr(parser, name, None) for name in ('joint_12', 'joint_34', 'joint_56')]
-        grip = self.gripper.get_gripper_status()
-        status = self.robot.get_arm_status()
-        drivers = [self.robot.get_driver_states(i) for i in _JOINTS]
-        motors = [self.robot.get_motor_states(i) for i in _JOINTS]
+        g_parser = getattr(self.gripper, '_parser', None)
+        grip = (
+            getattr(g_parser, 'gripper', None)
+            if g_parser is not None
+            else self.gripper.get_gripper_status()
+        )
+        if self._real_sdk():
+            status = getattr(parser, 'arm_status', None)
+            drivers = [getattr(parser, f'driver_state_{i}', None) for i in _JOINTS]
+            motors = [getattr(parser, f'motor_state_{i}', None) for i in _JOINTS]
+        else:
+            status = self.robot.get_arm_status()
+            drivers = [self.robot.get_driver_states(i) for i in _JOINTS]
+            motors = [self.robot.get_motor_states(i) for i in _JOINTS]
         pose_parts = [
             getattr(parser, name, None) for name in
             ('end_pose_xy', 'end_pose_zrx', 'end_pose_ryrz')
         ]
         # SDK receive callbacks mutate cached timestamps in place.
         timestamps = [getattr(x, 'timestamp', None) for x in (*parts, grip, status, *drivers)]
+        j_stamp = timestamps[0]
+        if j_stamp is not None and j_stamp != self._last_joint_rx_stamp:
+            self._last_joint_rx_stamp = j_stamp
+            self.can_rx_updates += 1
         motor_timestamps = [getattr(x, 'timestamp', None) for x in motors]
         pose_timestamps = [getattr(x, 'timestamp', None) for x in pose_parts]
         now = time.time()
         ages = tuple(-1.0 if stamp is None else now - stamp for stamp in timestamps)
-        # SDK aggregation can fill absent segments with zero; require every segment.
-        joint = self.robot.get_joint_angles() if all(item is not None for item in parts) else None
         position = None
-        if joint is not None and grip is not None:
+        if all(item is not None for item in parts) and grip is not None:
             if grip.msg.mode != 'width':
                 raise ValueError('This workspace requires width-mode gripper feedback')
-            position = tuple(joint.msg) + (float(grip.msg.value),)
+            if self._real_sdk() and hasattr(parts[0].msg, 'joint_1'):
+                j12, j34, j56 = parts[0].msg, parts[1].msg, parts[2].msg
+                position = (
+                    float(j12.joint_1), float(j12.joint_2),
+                    float(j34.joint_3), float(j34.joint_4),
+                    float(j56.joint_5), float(j56.joint_6),
+                    float(grip.msg.value),
+                )
+            else:
+                joint = self.robot.get_joint_angles()
+                if joint is not None:
+                    position = tuple(joint.msg) + (float(grip.msg.value),)
         elif self._mode == 'drag' and self._real_sdk():
             leader_parts = [
                 getattr(parser, name, None)
@@ -231,9 +262,16 @@ class SdkArm:
             torque = tuple(float(item.msg.torque) for item in motors if item is not None)
         pose = None
         if all(stamp is not None and 0 <= now - stamp <= 1.0 for stamp in pose_timestamps):
-            sample = self.robot.get_flange_pose()
-            if sample is not None:
-                pose = tuple(sample.msg)
+            if self._real_sdk() and hasattr(pose_parts[0].msg, 'X_axis'):
+                pxy, pzrx, pryrz = pose_parts[0].msg, pose_parts[1].msg, pose_parts[2].msg
+                pose = (
+                    float(pxy.X_axis), float(pxy.Y_axis), float(pzrx.Z_axis),
+                    float(pzrx.RX_axis), float(pryrz.RY_axis), float(pryrz.RZ_axis),
+                )
+            else:
+                sample = self.robot.get_flange_pose()
+                if sample is not None:
+                    pose = tuple(sample.msg)
         gripper_velocity = 0.0
         gripper_force = 0.0
         if grip is not None and 0 <= ages[3] <= 1.0:
@@ -482,7 +520,7 @@ class SdkArm:
             )
             self._grip_target_pos = target_w
             self._grip_target_effort = target_eff
-            if abs(target_w - start_w) <= 0.0002:
+            if abs(target_w - start_w) <= 0.0002 or (0.0 < dt <= 0.007):
                 self._grip_cmd_pos = target_w
                 self._grip_interp_active = False
                 self._grip_last_tx_time = now

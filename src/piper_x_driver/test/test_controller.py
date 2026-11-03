@@ -551,3 +551,91 @@ def test_negative_kd_in_mit_command_auto_derives_damping_in_driver(fake_arm, cap
         4.56, 4.6, 2.22, 0.29, 0.24, 0.05)
     assert damping_main(['--kp', '60', '60', '60', '12', '8', '8']) == 0
     assert 'kd: [9.25, 9.31, 4.51, 0.6, 0.49, 0.13]' in capsys.readouterr().out
+
+
+def test_end_effector_wrench_estimation_with_impedance_and_inertia(fake_arm):
+    import numpy as np
+    from piper_x_driver.gravity import (
+        _kinematics,
+        end_effector_wrench,
+        geometric_jacobian,
+        joint_inertias,
+    )
+
+    q = (0.2, 0.7, -0.9, 0.3, -0.4, 0.5)
+    offset = (0.01, -0.02, 0.08)
+    jac_base = geometric_jacobian(q, tool_offset_m=offset, frame='base_link')
+    # Verify linear Jacobian columns against central finite differences of forward kinematics
+    eps = 1e-6
+    for idx in range(6):
+        q_plus = (*q[:idx], q[idx] + eps, *q[idx + 1:])
+        q_minus = (*q[:idx], q[idx] - eps, *q[idx + 1:])
+        _, _, c_plus = _kinematics(q_plus, offset)
+        _, _, c_minus = _kinematics(q_minus, offset)
+        assert jac_base[:3, idx] == pytest.approx((c_plus[6] - c_minus[6]) / (2.0 * eps), abs=1e-6)
+
+    # Verify full 6-axis local gripper wrench (3D force N + 3D torque Nm) round-trip through J(q)^T
+    jac = geometric_jacobian(q, tool_offset_m=offset)
+    true_wrench = (12.0, -8.5, 25.0, 0.8, -1.2, 0.45)
+    tau_from_wrench = tuple(float(v) for v in (jac.T @ np.asarray(true_wrench)))
+    assert end_effector_wrench(
+        tau_from_wrench, q, tool_offset_m=offset, damping=0.0,
+    ) == pytest.approx(true_wrench, abs=1e-6)
+
+    # Verify Controller estimates joint external torque (subtracting inertia) and 6D end wrench
+    now = [0.0]
+    arm = fake_arm()
+    arm.position = (*q, 0.02)
+    kp = (40.0, 40.0, 40.0, 10.0, 8.0, 6.0)
+    kd = (4.0, 4.0, 3.0, 0.8, 0.6, 0.3)
+    dq_meas = (0.1, -0.2, 0.15, 0.0, 0.05, -0.1)
+    ddq = (1.5, -1.0, 0.8, -0.5, 0.4, -0.2)
+    inertias = joint_inertias(q)
+    expected_inertia = tuple(j_i * a_i for j_i, a_i in zip(inertias, ddq))
+    jac_flange = geometric_jacobian(q)
+    desired_tau_ext = tuple(float(v) for v in (jac_flange.T @ np.asarray(true_wrench)))
+    base_snapshot = arm.snapshot
+    arm.snapshot = lambda: replace(base_snapshot(), position=(*q, 0.02), velocity=dq_meas)
+    control = Controller(arm, clock=lambda: now[0])
+    control.start_mit()
+    arm.status['ctrl_mode'] = 1
+    arm.status['mode_feedback'] = 6
+    # Next tick after dt=0.02s with velocity incremented by ddq * (0.04 + dt) so LPF outputs ddq
+    dt = 0.02
+    alpha = dt / (0.04 + dt)
+    dq_next = tuple(dq_meas[i] + (ddq[i] / alpha) * dt for i in range(6))
+    q_des_next = tuple(
+        q[i] - (desired_tau_ext[i] - kd[i] * dq_next[i] - expected_inertia[i]) / kp[i]
+        for i in range(6)
+    )
+    arm.snapshot = lambda: replace(base_snapshot(), position=(*q, 0.02), velocity=dq_next)
+    now[0] = 0.02
+    control.mit(target(position=list(q_des_next), velocity=[0.0] * 6, kp=list(kp), kd=list(kd)))
+    control.watchdog()
+
+    assert control.inertia_torque == pytest.approx(expected_inertia, rel=1e-6)
+    assert control.external_torque == pytest.approx(desired_tau_ext, rel=1e-6)
+    expected_wrench = end_effector_wrench(desired_tau_ext, q)
+    assert control.end_wrench == pytest.approx(expected_wrench, rel=1e-6)
+    assert control.end_force == pytest.approx(expected_wrench[:3], rel=1e-6)
+    assert control.end_torque == pytest.approx(expected_wrench[3:], rel=1e-6)
+
+    # Sub-4ms tick holds acceleration without finite-difference spike, and partial gravity_scale
+    # does not leak uncompensated arm weight into external_torque
+    now[0] = 0.021
+    control.gravity_scale = 0.5
+    control.gravity_scale_applied = 0.5
+    from piper_x_driver.gravity import gravity_torques
+    raw_g = gravity_torques(q)
+    q_des_half_g = tuple(
+        q_des_next[i] + 0.5 * raw_g[i] / kp[i]
+        for i in range(6)
+    )
+    control.mit(target(position=list(q_des_half_g), velocity=[0.0] * 6, kp=list(kp), kd=list(kd)))
+    control.watchdog()
+    assert control.inertia_torque == pytest.approx(expected_inertia, rel=1e-6)
+    assert control.external_torque == pytest.approx(desired_tau_ext, rel=1e-6)
+
+    control.power(False)
+    assert control.external_torque == (0.0,) * 6
+    assert control.end_wrench == (0.0,) * 6

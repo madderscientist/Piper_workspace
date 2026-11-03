@@ -1,9 +1,10 @@
-"""Static compensation for an upright PiPER-X with a configured end effector.
+"""Kinematics, gravity/inertia models, and 6-axis wrench estimation for an upright PiPER-X.
 
 Inertial parameters from agilexrobotics/agx_arm_urdf at
 680fa925cd00db7e2628563d2edc5540963045de (piper_x_description.urdf and
 piper_x_with_gripper_description.xacro). Finger moments cancel by symmetry.
-No payload, friction, Coriolis or acceleration compensation is assumed.
+Provides fast scalar forward kinematics, static gravity torques, pose-dependent
+joint inertias, critical damping bounds, geometric Jacobians, and damped wrench solvers.
 
 Model parameter license:
 MIT License
@@ -75,23 +76,36 @@ _LINK_INERTIAS = np.array([
     [[0.00171172, -9.89e-06, -1e-07], [-9.89e-06, 0.00017936, 2.42e-06], [-1e-07, 2.42e-06, 0.00172318]],
     [[0.00138626, -2.02e-06, -3e-08], [-2.02e-06, 0.00152112, 2.75e-06], [-3e-08, 2.75e-06, 0.00031152]],
 ])
+_TEACH_INERTIA = np.array([
+    [0.00126369, 1.041e-05, -8e-08],
+    [1.041e-05, 0.00104075, 8.975e-05],
+    [-8e-08, 8.975e-05, 0.00067711],
+])
+_GRIPPER_INERTIA = np.array([
+    [0.00099737, -2.4e-07, -2.5e-07],
+    [-2.4e-07, 0.00121497, -7.74e-06],
+    [-2.5e-07, -7.74e-06, 0.00041479],
+])
 _EFFECTOR_INERTIAS = {
-    'teaching_handle': np.array([
-        [0.00126369, 1.041e-05, -8e-08],
-        [1.041e-05, 0.00104075, 8.975e-05],
-        [-8e-08, 8.975e-05, 0.00067711],
-    ]),
-    'gripper': np.array([
-        [0.00099737, -2.4e-07, -2.5e-07],
-        [-2.4e-07, 0.00121497, -7.74e-06],
-        [-2.5e-07, -7.74e-06, 0.00041479],
-    ]),
+    'teaching_handle': _TEACH_INERTIA,
+    'piper_description_with_teach.urdf': _TEACH_INERTIA,
+    'gripper': _GRIPPER_INERTIA,
+    'piper_description.urdf': _GRIPPER_INERTIA,
 }
 _MAX_INERTIA = {
     'teaching_handle': (0.712418, 0.722116, 0.169451, 0.015078, 0.014926, 0.001023),
     'piper_description_with_teach.urdf': (0.712418, 0.722116, 0.169451, 0.015078, 0.014926, 0.001023),
     'gripper': (0.694602, 0.704391, 0.163588, 0.014434, 0.014274, 0.000726),
     'piper_description.urdf': (0.694602, 0.704391, 0.163588, 0.014434, 0.014274, 0.000726),
+}
+_XYZ_T = tuple(tuple(map(float, row)) for row in _XYZ)
+_ROT_T = tuple(tuple(tuple(map(float, row)) for row in mat) for mat in _ROTATIONS)
+_COM_T = tuple(tuple(map(float, row)) for row in _COM)
+_MASS_T = tuple(map(float, _MASS))
+_LINK_I_T = tuple(tuple(tuple(map(float, row)) for row in mat) for mat in _LINK_INERTIAS)
+_EFF_I_T = {
+    k: tuple(tuple(map(float, row)) for row in mat)
+    for k, mat in _EFFECTOR_INERTIAS.items()
 }
 
 
@@ -114,21 +128,57 @@ def max_critical_kd(
 
 
 def _kinematics(position: tuple[float, ...], effector_com=None):
-    rotation = np.eye(3)
-    translation = np.zeros(3)
-    origins, axes, centers = np.empty((6, 3)), np.empty((6, 3)), np.empty((7, 3))
-    for index, q in enumerate(position):
-        translation = translation + rotation @ _XYZ[index]
-        rotation = rotation @ _ROTATIONS[index]
-        origins[index] = translation
-        axes[index] = rotation[:, 2]
+    origins, axes, centers, _ = _fast_fk(position, effector_com)
+    return np.asarray(origins, dtype=float), np.asarray(axes, dtype=float), np.asarray(centers, dtype=float)
+
+
+def _fast_fk(position, effector_com=None):
+    r00, r01, r02 = 1.0, 0.0, 0.0
+    r10, r11, r12 = 0.0, 1.0, 0.0
+    r20, r21, r22 = 0.0, 0.0, 1.0
+    tx, ty, tz = 0.0, 0.0, 0.0
+    origins = []
+    axes = []
+    centers = []
+    rots = []
+    for i in range(6):
+        q = float(position[i])
+        ox, oy, oz = _XYZ_T[i]
+        tx += r00 * ox + r01 * oy + r02 * oz
+        ty += r10 * ox + r11 * oy + r12 * oz
+        tz += r20 * ox + r21 * oy + r22 * oz
+        m0, m1, m2 = _ROT_T[i]
+        n00 = r00 * m0[0] + r01 * m1[0] + r02 * m2[0]
+        n01 = r00 * m0[1] + r01 * m1[1] + r02 * m2[1]
+        n02 = r00 * m0[2] + r01 * m1[2] + r02 * m2[2]
+        n10 = r10 * m0[0] + r11 * m1[0] + r12 * m2[0]
+        n11 = r10 * m0[1] + r11 * m1[1] + r12 * m2[1]
+        n12 = r10 * m0[2] + r11 * m1[2] + r12 * m2[2]
+        n20 = r20 * m0[0] + r21 * m1[0] + r22 * m2[0]
+        n21 = r20 * m0[1] + r21 * m1[1] + r22 * m2[1]
+        n22 = r20 * m0[2] + r21 * m1[2] + r22 * m2[2]
+        origins.append((tx, ty, tz))
+        axes.append((n02, n12, n22))
         c, s = math.cos(q), math.sin(q)
-        r0 = rotation[:, 0].copy()
-        rotation[:, 0] = r0 * c + rotation[:, 1] * s
-        rotation[:, 1] = rotation[:, 1] * c - r0 * s
-        centers[index] = translation + rotation @ _COM[index]
-    centers[6] = translation + rotation @ (_COM[6] if effector_com is None else effector_com)
-    return origins, axes, centers
+        r00, r01, r02 = n00 * c + n01 * s, n01 * c - n00 * s, n02
+        r10, r11, r12 = n10 * c + n11 * s, n11 * c - n10 * s, n12
+        r20, r21, r22 = n20 * c + n21 * s, n21 * c - n20 * s, n22
+        cx, cy, cz = _COM_T[i]
+        centers.append((
+            tx + r00 * cx + r01 * cy + r02 * cz,
+            ty + r10 * cx + r11 * cy + r12 * cz,
+            tz + r20 * cx + r21 * cy + r22 * cz,
+        ))
+        rots.append(((r00, r01, r02), (r10, r11, r12), (r20, r21, r22)))
+    ec = _COM_T[6] if effector_com is None else effector_com
+    cx, cy, cz = float(ec[0]), float(ec[1]), float(ec[2])
+    centers.append((
+        tx + r00 * cx + r01 * cy + r02 * cz,
+        ty + r10 * cx + r11 * cy + r12 * cz,
+        tz + r20 * cx + r21 * cy + r22 * cz,
+    ))
+    rots.append(rots[5])
+    return origins, axes, centers, rots
 
 
 def joint_inertias(
@@ -143,41 +193,32 @@ def joint_inertias(
     When `scales` is provided (e.g. from gravity calibration), each joint's effective inertia
     is scaled proportionally without altering the 3x3 inertia tensor's geometric shape.
     """
-    rotation = np.eye(3)
-    translation = np.zeros(3)
-    origins = np.empty((6, 3))
-    axes = np.empty((6, 3))
-    centers = np.empty((7, 3))
-    rotations = np.empty((7, 3, 3))
-    for index, q in enumerate(position[:6]):
-        translation = translation + rotation @ _XYZ[index]
-        rotation = rotation @ _ROTATIONS[index]
-        origins[index] = translation
-        axes[index] = rotation[:, 2]
-        c, s = math.cos(float(q)), math.sin(float(q))
-        r0 = rotation[:, 0].copy()
-        rotation[:, 0] = r0 * c + rotation[:, 1] * s
-        rotation[:, 1] = rotation[:, 1] * c - r0 * s
-        centers[index] = translation + rotation @ _COM[index]
-        rotations[index] = rotation
-    centers[6] = translation + rotation @ np.asarray(com_m, dtype=float)
-    rotations[6] = rotation
-
-    masses = np.append(_MASS[:6], mass_kg)
-    eff_inertia = _EFFECTOR_INERTIAS.get(end_effector, _EFFECTOR_INERTIAS['teaching_handle'])
-    local_tensors = [*_LINK_INERTIAS, eff_inertia]
-
+    origins, axes, centers, rots = _fast_fk(position[:6], com_m)
+    masses = (*_MASS_T[:6], float(mass_kg))
+    eff_t = _EFF_I_T.get(end_effector, _EFF_I_T['teaching_handle'])
+    tensors = (*_LINK_I_T, eff_t)
     out: list[float] = []
     for j in range(6):
-        z_j = axes[j]
-        o_j = origins[j]
+        zx, zy, zz = axes[j]
+        ox, oy, oz = origins[j]
         total_j = 0.0
         for k in range(j, 7):
-            r_jk = centers[k] - o_j
-            v_lin = np.cross(z_j, r_jk)
-            z_local = rotations[k].T @ z_j
-            rot_part = float(z_local @ local_tensors[k] @ z_local)
-            total_j += float(masses[k] * np.dot(v_lin, v_lin)) + rot_part
+            ckx, cky, ckz = centers[k]
+            rx, ry, rz = ckx - ox, cky - oy, ckz - oz
+            vx = zy * rz - zz * ry
+            vy = zz * rx - zx * rz
+            vz = zx * ry - zy * rx
+            rk0, rk1, rk2 = rots[k]
+            lx = rk0[0] * zx + rk1[0] * zy + rk2[0] * zz
+            ly = rk0[1] * zx + rk1[1] * zy + rk2[1] * zz
+            lz = rk0[2] * zx + rk1[2] * zy + rk2[2] * zz
+            t0, t1, t2 = tensors[k]
+            rot_part = (
+                lx * (t0[0] * lx + t0[1] * ly + t0[2] * lz)
+                + ly * (t1[0] * lx + t1[1] * ly + t1[2] * lz)
+                + lz * (t2[0] * lx + t2[1] * ly + t2[2] * lz)
+            )
+            total_j += masses[k] * (vx * vx + vy * vy + vz * vz) + rot_part
         out.append(float(scales[j] * total_j))
     return tuple(out)
 
@@ -187,13 +228,282 @@ def gravity_torques(
     com_m: tuple[float, ...] = tuple(_COM[6]),
 ) -> tuple[float, ...]:
     """Return joint-side Nm opposing gravity, not motor-side current/torque."""
-    origins, axes, centers = _kinematics(position, com_m)
-    masses = np.append(_MASS[:6], mass_kg)
-    arms = (
-        _DESCENDANT.T @ (masses[:, None] * centers)
-        - (_DESCENDANT.T @ masses)[:, None] * origins
+    origins, axes, centers, _ = _fast_fk(position[:6], com_m)
+    masses = (*_MASS_T[:6], float(mass_kg))
+    out = [0.0] * 6
+    acc_m = masses[6]
+    acc_mx = acc_m * centers[6][0]
+    acc_my = acc_m * centers[6][1]
+    for j in range(5, -1, -1):
+        mj = masses[j]
+        acc_m += mj
+        acc_mx += mj * centers[j][0]
+        acc_my += mj * centers[j][1]
+        arm_x = acc_mx - acc_m * origins[j][0]
+        arm_y = acc_my - acc_m * origins[j][1]
+        ax0, ax1, _ = axes[j]
+        out[j] = float(9.81 * (arm_y * ax0 - arm_x * ax1))
+    return tuple(out)
+
+
+def geometric_jacobian(
+    position: tuple[float, ...] | list[float],
+    tool_offset_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.0),
+    *,
+    frame: str = 'gripper',
+) -> np.ndarray:
+    """Return the 6x6 geometric Jacobian J(q) in 'gripper' local frame (+x left, +y up, +z forward) or 'base_link'."""
+    if len(position) < 6:
+        raise ValueError('Six joint positions are required')
+    if frame not in ('gripper', 'base_link'):
+        raise ValueError("frame must be 'gripper' or 'base_link'")
+    origins, axes, centers, rots = _fast_fk(position[:6], tool_offset_m)
+    ex, ey, ez = centers[6]
+    jacobian = np.empty((6, 6), dtype=float)
+    r0, r1, r2 = rots[5]
+    for i in range(6):
+        zx, zy, zz = axes[i]
+        ox, oy, oz = origins[i]
+        rx, ry, rz = ex - ox, ey - oy, ez - oz
+        vx = zy * rz - zz * ry
+        vy = zz * rx - zx * rz
+        vz = zx * ry - zy * rx
+        if frame == 'gripper':
+            # Gripper local frame: +x = -col0 (left), +y = -col1 (up), +z = +col2 (forward)
+            jacobian[0, i] = -(r0[0] * vx + r1[0] * vy + r2[0] * vz)
+            jacobian[1, i] = -(r0[1] * vx + r1[1] * vy + r2[1] * vz)
+            jacobian[2, i] = r0[2] * vx + r1[2] * vy + r2[2] * vz
+            jacobian[3, i] = -(r0[0] * zx + r1[0] * zy + r2[0] * zz)
+            jacobian[4, i] = -(r0[1] * zx + r1[1] * zy + r2[1] * zz)
+            jacobian[5, i] = r0[2] * zx + r1[2] * zy + r2[2] * zz
+        else:
+            jacobian[0, i] = vx
+            jacobian[1, i] = vy
+            jacobian[2, i] = vz
+            jacobian[3, i] = zx
+            jacobian[4, i] = zy
+            jacobian[5, i] = zz
+    return jacobian
+
+
+def estimate_joint_torques(
+    position: tuple[float, ...] | list[float],
+    velocity: tuple[float, ...] | list[float],
+    target_position: tuple[float, ...] | list[float],
+    target_velocity: tuple[float, ...] | list[float],
+    kp: tuple[float, ...] | list[float],
+    kd: tuple[float, ...] | list[float],
+    torque_cmd: tuple[float, ...] | list[float] = (0.0,) * 6,
+    acceleration: tuple[float, ...] | list[float] = (0.0,) * 6,
+    *,
+    end_effector: str = 'teaching_handle',
+    mass_kg: float = float(_MASS[6]),
+    com_m: tuple[float, ...] = tuple(_COM[6]),
+    gravity_model: 'ArmGravityModel | None' = None,
+) -> tuple[float, ...]:
+    """Estimate 6-joint load/external torques (Nm) from MIT impedance error minus inertial torque."""
+    for name, values in (
+        ('position', position),
+        ('velocity', velocity),
+        ('target_position', target_position),
+        ('target_velocity', target_velocity),
+        ('kp', kp),
+        ('kd', kd),
+        ('torque_cmd', torque_cmd),
+        ('acceleration', acceleration),
+    ):
+        if len(values) < 6:
+            raise ValueError(f'{name} requires six values')
+    inertias = (
+        joint_inertias(position[:6], end_effector=end_effector, mass_kg=mass_kg, com_m=com_m)
+        if gravity_model is None
+        else gravity_model.inertias(
+            position[:6], end_effector=end_effector, mass_kg=mass_kg, com_m=com_m,
+        )
     )
-    return tuple(map(float, -_GRAVITY[2] * (arms[:, 1] * axes[:, 0] - arms[:, 0] * axes[:, 1])))
+    return tuple(
+        float(
+            float(kp[i]) * (float(position[i]) - float(target_position[i]))
+            + float(kd[i]) * (float(velocity[i]) - float(target_velocity[i]))
+            - float(torque_cmd[i])
+            + inertias[i] * float(acceleration[i])
+        )
+        for i in range(6)
+    )
+
+
+def end_effector_wrench(
+    joint_torques: tuple[float, ...] | list[float],
+    position: tuple[float, ...] | list[float],
+    *,
+    gravity_model: 'ArmGravityModel | None' = None,
+    tool_offset_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.0),
+    damping: float = 1e-2,
+    frame: str = 'gripper',
+) -> tuple[float, ...]:
+    """Map 6-joint torques (Nm) to 6-axis end-effector wrench (fx, fy, fz, tx, ty, tz) in gripper or base_link frame.
+
+    Returns (fx, fy, fz, tx, ty, tz) where (fx, fy, fz) are forces in N and
+    (tx, ty, tz) are torques in Nm, solved via damped transpose pseudo-inverse:
+        F = (J * J^T + damping^2 * I)^(-1) * J * tau
+    """
+    if len(joint_torques) < 6 or len(position) < 6:
+        raise ValueError('Six joint torques and six joint positions are required')
+    if (
+        isinstance(damping, bool)
+        or not isinstance(damping, (int, float))
+        or not math.isfinite(damping)
+        or damping < 0.0
+    ):
+        raise ValueError('damping must be finite and non-negative')
+    if frame not in ('gripper', 'base_link'):
+        raise ValueError("frame must be 'gripper' or 'base_link'")
+    t0, t1, t2, t3, t4, t5 = (
+        float(joint_torques[0]), float(joint_torques[1]), float(joint_torques[2]),
+        float(joint_torques[3]), float(joint_torques[4]), float(joint_torques[5]),
+    )
+    if not (t0 or t1 or t2 or t3 or t4 or t5):
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if damping > 0.0:
+        q_eff = (
+            position[:6]
+            if gravity_model is None
+            else tuple(float(position[i]) + gravity_model.joint(i + 1).angle_offset for i in range(6))
+        )
+        origins, axes, centers, rots = _fast_fk(q_eff, tool_offset_m)
+        return _solve_damped_wrench(
+            (t0, t1, t2, t3, t4, t5), origins, axes, centers[6], rots[5], float(damping), frame,
+        )
+    tau = np.asarray(joint_torques[:6], dtype=float)
+    j = (
+        geometric_jacobian(position[:6], tool_offset_m=tool_offset_m, frame=frame)
+        if gravity_model is None
+        else gravity_model.jacobian(position[:6], tool_offset_m=tool_offset_m, frame=frame)
+    )
+    wrench, *_ = np.linalg.lstsq(j.T, tau, rcond=None)
+    return tuple(float(v) for v in wrench)
+
+
+def _solve_damped_wrench(
+    tau: tuple[float, float, float, float, float, float],
+    origins: list[tuple[float, float, float]],
+    axes: list[tuple[float, float, float]],
+    tip: tuple[float, float, float],
+    rot5: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]],
+    damping: float,
+    frame: str,
+) -> tuple[float, ...]:
+    t0, t1, t2, t3, t4, t5 = tau
+    ex, ey, ez = tip
+    r0, r1, r2 = rot5
+    r00, r01, r02 = r0
+    r10, r11, r12 = r1
+    r20, r21, r22 = r2
+    j0 = [0.0] * 6
+    j1 = [0.0] * 6
+    j2 = [0.0] * 6
+    j3 = [0.0] * 6
+    j4 = [0.0] * 6
+    j5 = [0.0] * 6
+    use_gripper = frame == 'gripper'
+    for i in range(6):
+        zx, zy, zz = axes[i]
+        ox, oy, oz = origins[i]
+        rx, ry, rz = ex - ox, ey - oy, ez - oz
+        vx = zy * rz - zz * ry
+        vy = zz * rx - zx * rz
+        vz = zx * ry - zy * rx
+        if use_gripper:
+            j0[i] = -(r00 * vx + r10 * vy + r20 * vz)
+            j1[i] = -(r01 * vx + r11 * vy + r21 * vz)
+            j2[i] = r02 * vx + r12 * vy + r22 * vz
+            j3[i] = -(r00 * zx + r10 * zy + r20 * zz)
+            j4[i] = -(r01 * zx + r11 * zy + r21 * zz)
+            j5[i] = r02 * zx + r12 * zy + r22 * zz
+        else:
+            j0[i] = vx
+            j1[i] = vy
+            j2[i] = vz
+            j3[i] = zx
+            j4[i] = zy
+            j5[i] = zz
+    lam2 = damping * damping
+    fx, fy, fz = _solve_3x6_block((j0, j1, j2), tau, lam2)
+    tau_rem = (
+        t0 - (j0[0] * fx + j1[0] * fy + j2[0] * fz),
+        t1 - (j0[1] * fx + j1[1] * fy + j2[1] * fz),
+        t2 - (j0[2] * fx + j1[2] * fy + j2[2] * fz),
+        t3 - (j0[3] * fx + j1[3] * fy + j2[3] * fz),
+        t4 - (j0[4] * fx + j1[4] * fy + j2[4] * fz),
+        t5 - (j0[5] * fx + j1[5] * fy + j2[5] * fz),
+    )
+    mx, my, mz = _solve_3x6_block((j3, j4, j5), tau_rem, max(lam2, 1e-2))
+    return (fx, fy, fz, mx, my, mz)
+
+
+def _solve_3x6_block(
+    rows3: tuple[list[float], list[float], list[float]],
+    tau: tuple[float, float, float, float, float, float],
+    lam2: float,
+) -> tuple[float, float, float]:
+    r0, r1, r2 = rows3
+    t0, t1, t2, t3, t4, t5 = tau
+    a00 = r0[0]*r0[0] + r0[1]*r0[1] + r0[2]*r0[2] + r0[3]*r0[3] + r0[4]*r0[4] + r0[5]*r0[5] + lam2
+    a01 = r0[0]*r1[0] + r0[1]*r1[1] + r0[2]*r1[2] + r0[3]*r1[3] + r0[4]*r1[4] + r0[5]*r1[5]
+    a02 = r0[0]*r2[0] + r0[1]*r2[1] + r0[2]*r2[2] + r0[3]*r2[3] + r0[4]*r2[4] + r0[5]*r2[5]
+    a11 = r1[0]*r1[0] + r1[1]*r1[1] + r1[2]*r1[2] + r1[3]*r1[3] + r1[4]*r1[4] + r1[5]*r1[5] + lam2
+    a12 = r1[0]*r2[0] + r1[1]*r2[1] + r1[2]*r2[2] + r1[3]*r2[3] + r1[4]*r2[4] + r1[5]*r2[5]
+    a22 = r2[0]*r2[0] + r2[1]*r2[1] + r2[2]*r2[2] + r2[3]*r2[3] + r2[4]*r2[4] + r2[5]*r2[5] + lam2
+    b0 = r0[0]*t0 + r0[1]*t1 + r0[2]*t2 + r0[3]*t3 + r0[4]*t4 + r0[5]*t5
+    b1 = r1[0]*t0 + r1[1]*t1 + r1[2]*t2 + r1[3]*t3 + r1[4]*t4 + r1[5]*t5
+    b2 = r2[0]*t0 + r2[1]*t1 + r2[2]*t2 + r2[3]*t3 + r2[4]*t4 + r2[5]*t5
+    # 3x3 symmetric positive-definite elimination
+    inv0 = 1.0 / a00
+    f10 = a01 * inv0
+    f20 = a02 * inv0
+    m11 = a11 - f10 * a01
+    m12 = a12 - f10 * a02
+    rhs1 = b1 - f10 * b0
+    m22 = a22 - f20 * a02
+    rhs2 = b2 - f20 * b0
+    inv1 = 1.0 / m11
+    f21 = m12 * inv1
+    m22 -= f21 * m12
+    rhs2 -= f21 * rhs1
+    x2 = rhs2 / m22
+    x1 = (rhs1 - m12 * x2) * inv1
+    x0 = (b0 - a01 * x1 - a02 * x2) * inv0
+    return (float(x0), float(x1), float(x2))
+
+
+def estimate_end_wrench(
+    position: tuple[float, ...] | list[float],
+    velocity: tuple[float, ...] | list[float],
+    target_position: tuple[float, ...] | list[float],
+    target_velocity: tuple[float, ...] | list[float],
+    kp: tuple[float, ...] | list[float],
+    kd: tuple[float, ...] | list[float],
+    torque_cmd: tuple[float, ...] | list[float] = (0.0,) * 6,
+    acceleration: tuple[float, ...] | list[float] = (0.0,) * 6,
+    *,
+    end_effector: str = 'teaching_handle',
+    mass_kg: float = float(_MASS[6]),
+    com_m: tuple[float, ...] = tuple(_COM[6]),
+    gravity_model: 'ArmGravityModel | None' = None,
+    tool_offset_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.0),
+    damping: float = 1e-2,
+    frame: str = 'gripper',
+) -> tuple[float, ...]:
+    """Estimate 6-axis end-effector wrench (fx, fy, fz, tx, ty, tz) from MIT impedance state."""
+    tau_ext = estimate_joint_torques(
+        position, velocity, target_position, target_velocity,
+        kp, kd, torque_cmd, acceleration,
+        end_effector=end_effector, mass_kg=mass_kg, com_m=com_m, gravity_model=gravity_model,
+    )
+    return end_effector_wrench(
+        tau_ext, position,
+        gravity_model=gravity_model, tool_offset_m=tool_offset_m, damping=damping, frame=frame,
+    )
 
 
 @dataclass(frozen=True)
@@ -235,6 +545,9 @@ class JointGravityModel:
         )
 
 
+_DEFAULT_JOINT_GRAVITY = JointGravityModel()
+
+
 @dataclass(frozen=True)
 class ArmGravityModel:
     """Six-joint calibrated gravity model container for one PiPER-X arm."""
@@ -245,7 +558,7 @@ class ArmGravityModel:
     def joint(self, index: int) -> JointGravityModel:
         if not 1 <= index <= 6:
             raise ValueError(f'Joint index must be in 1..6, got {index}')
-        return self.joints.get(index, JointGravityModel())
+        return self.joints.get(index, _DEFAULT_JOINT_GRAVITY)
 
     def with_joint(self, index: int, model: JointGravityModel) -> 'ArmGravityModel':
         if not 1 <= index <= 6:
@@ -290,6 +603,22 @@ class ArmGravityModel:
         return joint_inertias(
             q_eff, end_effector=end_effector, mass_kg=mass_kg, com_m=com_m, scales=scales,
         )
+
+    def jacobian(
+        self,
+        position: tuple[float, ...] | list[float],
+        tool_offset_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.0),
+        *,
+        frame: str = 'gripper',
+    ) -> np.ndarray:
+        """Return 6x6 geometric Jacobian J(q) with calibrated joint angle offsets."""
+        if len(position) < 6:
+            raise ValueError('Six joint positions are required')
+        q_eff = tuple(
+            float(position[i]) + self.joint(i + 1).angle_offset
+            for i in range(6)
+        )
+        return geometric_jacobian(q_eff, tool_offset_m=tool_offset_m, frame=frame)
 
     def scaled_inertia_tensors(
         self,

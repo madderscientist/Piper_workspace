@@ -1,7 +1,9 @@
+import json
 import time
 from typing import Any
 from unittest.mock import patch
 
+from geometry_msgs.msg import WrenchStamped
 from piper_x_driver.node import DriverNode
 from piper_x_interfaces.msg import ArmStatus, JointCommand, MitCommand
 from piper_x_interfaces.srv import Enable, SetMode
@@ -9,6 +11,7 @@ import pytest
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from std_msgs.msg import String
 
 
 def spin_until(executor, predicate, timeout=4):
@@ -27,7 +30,13 @@ def test_driver_real_ros_services_commands_and_telemetry():
     executor.add_node(driver)
     executor.add_node(client)
     states = []
+    wrenches = []
+    ctrl_states = []
     subscription = client.create_subscription(ArmStatus, 'arm_status', states.append, 10)
+    wrench_sub = client.create_subscription(WrenchStamped, 'end_wrench_stamped', wrenches.append, 10)
+    ctrl_sub = client.create_subscription(
+        String, 'control_state', lambda msg: ctrl_states.append(json.loads(msg.data)), 10,
+    )
     power = client.create_client(Enable, 'enable_srv')
     mode = client.create_client(SetMode, 'set_mode')
     publisher = client.create_publisher(JointCommand, 'command/joints', 1)
@@ -46,10 +55,30 @@ def test_driver_real_ros_services_commands_and_telemetry():
             position=[0.1, 0.5, -0.5, 0.0, 0.0, 0.0], speed_percent=10))
         spin_until(executor, lambda: driver.arm.position[0] == 0.1)
         spin_until(executor, lambda: states and all(states[-1].motor_enabled))
+        spin_until(executor, lambda: bool(wrenches) and bool(ctrl_states))
         assert all(states[-1].motor_enable_valid)
         assert states[-1].gripper_enabled
+        assert wrenches[-1].header.frame_id == 'gripper'
+        assert len(ctrl_states[-1]['end_wrench']) == 6
+        assert len(ctrl_states[-1]['end_force']) == 3
+        assert len(ctrl_states[-1]['end_torque']) == 3
+        assert len(ctrl_states[-1]['external_torque']) == 6
+        assert len(ctrl_states[-1]['inertia_torque']) == 6
+        assert driver.rate_hz == 200.0
+        assert driver.telemetry_hz == 200.0
+        rates = ctrl_states[-1]['rates']
+        assert rates['target_hz'] == 200.0
+        assert rates['telemetry_target_hz'] == 200.0
+        for key in (
+            'can_rx_hz', 'loop_hz', 'comp_hz', 'cmd_tx_hz', 'mit_tx_hz',
+            'grip_tx_hz', 'ros_cmd_hz', 'joints_pub_hz', 'wrench_pub_hz',
+            'pose_pub_hz', 'status_pub_hz', 'control_pub_hz',
+        ):
+            assert key in rates
     finally:
         client.destroy_subscription(subscription)
+        client.destroy_subscription(wrench_sub)
+        client.destroy_subscription(ctrl_sub)
         executor.shutdown()
         driver.destroy_node()
         client.destroy_node()
@@ -73,7 +102,11 @@ def test_driver_has_only_can_backend_and_never_acts_on_startup(fake_arm):
         assert mit_cmd.kd == driver.control.debug_kd
         profile = driver.fleet.effectors[driver.arm_config.end_effector]
         pose = (0.0, 0.5, -0.5, 0.0, 0.0, 0.0)
-        expected_g = gravity_torques(pose, profile.mass_kg, profile.com_m)
+        expected_g = (
+            gravity_torques(pose, profile.mass_kg, profile.com_m)
+            if driver.control.gravity_model is None
+            else driver.control.gravity_model.torques(pose, profile.mass_kg, profile.com_m)
+        )
         assert mit_cmd.position == pytest.approx([
             q + g / kp for q, g, kp in zip(pose, expected_g, driver.control.debug_kp)
         ])

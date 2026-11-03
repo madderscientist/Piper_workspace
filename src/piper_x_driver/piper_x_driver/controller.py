@@ -1,5 +1,6 @@
 """Explicit command semantics, independent of ROS and CAN transport."""
 
+from collections import deque
 import math
 import secrets
 import time
@@ -10,7 +11,12 @@ from .backend import (
     feedback_problem, fresh, MAX_GRAVITY_OFFSET, MIT_KD_LSB, MIT_KP_LSB, MitTarget,
 )
 from .configuration import bounded
-from .gravity import gravity_torques, max_critical_kd
+from .gravity import (
+    end_effector_wrench,
+    gravity_torques,
+    joint_inertias,
+    max_critical_kd,
+)
 
 MIT_POSITION_LIMIT = 12.5
 LOWER = (-MIT_POSITION_LIMIT,) * 6
@@ -20,6 +26,33 @@ SLIDER_LOWER = tuple(map(math.radians, (-150, 0, -170, -89, -89, -170)))
 SLIDER_UPPER = tuple(map(math.radians, (150, 180, 0, 89, 89, 170)))
 MODES = ('standby', 'joint', 'point', 'linear', 'mit', 'drag', 'hold')
 DEBUG_TIMEOUT = 0.3
+
+
+class RateMeter:
+    """Sliding-window event frequency tracker (Hz) over a monotonic clock window."""
+
+    __slots__ = ('_stamps', '_window')
+
+    def __init__(self, window: float = 1.0):
+        self._stamps: deque[float] = deque(maxlen=1024)
+        self._window = float(window)
+
+    def mark(self, now: float) -> None:
+        self._stamps.append(float(now))
+
+    def hz(self, now: float) -> float:
+        stamps = self._stamps
+        cutoff = float(now) - self._window
+        while stamps and stamps[0] < cutoff:
+            stamps.popleft()
+        n = len(stamps)
+        if n < 2:
+            return 0.0
+        span = stamps[-1] - stamps[0]
+        return round((n - 1) / span, 1) if span > 1e-6 else 0.0
+
+    def clear(self) -> None:
+        self._stamps.clear()
 
 
 def vector(values, name, lower, upper):
@@ -60,10 +93,31 @@ class Controller:
         self.gravity = (0.0,) * 6
         self.friction = (0.0,) * 6
         self.output_torque = (0.0,) * 6
+        self.joint_acceleration = (0.0,) * 6
+        self.inertia_torque = (0.0,) * 6
+        self.external_torque = (0.0,) * 6
+        self.end_wrench = (0.0,) * 6
+        self._last_mit_command = None
+        self._prev_velocity = None
+        self._vel_updated = None
         self.gripper_friction = 0.0
         self._gripper_assist_active = False
         self._gripper_received = None
         self.hold_reason = ''
+        self._compute_wrench = True
+        self.comp_rate = RateMeter()
+        self.cmd_tx_rate = RateMeter()
+        self.mit_tx_rate = RateMeter()
+        self.grip_tx_rate = RateMeter()
+        self.ros_cmd_rate = RateMeter()
+
+    @property
+    def end_force(self) -> tuple[float, float, float]:
+        return self.end_wrench[:3]
+
+    @property
+    def end_torque(self) -> tuple[float, float, float]:
+        return self.end_wrench[3:6]
 
     def feedback(self, sample=None):
         if sample is None:
@@ -96,16 +150,61 @@ class Controller:
             self.arm.power(False, 0.0)
             self._clear_power_state()
 
+    def _reset_dynamics_state(self, *, clear_compensation=True):
+        self.joint_acceleration = self.inertia_torque = (0.0,) * 6
+        self.external_torque = self.end_wrench = (0.0,) * 6
+        self._prev_velocity = None
+        self._vel_updated = None
+        if clear_compensation:
+            self.gravity = self.friction = self.output_torque = (0.0,) * 6
+            self._last_mit_command = None
+            self.gripper_friction = 0.0
+            self._gripper_assist_active = False
+
     def _clear_power_state(self):
         self.mode = 'standby'
         self.mit_target = None
         self.mit_received = None
         self._gripper_received = None
         self.debug_session = ''
-        self.gravity = self.friction = self.output_torque = (0.0,) * 6
-        self.gripper_friction = 0.0
-        self._gripper_assist_active = False
+        self._reset_dynamics_state(clear_compensation=True)
         self.hold_reason = ''
+        self.comp_rate.clear()
+        self.cmd_tx_rate.clear()
+        self.mit_tx_rate.clear()
+        self.grip_tx_rate.clear()
+
+    def reconfigure(
+        self,
+        *,
+        effector=None,
+        gravity_scale=None,
+        gravity_model=None,
+        friction_scale=None,
+        friction_model=None,
+        update_models=False,
+    ):
+        if effector is not None or update_models:
+            self.effector = effector
+        if gravity_scale is not None:
+            self.gravity_scale = bounded(gravity_scale, 'gravity_scale', 0, 1)
+            if self.gravity_scale == 0.0:
+                self.gravity_scale_applied = 0.0
+        if friction_scale is not None:
+            self.friction_scale = bounded(friction_scale, 'friction_scale', 0, 1)
+            if self.friction_scale == 0.0:
+                self.friction_scale_applied = 0.0
+        if update_models:
+            self.gravity_model = gravity_model
+            self.friction_model = friction_model
+
+    def shutdown_to_drag(self) -> bool:
+        if self.mode != 'drag' and (self.mode == 'mit' or getattr(self.arm, '_powered', False)):
+            self.arm._enter_drag()
+            self._clear_power_state()
+            self.mode = 'drag'
+            return True
+        return False
 
     def start_mit(self):
         self.power(True)
@@ -117,6 +216,8 @@ class Controller:
         self.gravity_scale_applied = self.gravity_scale
         self.friction_scale_applied = self.friction_scale
         self.gravity_updated = self.clock()
+        self._prev_velocity = None
+        self._vel_updated = None
         self.mit_started = self.clock()
         self.mit_ready = (
             sample.status['ctrl_mode'] == 1 and sample.status['mode_feedback'] == 6
@@ -126,7 +227,7 @@ class Controller:
         self.mode = 'mit'
         self.hold_reason = ''
 
-    def set_mode(self, mode):
+    def set_mode(self, mode, *, preload_mit=False):
         if self.debug_session:
             raise ValueError('MIT debugger owns this arm; stop/disable it first')
         if mode not in MODES:
@@ -139,10 +240,19 @@ class Controller:
                 assert sample.status is not None
                 if sample.status['teach_status'] == 1:
                     self.arm.mode('hold')
+                if preload_mit and (
+                    self.mit_target is None
+                    or self.mit_received is None
+                    or self.clock() - self.mit_received > 0.2
+                ):
+                    self.mit(self._gravity_command(sample))
                 if (self.mit_target is None or self.mit_received is None
                         or self.clock() - self.mit_received > 0.2):
                     raise ValueError('Publish a fresh six-joint MIT target before entering MIT')
                 self.arm.mit(self.mit_target)
+                now_tx = self.clock()
+                self.mit_tx_rate.mark(now_tx)
+                self.cmd_tx_rate.mark(now_tx)
         self.arm.mode(mode)
         self.mode = mode
         self.hold_reason = ''
@@ -152,10 +262,9 @@ class Controller:
             self.gravity_scale_applied = self.gravity_scale
             self.friction_scale_applied = self.friction_scale
             self.gravity_updated = self.clock()
+            self._reset_dynamics_state(clear_compensation=False)
         else:
-            self.gravity = self.friction = self.output_torque = (0.0,) * 6
-            self.gripper_friction = 0.0
-            self._gripper_assist_active = False
+            self._reset_dynamics_state(clear_compensation=True)
 
     def require_mode(self, *modes):
         if self.mode not in modes:
@@ -181,16 +290,24 @@ class Controller:
                 tuple(base.torque) if base is not None else (0.0,) * 6,
             ))
             return
+        now = self.clock()
+        self.ros_cmd_rate.mark(now)
         self.require_mode('joint')
         self.arm.joints(command.position, command.speed_percent)
+        self.cmd_tx_rate.mark(now)
 
     def cartesian(self, command):
         if len(command.pose) != 6:
             raise ValueError('pose: six values required')
+        now = self.clock()
+        self.ros_cmd_rate.mark(now)
         self.require_mode('point', 'linear')
         self.arm.cartesian(command.pose, command.speed_percent, self.mode)
+        self.cmd_tx_rate.mark(now)
 
     def _resolve_kd(self, kp, kd=None):
+        if kd is not None and all(float(v) >= 0.0 for v in kd):
+            return tuple(float(v) for v in kd)
         eff = 'teaching_handle' if self.effector is None else getattr(self.effector, 'model', 'teaching_handle')
         auto = max_critical_kd(kp, eff, self.gravity_model)
         return auto if kd is None else tuple(a if float(v) < 0 else float(v) for v, a in zip(kd, auto))
@@ -211,22 +328,31 @@ class Controller:
                 tuple(getattr(command, 'gravity_offset', (0.0,) * 6)),
             )
         self.mit_target = command
-        self.mit_received = self.clock()
+        now = self.clock()
+        self.mit_received = now
+        self.ros_cmd_rate.mark(now)
 
     def debug_start(self):
         sample = self.healthy()
         assert sample.position is not None
-        if self.debug_session or self.mode not in ('standby', 'mit'):
+        now = self.clock()
+        active_debug = bool(self.debug_session and now - self.debug_received <= DEBUG_TIMEOUT)
+        if active_debug or self.mode not in ('standby', 'mit'):
             raise ValueError('Stop other controllers and select standby before MIT debugging')
-        if self.mit_received is not None and self.clock() - self.mit_received <= 0.2:
+        if self.mit_received is not None and now - self.mit_received <= 0.2:
             raise ValueError('Another MIT source is preloading targets')
         measured = sample.position[:6]
-        self.mit(MitTarget(measured, (0.0,) * 6, (0.0,) * 6,
-                           self.debug_kd, (0.0,) * 6))
-        self.set_mode('mit')
+        if not (self.mode == 'mit' and self.mit_ready):
+            self.mit(MitTarget(measured, (0.0,) * 6, (0.0,) * 6,
+                               self.debug_kd, (0.0,) * 6))
+            if self.ros_cmd_rate._stamps:
+                self.ros_cmd_rate._stamps.pop()
+            self.set_mode('mit')
         self.debug_session = secrets.token_urlsafe(24)
         self.debug_desired = self.debug_target = measured
-        self.debug_received = self.clock()
+        self.debug_received = now
+        if self.mode == 'mit' and self.mit_ready:
+            self._send_mit(self._debug_command(now), sample)
         return self.debug_session
 
     def debug_update(self, session, position):
@@ -234,11 +360,16 @@ class Controller:
             raise ValueError('MIT debugging session expired or belongs to another page')
         if len(position) != 6:
             raise ValueError('MIT position requires six values')
-        self.debug_desired = tuple(position)
-        self.debug_received = self.clock()
+        self.debug_desired = self.debug_target = tuple(position)
+        now = self.clock()
+        self.debug_received = now
+        self.ros_cmd_rate.mark(now)
 
     def debug_stop(self, session):
-        if not self.debug_session or not secrets.compare_digest(session, self.debug_session):
+        expired = bool(self.debug_session and self.clock() - self.debug_received > DEBUG_TIMEOUT)
+        if not self.debug_session or (
+            not expired and not secrets.compare_digest(session, self.debug_session)
+        ):
             raise ValueError('MIT debugging session expired; disable remains available')
         self.debug_session = ''
         self.debug_desired = self.debug_target = ()
@@ -257,6 +388,110 @@ class Controller:
         return MitTarget(
             sample.position[:6], (0.0,) * 6,
             self.debug_kp, self.debug_kd, (0.0,) * 6,
+        )
+
+    def _update_acceleration(self, sample, command, now: float) -> tuple[float, ...]:
+        has_measured_velocity = len(sample.velocity) >= 6
+        velocity = (
+            sample.velocity[:6]
+            if has_measured_velocity
+            else tuple(command.velocity)
+        )
+        raw_accel = getattr(sample, 'acceleration', ())
+        if len(raw_accel) >= 6:
+            accel = tuple(float(a) for a in raw_accel[:6])
+        elif has_measured_velocity:
+            vel_now = tuple(float(v) for v in sample.velocity[:6])
+            if self._prev_velocity is None or self._vel_updated is None:
+                accel = (0.0,) * 6
+                self._prev_velocity = vel_now
+                self._vel_updated = now
+            else:
+                dt_vel = now - self._vel_updated
+                if 0.0 <= dt_vel < 0.0015 or (
+                    vel_now == self._prev_velocity and 0.0 <= dt_vel < 0.0045
+                ):
+                    accel = self.joint_acceleration
+                elif 0.0015 <= dt_vel <= 0.2:
+                    alpha = dt_vel / (0.04 + dt_vel)
+                    accel = tuple(
+                        (1.0 - alpha) * a_prev + alpha * ((v - v_prev) / dt_vel)
+                        for a_prev, v, v_prev in zip(
+                            self.joint_acceleration, vel_now, self._prev_velocity,
+                        )
+                    )
+                    self._prev_velocity = vel_now
+                    self._vel_updated = now
+                else:
+                    accel = (0.0,) * 6
+                    self._prev_velocity = vel_now
+                    self._vel_updated = now
+        else:
+            accel = (0.0,) * 6
+            self._prev_velocity = None
+            self._vel_updated = None
+        self.joint_acceleration = accel
+        return velocity
+
+    def _update_wrench_estimate(
+        self,
+        command,
+        sample,
+        resolved_kd=None,
+        *,
+        velocity=None,
+        raw_gravity=None,
+        gravity=None,
+        raw_friction=None,
+        friction=None,
+    ):
+        assert sample.position is not None
+        if velocity is None:
+            velocity = (
+                sample.velocity[:6]
+                if len(sample.velocity) >= 6
+                else tuple(command.velocity)
+            )
+        if resolved_kd is None:
+            resolved_kd = self._resolve_kd(command.kp, command.kd)
+        real_sdk = getattr(self.arm, '_real_sdk', lambda: False)()
+        ext_torques = []
+        for idx, (q_des, q_meas, dq_des, dq_meas, kp, kd, t_cmd, t_iner) in enumerate(zip(
+            command.position,
+            sample.position[:6],
+            command.velocity,
+            velocity,
+            command.kp,
+            resolved_kd,
+            command.torque,
+            self.inertia_torque,
+        )):
+            raw_uint = round(kp / MIT_KP_LSB[idx]) if kp > 0.0 else 0
+            if raw_uint <= 0:
+                kp_eff = 0.0
+            elif real_sdk:
+                kp_eff = min(4095, raw_uint) * MIT_KP_LSB[idx]
+            else:
+                kp_eff = kp
+            uncomp_gravity = (
+                0.0 if raw_gravity is None or gravity is None else (raw_gravity[idx] - gravity[idx])
+            )
+            uncomp_friction = (
+                0.0 if raw_friction is None or friction is None else (raw_friction[idx] - friction[idx])
+            )
+            ext_torques.append(float(
+                kp_eff * (q_meas - q_des)
+                + kd * (dq_meas - dq_des)
+                - t_cmd
+                + t_iner
+                + uncomp_gravity
+                + uncomp_friction
+            ))
+        self.external_torque = tuple(ext_torques)
+        self.end_wrench = end_effector_wrench(
+            self.external_torque,
+            sample.position[:6],
+            gravity_model=self.gravity_model,
         )
 
     def _send_mit(self, command, sample):
@@ -299,17 +534,26 @@ class Controller:
         )
         gravity = tuple(self.gravity_scale_applied * value for value in raw_gravity)
         # 2. 计算当前位置与速度下的六轴摩擦力补偿力矩 f = friction_scale_applied * f_model(q, dq) (Nm)
-        velocity = (
-            sample.velocity[:6]
-            if len(sample.velocity) >= 6
-            else tuple(command.velocity)
+        compute_wrench = self._compute_wrench
+        if compute_wrench:
+            velocity = self._update_acceleration(sample, command, now)
+        else:
+            velocity = (
+                sample.velocity[:6]
+                if len(sample.velocity) >= 6
+                else tuple(command.velocity)
+            )
+        raw_friction = (
+            (0.0,) * 6
+            if self.friction_model is None
+            else tuple(self.friction_model.torques(sample.position[:6], velocity))
         )
         friction = (
             (0.0,) * 6
-            if self.friction_model is None or self.friction_scale_applied == 0.0
+            if self.friction_scale_applied == 0.0
             else tuple(
                 self.friction_scale_applied * value
-                for value in self.friction_model.torques(sample.position[:6], velocity)
+                for value in raw_friction
             )
         )
         # 3. 逐轴合成目标位置 (q + offset) 与前馈力矩 t_ff (t_cmd + residual + f)
@@ -338,9 +582,43 @@ class Controller:
             tuple(command.kp), tuple(resolved_kd), tuple(torques), tuple(offsets),
         )
         self.arm.mit(output)
+        self.comp_rate.mark(now)
+        self.mit_tx_rate.mark(now)
+        self.cmd_tx_rate.mark(now)
+        self._last_mit_command = command
         self.gravity, self.friction, self.output_torque = (
             gravity, friction, tuple(torques),
         )
+        # 4. 计算六轴关节受载力矩（阻抗恢复力矩扣除惯性力矩）与末端六轴力螺旋 (fx, fy, fz, tx, ty, tz)
+        if compute_wrench:
+            if any(a != 0.0 for a in self.joint_acceleration):
+                eff_name = (
+                    'teaching_handle'
+                    if self.effector is None
+                    else getattr(self.effector, 'model', 'teaching_handle')
+                )
+                inertias = (
+                    joint_inertias(sample.position[:6], end_effector=eff_name, **model)
+                    if self.gravity_model is None
+                    else self.gravity_model.inertias(
+                        sample.position[:6], end_effector=eff_name, **model
+                    )
+                )
+                self.inertia_torque = tuple(
+                    float(j_val * a_val) for j_val, a_val in zip(inertias, self.joint_acceleration)
+                )
+            else:
+                self.inertia_torque = (0.0,) * 6
+            self._update_wrench_estimate(
+                command,
+                sample,
+                resolved_kd,
+                velocity=velocity,
+                raw_gravity=raw_gravity,
+                gravity=gravity,
+                raw_friction=raw_friction,
+                friction=friction,
+            )
         external_grip_active = (
             self._gripper_received is not None
             and 0.0 <= now - self._gripper_received <= 0.2
@@ -377,19 +655,22 @@ class Controller:
         if self._gripper_assist_active:
             try:
                 self.arm.grip(width, effort, interpolate=False)
+                self.grip_tx_rate.mark(self.clock())
                 return
             except TypeError:
                 pass
         self.arm.grip(width, effort)
+        self.grip_tx_rate.mark(self.clock())
 
     def gripper(self, command):
         sample = self.healthy(enabled=False)
         self._gripper_received = self.clock()
         self._apply_gripper(command.width, command.effort, sample)
 
-    def watchdog(self):
+    def watchdog(self, *, compute_wrench=True):
         """Return one feedback snapshot after enforcing the MIT watchdog."""
         if self.mode == 'mit':
+            sample = None
             try:
                 sample = self.healthy()
                 assert sample.status is not None and sample.position is not None
@@ -411,18 +692,47 @@ class Controller:
                             self.arm.mode('hold')
                             return sample
                         self.arm.mit(command)
+                        self.mit_tx_rate.mark(now)
+                        self.cmd_tx_rate.mark(now)
                         self.arm.mode('mit')
                         return sample
                     if self.mit_ready or now - self.mit_started > 0.2:
                         raise ValueError('Arm did not acknowledge or left external MIT mode')
                     return sample
                 self.mit_ready = True
-                self._send_mit(command, sample)
+                self._compute_wrench = bool(compute_wrench)
+                try:
+                    self._send_mit(command, sample)
+                finally:
+                    self._compute_wrench = True
                 self.hold_reason = ''
             except (ValueError, RuntimeError, CanError) as error:
                 self.hold_reason = str(error)
                 try:
                     self.arm.retain_mit()
+                    now_ret = self.clock()
+                    self.mit_tx_rate.mark(now_ret)
+                    self.cmd_tx_rate.mark(now_ret)
+                    if (
+                        compute_wrench
+                        and sample is not None
+                        and sample.position is not None
+                        and self._last_mit_command is not None
+                    ):
+                        self.inertia_torque = (0.0,) * 6
+                        model = {} if self.effector is None else {
+                            'mass_kg': self.effector.mass_kg, 'com_m': self.effector.com_m}
+                        raw_g = (
+                            gravity_torques(sample.position[:6], **model)
+                            if self.gravity_model is None
+                            else self.gravity_model.torques(sample.position[:6], **model)
+                        )
+                        self._update_wrench_estimate(
+                            self._last_mit_command,
+                            sample,
+                            raw_gravity=raw_g,
+                            gravity=self.gravity,
+                        )
                 except (ValueError, RuntimeError, CanError) as send_error:
                     raise ValueError(
                         f'{error}; last MIT output retained locally; retransmission failed: '
