@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PiPER-X · InsertAnything 插入策略控制台 (CAN4)</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-badge" id="can-badge">CAN4 · /arm_4</span>
+      <div>
+        <h1>InsertAnything 六自由度力控插入策略控制台</h1>
+        <p class="subtitle" id="model-subtitle">模型：insert/actor.onnx · 50 Hz 闭环 GRU 策略</p>
+      </div>
+    </div>
+    <div class="top-controls">
+      <span class="status-pill" id="conn-pill" data-state="offline">等待遥测</span>
+      <span class="status-pill" id="power-pill" data-state="unknown">使能未知</span>
+      <span class="status-pill" id="mode-pill" data-mode="idle">模式：待机</span>
+      <button type="button" class="btn btn-outline" id="btn-enable">使能机械臂</button>
+      <button type="button" class="btn btn-danger-outline" id="btn-disable">失能</button>
+    </div>
+  </header>
+
+  <div class="notice-bar" id="notice-bar">
+    <span class="notice-dot"></span>
+    <span id="notice-text">正在连接 ROS 2 节点…</span>
+  </div>
+
+  <main class="main-grid">
+    <!-- Left column: 3-Step Workflow -->
+    <section class="workflow-col">
+      <!-- Step 1: Gripper & Zero-force drag -->
+      <article class="card step-card" id="step-card-1">
+        <div class="card-header">
+          <span class="step-num">步骤 1</span>
+          <h2>夹爪开关与零力拖动示教</h2>
+          <span class="card-tag" id="gripper-state-badge">夹爪：待机</span>
+        </div>
+        <p class="card-desc">
+          操作夹爪夹紧插头，并在零力拖动模式下用手将夹着插头的末端插入孔中。
+        </p>
+
+        <div class="gripper-switch-row">
+          <button type="button" class="btn btn-primary btn-lg" id="btn-grip-close">
+            🤏 闭合夹爪（夹紧插头）
+          </button>
+          <button type="button" class="btn btn-secondary btn-lg" id="btn-grip-open">
+            🖐 打开夹爪
+          </button>
+          <button type="button" class="btn btn-ghost" id="btn-grip-release">
+            🔓 释放（零力）
+          </button>
+        </div>
+
+        <div class="gripper-params-grid">
+          <div class="param-item">
+            <label for="input-grip-actual">当前实测开度</label>
+            <strong class="metric-inline" id="grip-actual-mm">— mm</strong>
+          </div>
+          <div class="param-item">
+            <label for="input-open-mm">打开开度 (mm)</label>
+            <input type="number" id="input-open-mm" min="0" max="100" step="1" value="50.0">
+          </div>
+          <div class="param-item">
+            <label for="input-close-mm">闭合开度 (mm)</label>
+            <input type="number" id="input-close-mm" min="0" max="100" step="0.5" value="0.0">
+          </div>
+          <div class="param-item">
+            <label for="input-grip-effort">夹持力度 (0..5)</label>
+            <input type="number" id="input-grip-effort" min="0.1" max="5.0" step="0.1" value="2.0">
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="action-row">
+          <button type="button" class="btn btn-accent btn-lg full-width" id="btn-enter-drag">
+            🪶 进入零力拖动模式（MIT 重力+摩擦补偿，保持夹爪夹紧）
+          </button>
+        </div>
+      </article>
+
+      <!-- Step 2: Record Inserted Goal Pose -->
+      <article class="card step-card" id="step-card-2">
+        <div class="card-header">
+          <span class="step-num">步骤 2</span>
+          <h2>记录孔中目标位置</h2>
+          <span class="card-tag" id="goal-status-badge">未记录</span>
+        </div>
+        <p class="card-desc">
+          设置插头末端相对于默认力作用点的位置（默认 <code>z + 19.5 cm</code>），将插头插入孔中后点击记录基准位姿 <code>H</code>。
+        </p>
+
+        <div class="gripper-params-grid tip-offset-grid">
+          <div class="param-item">
+            <label for="input-tip-x-cm">作用点偏移 X (cm)</label>
+            <input type="number" id="input-tip-x-cm" step="0.1" value="0.0">
+          </div>
+          <div class="param-item">
+            <label for="input-tip-y-cm">作用点偏移 Y (cm)</label>
+            <input type="number" id="input-tip-y-cm" step="0.1" value="0.0">
+          </div>
+          <div class="param-item">
+            <label for="input-tip-z-cm">作用点偏移 Z (cm)</label>
+            <input type="number" id="input-tip-z-cm" step="0.1" value="19.5">
+          </div>
+          <div class="param-item param-action">
+            <button type="button" class="btn btn-secondary" id="btn-apply-tip-offset">更新作用点</button>
+          </div>
+        </div>
+
+        <div class="action-row">
+          <button type="button" class="btn btn-primary btn-lg" id="btn-record-goal">
+            📍 记录当前孔中位置
+          </button>
+          <button type="button" class="btn btn-ghost" id="btn-clear-goal">
+            清除记录
+          </button>
+        </div>
+
+        <div class="recorded-box" id="recorded-box">
+          <div class="recorded-grid">
+            <div>
+              <span>记录尖端位置 B 系 (mm)</span>
+              <strong id="goal-pos-mm">尚未记录</strong>
+            </div>
+            <div>
+              <span>记录尖端姿态 RPY (°)</span>
+              <strong id="goal-rpy-deg">—</strong>
+            </div>
+            <div class="span-2">
+              <span>记录六轴关节角 (°)</span>
+              <strong id="goal-joints-deg">—</strong>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <!-- Step 3: Lift Out & Execute Policy -->
+      <article class="card step-card" id="step-card-3">
+        <div class="card-header">
+          <span class="step-num">步骤 3</span>
+          <h2>移出孔外并执行插入策略</h2>
+          <span class="card-tag" id="policy-state-badge">策略：待机</span>
+        </div>
+        <p class="card-desc">
+          用手把拿着插头的末端从孔中拿起来（移出孔），然后点击“执行插入策略”启动 50 Hz 闭环力控插孔。
+        </p>
+
+        <div class="policy-btn-row">
+          <button type="button" class="btn btn-success btn-xl" id="btn-start-policy">
+            ▶ 执行插入策略 (Execute Policy)
+          </button>
+          <button type="button" class="btn btn-warning btn-lg" id="btn-stop-drag">
+            ⏹ 停止并切回零力拖动
+          </button>
+          <button type="button" class="btn btn-secondary" id="btn-stop-hold">
+            ⏸ 停止并保持位置
+          </button>
+          <button type="button" class="btn btn-ghost" id="btn-tare-wrench">
+            ⚖ 力觉清零
+          </button>
+        </div>
+
+        <div class="policy-metrics-grid">
+          <div class="metric-card">
+            <span>策略步数 / 用时</span>
+            <strong id="policy-steps-time">0 步 · 0.0 s</strong>
+          </div>
+          <div class="metric-card">
+            <span>策略频率 / 推理耗时</span>
+            <strong id="policy-rate-latency">0.0 Hz · — ms</strong>
+          </div>
+          <div class="metric-card">
+            <span>到位状态 (连续 5 步)</span>
+            <strong id="policy-reached">等待执行</strong>
+          </div>
+          <div class="metric-card">
+            <span>动作增量 Δp / Δr</span>
+            <strong id="policy-last-action">—</strong>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <!-- Right column: Live Hole-Frame Visualizer, Wrench & Joints -->
+    <section class="telemetry-col">
+      <!-- Hole frame relative pose & visual target -->
+      <article class="card">
+        <div class="card-header">
+          <h2>孔坐标系 H 实时相对位姿 (插头尖端 T → 孔目标 H)</h2>
+          <span class="card-tag" id="tip-pose-b-tag">B 系尖端：—</span>
+        </div>
+
+        <div class="hole-vis-layout">
+          <div class="bullseye-wrap">
+            <svg id="xy-bullseye" viewBox="-40 -40 80 80" aria-label="孔口 XY 对准靶心图">
+              <defs>
+                <radialGradient id="bullseye-bg" cx="50%" cy="50%" r="50%">
+                  <stop offset="0%" stop-color="#1e293b"/>
+                  <stop offset="100%" stop-color="#0b1120"/>
+                </radialGradient>
+              </defs>
+              <circle cx="0" cy="0" r="38" fill="url(#bullseye-bg)"></circle>
+              <circle cx="0" cy="0" r="35" class="ring-outer"></circle>
+              <circle cx="0" cy="0" r="20" class="ring-mid"></circle>
+              <circle cx="0" cy="0" r="5" class="ring-inner"></circle>
+              <line x1="-38" y1="0" x2="38" y2="0" class="axis-line"></line>
+              <line x1="0" y1="-38" x2="0" y2="38" class="axis-line"></line>
+              <line id="xy-tip-x" x1="0" y1="-38" x2="0" y2="38" class="tip-guide"></line>
+              <line id="xy-tip-y" x1="-38" y1="0" x2="38" y2="0" class="tip-guide"></line>
+              <circle id="xy-tip-dot" cx="0" cy="0" r="3.2" class="tip-dot"></circle>
+            </svg>
+            <div class="vis-caption">孔系 XY 平面偏差 (±35 mm)</div>
+          </div>
+
+          <div class="z-bar-wrap">
+            <div class="z-bar-track">
+              <div class="z-scale-label top">+40</div>
+              <div class="z-scale-label zero">0</div>
+              <div class="z-zero-line" title="记录孔内目标深度 Z=0"></div>
+              <div class="z-tip-marker" id="z-tip-marker"></div>
+            </div>
+            <div class="vis-caption">孔系 Z 高度</div>
+          </div>
+
+          <div class="hole-readouts">
+            <div class="readout-box">
+              <span>孔系 ΔX</span>
+              <strong id="rel-dx">— mm</strong>
+            </div>
+            <div class="readout-box">
+              <span>孔系 ΔY</span>
+              <strong id="rel-dy">— mm</strong>
+            </div>
+            <div class="readout-box highlight">
+              <span>孔系 ΔZ (拔出高度)</span>
+              <strong id="rel-dz">— mm</strong>
+            </div>
+            <div class="readout-box">
+              <span>横向偏差 |ΔXY|</span>
+              <strong id="rel-xy-norm">— mm</strong>
+            </div>
+            <div class="readout-box">
+              <span>空间总距离 |Δp|</span>
+              <strong id="rel-total-norm">— mm</strong>
+            </div>
+            <div class="readout-box">
+              <span>姿态角偏差 Δθ</span>
+              <strong id="rel-angle-err">— °</strong>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <!-- Tip Wrench & ONNX Observation -->
+      <article class="card">
+        <div class="card-header">
+          <h2 id="wrench-card-title">插头末端六维力旋量 (200Hz 等效 1kHz 滤波 τ=12.84ms)</h2>
+          <span class="card-tag" id="wrench-summary-tag">|F| — N · |M| — N·m</span>
+        </div>
+        <div class="wrench-grid">
+          <div class="wrench-item"><span>Fx (N)</span><strong id="w-fx">0.00</strong><div class="w-meter"><i id="wb-fx"></i></div></div>
+          <div class="wrench-item"><span>Fy (N)</span><strong id="w-fy">0.00</strong><div class="w-meter"><i id="wb-fy"></i></div></div>
+          <div class="wrench-item"><span>Fz (N)</span><strong id="w-fz">0.00</strong><div class="w-meter"><i id="wb-fz"></i></div></div>
+          <div class="wrench-item"><span>Mx (N·m)</span><strong id="w-mx">0.000</strong><div class="w-meter"><i id="wb-mx"></i></div></div>
+          <div class="wrench-item"><span>My (N·m)</span><strong id="w-my">0.000</strong><div class="w-meter"><i id="wb-my"></i></div></div>
+          <div class="wrench-item"><span>Mz (N·m)</span><strong id="w-mz">0.000</strong><div class="w-meter"><i id="wb-mz"></i></div></div>
+        </div>
+      </article>
+
+      <!-- Joint Telemetry & Controller Parameters -->
+      <article class="card">
+        <div class="card-header">
+          <h2>六轴实时状态与阻抗参数</h2>
+          <span class="card-tag" id="driver-rates-tag">驱动频率：—</span>
+        </div>
+        <table class="joint-table">
+          <thead>
+            <tr>
+              <th>关节</th>
+              <th>实测角 (°)</th>
+              <th>角速度 (rad/s)</th>
+              <th>力矩 (N·m)</th>
+              <th>策略目标 (°)</th>
+            </tr>
+          </thead>
+          <tbody id="joint-tbody">
+            <tr><td>J1</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J2</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J3</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J4</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J5</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J6</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+          </tbody>
+        </table>
+
+        <details class="params-details">
+          <summary>高级参数配置（MIT 阻抗刚度 kp 与事件日志）</summary>
+          <div class="adv-params-grid">
+            <div class="param-item">
+              <label for="input-kp-list">策略 MIT 刚度 kp (6 轴 Nm/rad)</label>
+              <input type="text" id="input-kp-list" value="45, 45, 45, 10, 6, 4">
+            </div>
+            <button type="button" class="btn btn-secondary" id="btn-save-params">应用参数</button>
+          </div>
+          <div class="log-list" id="log-list"></div>
+        </details>
+      </article>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
