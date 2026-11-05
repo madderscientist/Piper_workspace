@@ -1,0 +1,357 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generated from piper_description.urdf and paxini/gripper_with_wrench.xacro. -->
+<robot name="piper">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-0.00473641164191482 2.56829134630247E-05 0.041451518036016" rpy="0 0 0" />
+      <mass value="1.02" />
+      <inertia ixx="0.00267433" ixy="-0.00000073" ixz="-0.00017389" iyy="0.00282612" iyz="0.0000004" izz="0.00089624" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/base_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="link1">
+    <inertial>
+      <origin xyz="0.00032 -0.00041 -0.00348" rpy="0 0 0" />
+      <mass value="0.71" />
+      <inertia ixx="0.00050027" ixy="0.00000078" ixz="0.00000626" iyy="0.00040879" iyz="0.00000462" izz="0.00045802" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link1.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint1" type="revolute">
+    <origin xyz="0 0 0.123" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="link1" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.618" upper="2.618" effort="100" velocity="5" />
+  </joint>
+  <link name="link2">
+    <inertial>
+      <origin xyz="0.21852 -0.00861 0.00126" rpy="0 0 0" />
+      <mass value="1.16" />
+      <inertia ixx="0.00111915" ixy="0.00182916" ixz="0.00019233" iyy="0.06763251" iyz="0.00000767" izz="0.067559" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link2.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint2" type="revolute">
+    <origin xyz="0 0 0" rpy="1.5708 -0.1359 -3.1416" />
+    <!-- rpy="1.5708 -0.10095-0.03490659 -3.1416" /> -->
+    <parent link="link1" />
+    <child link="link2" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="3.14" effort="100" velocity="5" />
+  </joint>
+  <link name="link3">
+    <inertial>
+      <origin xyz="-0.01999 -0.14808 -0.00053" rpy="0 0 0" />
+      <mass value="0.5" />
+      <inertia ixx="0.01347608" ixy="0.00161034" ixz="0.00000066" iyy="0.00046377" iyz="0.00000162" izz="0.01363321" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link3.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link3.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint3" type="revolute">
+    <origin xyz="0.28503 0 0" rpy="0 0 -1.7939" />
+    <!-- rpy="0 0 -1.759-0.03490659" /> -->
+    <parent link="link2" />
+    <child link="link3" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.967" upper="0" effort="100" velocity="5" />
+  </joint>
+  <link name="link4">
+    <inertial>
+      <origin xyz="0.00013 -0.00076 -0.00394" rpy="0 0 0" />
+      <mass value="0.38" />
+      <inertia ixx="0.00017844" ixy="0.00000062" ixz="0.00000067" iyy="0.00018914" iyz="0.00000408" izz="0.00014613" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link4.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link4.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint4" type="revolute">
+    <origin xyz="-0.021984 -0.25075 0" rpy="1.5708 0 0" />
+    <parent link="link3" />
+    <child link="link4" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.745" upper="1.745" effort="100" velocity="5" />
+  </joint>
+  <link name="link5">
+    <inertial>
+      <origin xyz="0.00018 -0.06104 -0.00227" rpy="0 0 0" />
+      <mass value="0.383" />
+      <inertia ixx="0.00172318" ixy="0.00000259" ixz="0.00000010" iyy="0.00017936" iyz="0.00000990" izz="0.00171172" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link5.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link5.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint5" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5708 0 0" />
+    <parent link="link4" />
+    <child link="link5" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.22" upper="1.22" effort="100" velocity="5" />
+  </joint>
+  <link name="link6">
+    <inertial>
+      <origin xyz="-0.00003 0.00006 0.04618" rpy="0 0 0" />
+      <mass value="0.007" />
+      <inertia ixx="0.00152112" ixy="0.00000202" ixz="0.00000261" iyy="0.00138626" iyz="0.00000002" izz="0.00031152" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link6.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link6.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint6" type="revolute">
+    <origin xyz="8.8259E-05 -0.091 0" rpy="1.5708015214913711 -0.78539816339070201 -3.6732051033300534e-06" />
+    <parent link="link5" />
+    <child link="link6" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.0543261909900767" upper="3.0543261909900767" effort="100" velocity="3" />
+  </joint>
+  <link name="arm_sensor_flange">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0000311060413 0.000115557158 0.00410619173" />
+      <mass value="0.024668705402650353" />
+      <inertia ixx="9.29383215e-6" ixy="-1.82651329e-8" ixz="1.59341322e-9" iyy="9.23066586e-6" iyz="6.00893181e-9" izz="1.83017019e-5" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/px6d75_arm_flange.stl" />
+      </geometry>
+      <material name="arm_flange">
+        <color rgba="0.65 0.72 0.80 1" />
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/px6d75_arm_flange.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <!--The -90-degree mount turns the complete terminal 180 degrees while keeping the six arm holes aligned with link6.-->
+  <joint name="joint6_to_arm_sensor_flange" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 -1.5707963267948966" />
+    <parent link="link6" />
+    <child link="arm_sensor_flange" />
+  </joint>
+  <link name="wrench_sensor">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0.012" />
+      <mass value="0.18" />
+      <inertia ixx="7.192125e-5" ixy="0" ixz="0" iyy="7.192125e-5" iyz="0" izz="1.265625e-4" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/px6d75.stl" />
+      </geometry>
+      <material name="sensor_aluminium">
+        <color rgba="0.72 0.74 0.77 1" />
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/px6d75.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="arm_flange_to_sensor" type="fixed">
+    <parent link="arm_sensor_flange" />
+    <child link="wrench_sensor" />
+    <origin rpy="0 0 -0.7853981633974483" xyz="0 0 0.0075" />
+  </joint>
+  <link name="sensor_gripper_flange">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000144094 -0.000000826582 0.003733041" />
+      <mass value="0.0171253823" />
+      <inertia ixx="4.79551758e-6" ixy="-6.28818591e-11" ixz="-5.04436317e-9" iyy="4.83761356e-6" iyz="-1.09299192e-11" izz="9.39946651e-6" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/px6d75_gripper_flange.stl" />
+      </geometry>
+      <material name="printed_flange">
+        <color rgba="0.86 0.65 0.33 1" />
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/px6d75_gripper_flange.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="sensor_to_gripper_flange" type="fixed">
+    <parent link="wrench_sensor" />
+    <child link="sensor_gripper_flange" />
+    <origin rpy="0 0 1.5707963267948966" xyz="0 0 0.024" />
+  </joint>
+  <link name="gripper_base">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.000301397362 0.0000190203633 0.0240422141" />
+      <mass value="0.413710499490316" />
+      <inertia ixx="8.90907746e-4" ixy="6.96798539e-7" ixz="-8.98102461e-6" iyy="6.75476611e-4" iyz="-7.86054516e-7" izz="3.76732181e-4" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/gripper_base_without_flange.STL" />
+      </geometry>
+      <material name="gripper_aluminium">
+        <color rgba="0.792157 0.819608 0.933333 1" />
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/gripper_base_without_flange.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="flange_to_gripper_base" type="fixed">
+    <parent link="sensor_gripper_flange" />
+    <child link="gripper_base" />
+    <origin rpy="0 0 0" xyz="0 0 0.0088" />
+  </joint>
+  <link name="link7">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.00065123185041968 -0.0491929869131989 0.00972258769184025" />
+      <mass value="0.025" />
+      <inertia ixx="0.00007371" ixy="-0.00000113" ixz="0.00000021" iyy="0.00000781" iyz="-0.00001372" izz="0.0000747" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link7.STL" />
+      </geometry>
+      <material name="left_finger_aluminium">
+        <color rgba="0.792157 0.819608 0.933333 1" />
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link7.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint7" type="prismatic">
+    <parent link="gripper_base" />
+    <child link="link7" />
+    <origin rpy="1.5708 0 0" xyz="0 0 0.1253" />
+    <axis xyz="0 0 1" />
+    <limit effort="10" lower="0" upper="0.035" velocity="1" />
+  </joint>
+  <link name="link8">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000651231850419722 -0.0491929869131991 0.00972258769184024" />
+      <mass value="0.025" />
+      <inertia ixx="0.00007371" ixy="-0.00000113" ixz="0.00000021" iyy="0.00000781" iyz="-0.00001372" izz="0.0000747" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link8.STL" />
+      </geometry>
+      <material name="right_finger_aluminium">
+        <color rgba="0.792157 0.819608 0.933333 1" />
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://piper_description/meshes/link8.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint8" type="prismatic">
+    <parent link="gripper_base" />
+    <child link="link8" />
+    <origin rpy="1.5708 0 -3.1416" xyz="0 0 0.1253" />
+    <axis xyz="0 0 -1" />
+    <limit effort="10" lower="-0.035" upper="0" velocity="1" />
+  </joint>
+</robot>

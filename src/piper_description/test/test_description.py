@@ -26,7 +26,7 @@ from piper_description.model_state import model_joint_states
 
 
 SHARE = get_package_share_path('piper_description')
-MODELS = sorted((SHARE / 'urdf').glob('*'))
+MODELS = sorted(path for path in (SHARE / 'urdf').glob('*') if path.is_file())
 
 
 @pytest.mark.parametrize('entry,model,config,rate', [
@@ -91,6 +91,88 @@ def test_models_parse_and_resolve_all_resources(model):
         assert parameters.text and Path(parameters.text.strip()).is_file()
     assert 'piper_gazebo' not in text
     assert '/home/a/piper_ros' not in text
+
+
+def test_gripper_with_wrench_stacks_measured_parts_and_keeps_finger_alignment():
+    text = xacro.process_file(str(SHARE / 'urdf/paxini/gripper_with_wrench.xacro')).toxml()
+    robot = URDF.from_xml_string(text)
+    assert robot.get_root() == 'arm_sensor_flange'
+    assert set(robot.link_map) == {
+        'arm_sensor_flange', 'wrench_sensor', 'sensor_gripper_flange',
+        'gripper_base', 'link7', 'link8'}
+    arm_joint = robot.joint_map['arm_flange_to_sensor']
+    assert arm_joint.origin.xyz == [0, 0, 0.0075]
+    assert arm_joint.origin.rpy == pytest.approx([0, 0, -math.pi / 4])
+    assert robot.joint_map['sensor_to_gripper_flange'].origin.xyz == [0, 0, 0.024]
+    assert robot.joint_map['sensor_to_gripper_flange'].origin.rpy == pytest.approx(
+        [0, 0, math.pi / 2])
+    assert robot.joint_map['flange_to_gripper_base'].origin.xyz == [0, 0, 0.0088]
+    assert (robot.joint_map['sensor_to_gripper_flange'].origin.rpy[2]
+            + arm_joint.origin.rpy[2]) == pytest.approx(math.pi / 4)
+    mass = {link.name: link.inertial.mass for link in robot.links if link.inertial}
+    assert mass['arm_sensor_flange'] == pytest.approx(0.242 / 9.81)
+    assert mass['wrench_sensor'] == 0.18
+    assert mass['sensor_gripper_flange'] == pytest.approx(0.168 / 9.81)
+    assert mass['gripper_base'] == pytest.approx(0.45 - 0.356 / 9.81)
+    assert mass['link7'] == mass['link8'] == 0.025
+
+    previous = URDF.from_xml_string(
+        xacro.process_file(str(SHARE / 'urdf/piper_description.urdf')).toxml())
+    for name in ('joint7', 'joint8'):
+        joint = robot.joint_map[name]
+        old_joint = previous.joint_map[name]
+        assert joint.origin.xyz[2] == pytest.approx(old_joint.origin.xyz[2] - 0.0105)
+        assert joint.origin.rpy == old_joint.origin.rpy
+        assert joint.axis == old_joint.axis
+        assert joint.limit.lower == old_joint.limit.lower
+        assert joint.limit.upper == old_joint.limit.upper
+
+    expected_meshes = {
+        'px6d75_arm_flange.stl', 'px6d75.stl', 'px6d75_gripper_flange.stl',
+        'gripper_base_without_flange.STL', 'link7.STL', 'link8.STL',
+    }
+    meshes = ET.fromstring(text).findall('.//mesh')
+    assert {mesh.attrib['filename'] for mesh in meshes} == {
+        f'package://piper_description/meshes/{name}' for name in expected_meshes}
+
+
+def test_piper_with_wrench_attaches_complete_terminal_to_link6():
+    robot = URDF.from_xml_string(
+        xacro.process_file(str(SHARE / 'urdf/piper_description_with_wrench.urdf')).toxml())
+    arm = URDF.from_xml_string(
+        xacro.process_file(str(SHARE / 'urdf/piper_description.urdf')).toxml())
+    terminal = URDF.from_xml_string(
+        xacro.process_file(str(SHARE / 'urdf/paxini/gripper_with_wrench.xacro')).toxml())
+    assert robot.get_root() == 'base_link'
+    assert set(robot.link_map) == (
+        set(arm.link_map) - {'gripper_base', 'link7', 'link8'}) | set(terminal.link_map)
+    assert set(robot.joint_map) == (
+        (set(arm.joint_map) - {'joint6_to_gripper_base', 'joint7', 'joint8'})
+        | set(terminal.joint_map) | {'joint6_to_arm_sensor_flange'})
+    for index in range(1, 7):
+        name = f'joint{index}'
+        assert robot.joint_map[name].origin.xyz == arm.joint_map[name].origin.xyz
+        if index < 6:
+            assert robot.joint_map[name].origin.rpy == arm.joint_map[name].origin.rpy
+        assert robot.joint_map[name].limit.velocity == arm.joint_map[name].limit.velocity
+    joint6 = robot.joint_map['joint6']
+    reference_roll = arm.joint_map['joint6'].origin.rpy[0]
+    zero_offset = math.pi / 4
+    assert joint6.origin.rpy == pytest.approx([
+        math.atan2(math.sin(reference_roll) * math.cos(zero_offset), math.cos(reference_roll)),
+        -math.asin(math.sin(reference_roll) * math.sin(zero_offset)),
+        math.atan2(math.cos(reference_roll) * math.sin(zero_offset), math.cos(zero_offset)),
+    ], abs=1e-12)
+    assert joint6.axis == arm.joint_map['joint6'].axis
+    assert robot.joint_map['joint6'].limit.lower == pytest.approx(math.radians(-175))
+    assert robot.joint_map['joint6'].limit.upper == pytest.approx(math.radians(175))
+    mount = robot.joint_map['joint6_to_arm_sensor_flange']
+    assert mount.parent == 'link6'
+    assert mount.child == 'arm_sensor_flange'
+    assert mount.origin.xyz == [0, 0, 0]
+    assert mount.origin.rpy == pytest.approx([0, 0, -math.pi / 2])
+    assert robot.joint_map['joint7'].origin.xyz == terminal.joint_map['joint7'].origin.xyz
+    assert robot.joint_map['joint8'].origin.xyz == terminal.joint_map['joint8'].origin.xyz
 
 
 @pytest.mark.parametrize('model', sorted((SHARE / 'mujoco_model').glob('*.xml')),
