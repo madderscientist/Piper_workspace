@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Piper · 四臂配置与调试</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/mesh.js" defer></script>
+  <script src="/controls.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="page-header">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">P</span><h1>四臂配置与调试</h1><span class="version">PIPER / ROS 2 HUMBLE</span></div>
+      <div class="header-right">
+        <div class="teaching-bar" aria-label="四臂示教控制">
+          <span class="teaching-badge" id="teaching-phase">示教：未连接</span>
+          <select id="teaching-mode-select" aria-label="示教模式" title="在非活动阶段切换四臂示教模式">
+            <option value="master_slave">主从模式 (1→3, 2→4)</option>
+            <option value="bilateral">双向耦合 (1↔3, 2↔4)</option>
+          </select>
+          <button type="button" id="teaching-start-btn" class="teaching-btn">启动示教</button>
+          <button type="button" id="teaching-stop-btn" class="teaching-btn stop">停止示教</button>
+          <span class="teaching-feedback" id="teaching-feedback" role="status"></span>
+        </div>
+        <span class="operation-note">3D Mesh · 配置 · 遥测 · 全模式控制</span>
+        <time class="clock" id="clock">--:--:--</time>
+      </div>
+    </header>
+    <section class="overview" aria-label="监控概览">
+      <div class="metric" title="关节、状态与位姿三路反馈均有效"><span class="metric-label">遥测在线</span><div><strong id="online-count">0</strong><span class="metric-unit">/ 4</span></div></div>
+      <div class="metric" title="仅统计新鲜状态反馈"><span class="metric-label">异常 / 急停</span><strong id="fault-count">—</strong></div>
+      <div class="metric" title="四台机械臂合计关节反馈频率与单臂各层均值"><span class="metric-label">关节反馈总计 / 各层均值</span><div><strong id="total-rate">—</strong><span class="metric-unit">Hz</span><span class="metric-note" id="layer-rate-summary">单臂 — Hz · 补偿 — Hz · 下发 — Hz</span></div></div>
+      <div class="metric transport"><span class="transport-dot" id="transport-dot"></span><strong id="transport-state">连接中</strong><span class="metric-note">轮询 12.5 Hz · 3D 60 FPS</span></div>
+    </section>
+    <div id="notice" class="notice" role="status">正在连接监控服务……</div>
+    <div class="workbench-heading" aria-hidden="true"><span>设备 / 状态</span><span>六轴关节反馈</span><span>末端六维力 / 关节受载</span><span>末端位姿 / 诊断</span></div>
+    <section id="arms" class="arm-list" aria-label="四台机械臂工作台"></section>
+    <footer class="page-footer"><span><span class="footer-dot"></span> 四臂实时只读遥测 · 点击“⤢ 展开控制 · 3D”进入全屏单臂工作台</span><span>数据超过 2 秒标记过期 · <a href="/api/status" target="_blank" rel="noopener">JSON API ↗</a></span></footer>
+  </main>
+
+  <dialog id="arm-studio" class="arm-studio" aria-label="单臂放大工作台与 3D 模型">
+    <header class="studio-header">
+      <div class="studio-tabs" id="studio-arm-tabs" role="tablist" aria-label="选择机械臂"></div>
+      <div class="studio-pills">
+        <span class="studio-pill" id="studio-conn-pill">等待遥测</span>
+        <span class="studio-pill" id="studio-power-pill">电机未知</span>
+        <span class="studio-pill" id="studio-mode-pill">模式 —</span>
+        <span class="studio-pill" id="studio-gripper-pill">开度 —</span>
+        <span class="studio-pill" id="studio-wrench-pill">末端 |F| — N · |M| — N·m</span>
+        <span class="studio-pill studio-rates-pill" id="studio-rates-pill">主环 — Hz · 补偿 — Hz · 下发 — Hz · 输入 — Hz</span>
+      </div>
+      <div class="studio-header-actions">
+        <button type="button" id="studio-power-btn" class="power-button">使能/失能</button>
+        <button type="button" id="studio-close-btn" class="studio-close">✕ 返回四臂总览</button>
+      </div>
+    </header>
+    <div class="studio-body">
+      <section class="studio-viewport" aria-label="3D STL Mesh 实时视图">
+        <div class="studio-canvas-wrap">
+          <canvas id="studio-mesh-canvas" width="640" height="520" aria-label="机械臂 3D STL 模型"></canvas>
+          <div class="studio-hud">
+            <div class="hud-title" id="studio-hud-title">机械臂 01</div>
+            <div class="hud-line" id="studio-hud-pose">法兰 XYZ / RPY：—</div>
+            <div class="hud-line" id="studio-hud-wrench">末端受载 F / M：—</div>
+            <div class="hud-line" id="studio-hud-effector">末端模型：—</div>
+          </div>
+          <div class="studio-cam-bar">
+            <button type="button" data-cam="iso">等轴测</button>
+            <button type="button" data-cam="front">正视</button>
+            <button type="button" data-cam="side">侧视</button>
+            <button type="button" data-cam="top">俯视</button>
+            <button type="button" id="studio-wireframe-btn">线框/实体</button>
+            <button type="button" id="studio-ghost-btn" class="active">目标虚影</button>
+          </div>
+        </div>
+        <div class="studio-viewport-wrench" aria-label="末端六维力实时监控">
+          <div class="studio-card-head">
+            <h3>末端夹爪局部六维力与力矩 (+X左 · +Y上 · +Z前)</h3>
+            <span id="studio-wrench-summary">合力 |F| = — N · 合力矩 |M| = — N·m · 夹爪力 —</span>
+          </div>
+          <div class="studio-wrench-grid" id="studio-wrench-cards"></div>
+        </div>
+      </section>
+      <section class="studio-controls" aria-label="单臂高级控制与诊断">
+        <div class="studio-mode-bar" id="studio-card-mode">
+          <div class="mode-grid" id="studio-mode-buttons">
+            <button type="button" data-mode="mit" title="MIT 阻抗与重力补偿模式">MIT 阻抗 (mit)</button>
+            <button type="button" data-mode="joint" title="关节空间规划模式 (MoveJ)">关节规划 (joint)</button>
+            <button type="button" data-mode="point" title="笛卡尔点到点规划模式 (MoveP)">笛卡尔点位 (point)</button>
+            <button type="button" data-mode="linear" title="笛卡尔直线规划模式 (MoveL)">笛卡尔直线 (linear)</button>
+            <button type="button" data-mode="drag" title="固件原生零力拖动模式">原生拖动 (drag)</button>
+            <button type="button" data-mode="hold" title="结束原生拖动记录并保持">拖动保持 (hold)</button>
+            <button type="button" data-mode="standby" title="固件待机状态">待机 (standby)</button>
+          </div>
+          <span id="studio-mode-detail">—</span>
+        </div>
+        <nav class="studio-tab-nav" role="tablist">
+          <button type="button" class="studio-tab-btn active" data-studio-tab="mit">MIT 阻抗控制 · 夹爪</button>
+          <button type="button" class="studio-tab-btn" data-studio-tab="motion">关节 MoveJ · 笛卡尔 MoveP/L</button>
+          <button type="button" class="studio-tab-btn" data-studio-tab="wrench">关节力矩拆解</button>
+          <button type="button" class="studio-tab-btn" data-studio-tab="diag">负载配置 · 标零 · 诊断</button>
+        </nav>
+        <p id="studio-action-status" class="studio-status" role="status">就绪</p>
+
+        <div class="studio-panel active" data-studio-panel="mit">
+          <div class="studio-card">
+            <div class="studio-card-head">
+              <h3>MIT 关节阻抗控制</h3>
+              <div class="studio-inline-actions">
+                <div class="mit-mode-switch" role="group" aria-label="MIT 控制模式切换">
+                  <button type="button" id="studio-mit-free-btn" class="mit-free-btn active" title="停止持续发送 MIT 目标，机械臂保持零重力自由浮动（可手掰）">🔓 自由移动 (零重力)</button>
+                  <button type="button" id="studio-mit-track-btn" class="mit-track-btn" title="锁定当前位置并持续发送下方滑条与表格的 MIT 目标">🔒 跟踪滑条 (锁定位置)</button>
+                </div>
+                <button type="button" id="studio-mit-sync-btn">同步实测角与默认增益</button>
+                <button type="button" id="studio-mit-zero-kp-btn">Kp 置零</button>
+                <button type="button" id="studio-mit-send-btn">单次发送</button>
+              </div>
+            </div>
+            <table class="studio-mit-table">
+              <thead><tr><th>轴</th><th>实测 (°)</th><th class="mit-target-col">目标角 (°)</th><th>速度 (rad/s)</th><th>Kp (Nm/rad)</th><th>Kd</th><th>额外力矩 (Nm)</th><th>重力补偿 (Nm)</th><th>受载外力矩 (Nm)</th></tr></thead>
+              <tbody id="studio-mit-tbody"></tbody>
+            </table>
+          </div>
+
+          <div class="studio-card" id="studio-card-gripper">
+            <div class="studio-card-head">
+              <h3>末端夹爪控制</h3>
+              <div class="studio-inline-actions">
+                <button type="button" data-grip-preset="0.08">全开 80mm</button>
+                <button type="button" data-grip-preset="0.04">半开 40mm</button>
+                <button type="button" data-grip-preset="0.0">闭合 0mm</button>
+                <button type="button" id="studio-grip-release-btn">零力释放</button>
+                <button type="button" id="studio-grip-send-btn" class="primary-btn">发送夹爪指令</button>
+              </div>
+            </div>
+            <div class="gripper-form">
+              <label>目标开度 (mm) <input type="range" id="studio-grip-width-range" min="0" max="100" step="0.5" value="20"><input type="number" id="studio-grip-width" min="0" max="100" step="0.5" value="20.0"></label>
+              <label>夹持力标度 (0~5) <input type="range" id="studio-grip-effort-range" min="0" max="5" step="0.1" value="1.0"><input type="number" id="studio-grip-effort" min="0" max="5" step="0.1" value="1.0"></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="studio-panel" data-studio-panel="motion">
+          <div class="studio-card" id="studio-card-joints">
+            <div class="studio-card-head">
+              <h3>六轴关节位置目标 (MoveJ · 适用 joint 模式)</h3>
+              <div class="studio-inline-actions">
+                <label class="speed-label">速度% <input type="number" id="studio-joint-speed" min="1" max="100" step="1" value="20"></label>
+                <button type="button" id="studio-joint-sync-btn">同步实测角</button>
+                <button type="button" id="studio-joint-send-btn" class="primary-btn">发送关节目标</button>
+              </div>
+            </div>
+            <div id="studio-joint-inputs" class="studio-joint-grid"></div>
+          </div>
+
+          <div class="studio-card" id="studio-card-cartesian">
+            <div class="studio-card-head">
+              <h3>笛卡尔末端位姿目标 (MoveP / MoveL · 适用 point / linear 模式)</h3>
+              <div class="studio-inline-actions">
+                <label class="speed-label">速度% <input type="number" id="studio-cart-speed" min="1" max="100" step="1" value="20"></label>
+                <button type="button" id="studio-cart-sync-btn">同步当前位姿</button>
+                <button type="button" id="studio-cart-send-btn" class="primary-btn">发送笛卡尔目标</button>
+              </div>
+            </div>
+            <div class="cartesian-grid" id="studio-cart-inputs">
+              <label><span>X (mm) <em data-cart-delta="0">Δ0.0</em></span><input type="number" data-cart="0" step="1" value="200"></label>
+              <label><span>Y (mm) <em data-cart-delta="1">Δ0.0</em></span><input type="number" data-cart="1" step="1" value="0"></label>
+              <label><span>Z (mm) <em data-cart-delta="2">Δ0.0</em></span><input type="number" data-cart="2" step="1" value="200"></label>
+              <label><span>Roll (°) <em data-cart-delta="3">Δ0.0°</em></span><input type="number" data-cart="3" step="0.5" value="0"></label>
+              <label><span>Pitch (°) <em data-cart-delta="4">Δ0.0°</em></span><input type="number" data-cart="4" step="0.5" value="0"></label>
+              <label><span>Yaw (°) <em data-cart-delta="5">Δ0.0°</em></span><input type="number" data-cart="5" step="0.5" value="0"></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="studio-panel" data-studio-panel="wrench">
+          <div class="studio-card">
+            <div class="studio-card-head">
+              <h3>六轴关节阻抗力矩拆解 (受载外力矩 = 阻抗力矩 - 惯性力矩)</h3>
+              <div class="studio-inline-actions">
+                <div class="mit-mode-switch" role="group" aria-label="MIT 测力锁定切换">
+                  <button type="button" class="mit-free-btn active">🔓 自由移动 (零重力)</button>
+                  <button type="button" class="mit-track-btn">🔒 跟踪滑条 (锁定位置)</button>
+                </div>
+              </div>
+            </div>
+            <table class="studio-diag-table">
+              <thead><tr><th>轴</th><th>实测 (°)</th><th>受载外力矩 (Nm)</th><th>惯性力矩 (Nm)</th><th>重力补偿 (Nm)</th><th>摩擦补偿 (Nm)</th><th>下发前馈 (Nm)</th></tr></thead>
+              <tbody id="studio-wrench-joint-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="studio-panel" data-studio-panel="diag">
+          <div class="studio-card">
+            <div class="studio-card-head"><h3>末端负载配置 · 重力补偿系数 · 闭合零位标定</h3><span id="studio-gravity-summary">—</span></div>
+            <div class="studio-config-row">
+              <label>末端类型 <select id="studio-effector-select"></select></label>
+              <button type="button" id="studio-save-effector-btn">保存末端</button>
+              <label class="studio-scale-label">重力补偿系数 <input type="range" id="studio-gravity-scale" min="0" max="1" step="0.01" value="1"><output id="studio-gravity-output">100%</output></label>
+            </div>
+            <div class="studio-cal-box">
+              <div class="studio-cal-row">
+                <label><input type="checkbox" id="studio-cal-confirm-check"> 确认末端无夹物且已物理完全闭合（写入 CAN 零点）</label>
+                <button type="button" id="studio-calibrate-btn" class="calibrate-effector" disabled>写入此臂闭合零位</button>
+              </div>
+              <span id="studio-cal-reason" class="control-help">等待状态检查…</span>
+            </div>
+          </div>
+          <div class="studio-card">
+            <div class="studio-card-head"><h3>逐轴电机状态、限位与通信诊断</h3><span id="studio-err-code">故障字：0x0000</span></div>
+            <table class="studio-diag-table">
+              <thead><tr><th>轴</th><th>使能状态</th><th>角度 (° / rad)</th><th>速度 (rad/s)</th><th>实测力矩 (Nm)</th><th>限位告警</th><th>通信状态</th></tr></thead>
+              <tbody id="studio-diag-tbody"></tbody>
+            </table>
+          </div>
+          <div class="studio-card">
+            <div class="studio-card-head"><h3>各层实时频率链路 (200Hz 驱动补偿/下发/遥测 ↔ 200Hz 示教 ← 50Hz 上层控制)</h3><span id="studio-target-rate">驱动 200 Hz · 示教 200 Hz · 上层 50 Hz</span></div>
+            <div class="can-age-grid layer-rate-cards" id="studio-layer-rates"></div>
+          </div>
+          <div class="studio-card">
+            <div class="studio-card-head"><h3>11 路 CAN 原始报文分段时效 (feedback_age)</h3><span>窗口 ≤ 1000 ms</span></div>
+            <div class="can-age-grid" id="studio-can-ages"></div>
+          </div>
+        </div>
+
+        <div class="studio-card studio-log-card">
+          <div class="studio-card-head"><h3>实时驱动与 ROS 节点日志 (/rosout & last_error)</h3><span id="studio-last-error-badge">无错误</span></div>
+          <div class="studio-log-list" id="studio-log-list" role="log" aria-live="polite"></div>
+        </div>
+      </section>
+    </div>
+  </dialog>
+
+  <template id="arm-template">
+    <article class="arm-row" data-connection="waiting">
+      <div class="arm-identity">
+        <header class="arm-header">
+          <div class="arm-heading"><span class="arm-index"></span><div><h2></h2><code class="namespace"></code></div></div>
+          <div class="arm-header-meta">
+            <span class="connection-badge"><span></span><b>等待遥测</b></span>
+            <button type="button" class="expand-arm-btn" title="展开全屏 3D STL 模型与全功能控制面板">⤢ 展开控制 · 3D</button>
+          </div>
+        </header>
+        <div class="status-strip"><div><span>状态</span><strong class="arm-state">—</strong></div><div><span>模式</span><strong class="control-mode">—</strong></div><div><span>到位</span><strong class="motion-state">—</strong></div><div><span>开度 <small>mm</small></span><strong class="gripper">—</strong></div></div>
+        <div class="enable-controls"><button class="power-button" data-action="disable" type="button" hidden disabled>失能此机械臂</button><div class="power-feedback"><strong class="power-state" data-state="unknown">电机状态未知</strong><span class="power-result" role="status">展开全屏面板可操作使能、模式与 MIT 控制</span></div></div>
+      </div>
+      <div class="joint-section"><div class="section-heading"><h3>关节反馈</h3><span class="joint-rate">等待 joint_states_feedback</span></div>
+        <table><thead><tr><th>关节</th><th>角度 <small>°</small></th><th>速度 <small>rad/s</small></th><th>力矩 <small>N·m</small></th><th class="trend-heading">角度趋势</th></tr></thead><tbody></tbody></table>
+      </div>
+      <section class="configuration-controls wrench-overview-col" aria-label="末端六维力与补偿力矩只读遥测">
+        <div class="section-heading"><h3>末端六维力与受载力矩</h3><span class="wrench-summary">|F| — N · |M| — N·m</span></div>
+        <div class="wrench-section">
+          <div class="wrench-values"></div>
+          <p class="outer-ext-torques">关节受载外力矩 Nm：—</p>
+          <p class="gravity-torques">非 MIT 模式：不计算、不输出软件重力补偿</p>
+          <p class="driver-error"></p>
+        </div>
+      </section>
+      <div class="arm-diagnostics">
+        <div class="pose-section"><div class="section-heading"><h3>末端位姿</h3><span class="pose-frame">—</span></div><div class="pose-values"></div></div>
+        <div class="alert-line"><span class="alert-icon" aria-hidden="true">○</span><span class="alert-text">等待状态反馈，尚无法判断故障</span><code class="error-code">—</code></div>
+        <div class="layer-rates-grid" aria-label="各层实时频率">
+          <div class="layer-rate-item" title="底层 CAN 关节反馈接收刷新频率"><span>CAN接收</span><strong class="rate-can-rx">—</strong></div>
+          <div class="layer-rate-item" title="joint_states_feedback 话题发布/接收频率"><span>关节反馈</span><strong class="rate-joints">—</strong></div>
+          <div class="layer-rate-item" title="驱动重力+摩擦补偿与末端六维力解算频率"><span>补偿解算</span><strong class="rate-comp">—</strong></div>
+          <div class="layer-rate-item" title="底层 CAN 运动命令 (MIT / J / P / L) 下发频率"><span>命令下发</span><strong class="rate-cmd-tx">—</strong></div>
+          <div class="layer-rate-item" title="上层 ROS 控制命令 (command/* 或 debug_mit) 输入频率"><span>上层输入</span><strong class="rate-ros-cmd">—</strong></div>
+        </div>
+        <details class="stream-details"><summary><span>话题与时效</span><span class="last-seen">尚未收到反馈</span></summary><div class="stream-list"></div><code class="enable-service"></code><p class="availability-note">按钮跟随六关节实际反馈；电机反馈超过 2 秒即失效。</p></details>
+      </div>
+    </article>
+  </template>
+</body>
+</html>
