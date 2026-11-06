@@ -45,6 +45,7 @@ from .identification import (
     CSV_COLUMNS,
     GravityIdentificationReport,
     ProbeSample,
+    identify_gripper_payload,
     identify_joint_gravity,
     parse_probe_samples_csv_reader,
     save_probe_samples_csv,
@@ -75,6 +76,7 @@ def synthesize_demo_probe_samples(
     num_points: int = 11,
     q_min: float | None = None,
     q_max: float | None = None,
+    arm_model: ArmGravityModel | None = None,
 ) -> list[ProbeSample]:
     """Generate realistic synthetic bidirectional quasi-static probe data for J1..J6."""
     default_lo, default_hi = DEFAULT_JOINT_RANGES.get(joint, (-0.5, 0.5))
@@ -105,6 +107,9 @@ def synthesize_demo_probe_samples(
                 q_shifted = list(base_pose)
                 q_shifted[joint - 1] = q_actual + true_offset
                 true_g = true_scale * gravity_torques(tuple(q_shifted))[joint - 1] + true_bias
+                if arm_model is not None and arm_model.effector_model:
+                    cad_g = arm_model.with_added_mass(0).torques(q_vec)[joint - 1]
+                    true_g = arm_model.with_added_mass(0.16).torques(q_vec)[joint - 1]
                 tau_eq = float(true_g + direction * true_fs + rng.normal(0.0, 0.006))
                 q_cmd = q_actual + tau_eq / max(1.0, kp_real)
                 samples.append(ProbeSample(
@@ -179,6 +184,11 @@ def serialize_gravity_report(
             'grid_points': int(n_grid),
             'theta_min': float(d.theta_grid[0]),
             'theta_max': float(d.theta_grid[-1]),
+        },
+        'payload': None if report.added_mass_kg is None else {
+            'added_mass_kg': report.added_mass_kg,
+            'total_mass_kg': report.total_effector_mass_kg,
+            'mass_identified': report.mass_identified,
         },
         'curves': {
             'theta_grid': [float(x) for x in d.theta_grid[idx]],
@@ -550,6 +560,21 @@ class GravityWorkbenchNode(Node):
             ))
             return True
 
+    def reload_saved_model(self, arm_id: str, output_yaml: str | Path) -> bool:
+        """Reapply the current driver configuration after its active model file is saved."""
+        with self.lock:
+            arm = self.fleet.arm(arm_id)
+            config = self.control_states.get(arm.namespace, {}).get('configuration', {})
+            active_path = config.get('gravity_config') or arm.gravity_config
+            if not active_path or Path(active_path).resolve() != Path(output_yaml).resolve():
+                return False
+            g_scale = float(config.get('gravity_scale', arm.gravity_scale))
+            f_scale = float(config.get('friction_scale', arm.friction_scale))
+            runner = self.runners[arm.namespace]
+            if runner.phase == 'restoring_compensation':
+                g_scale, f_scale = runner.saved_gravity_scale, runner.saved_friction_scale
+        return self.request_compensation_scales(arm.namespace, g_scale, f_scale)
+
     def _tick_probe(self) -> None:
         completed_jobs: list[tuple[list[ProbeSample], ProbeConfig, str, str, bool]] = []
 
@@ -804,15 +829,26 @@ class GravityWorkbenchNode(Node):
         output_yaml: str | Path | None = None,
         update_friction_yaml: str | Path | None = None,
     ) -> dict[str, Any]:
-        report = identify_joint_gravity(
-            samples,
-            torque_source=torque_source,
-            grid_step=grid_step,
-            trim_ratio=trim_ratio,
-        )
+        if not samples:
+            raise ValueError('No gravity probe samples provided')
+        joint = samples[0].joint
         with self.lock:
-            current_model = self.arm_models.get(arm_id, ArmGravityModel(arm_id=arm_id))
+            arm = self.fleet.arm(arm_id)
+            config = self.control_states.get(arm.namespace, {}).get('configuration', {})
+            model_name = config.get('effector', {}).get('model') or self.fleet.effectors[arm.end_effector].model
+            current_model = self.arm_models.get(arm_id, ArmGravityModel(arm_id=arm_id)).for_effector(model_name)
+            self.joint_samples.setdefault(arm_id, {})[joint] = list(samples)
+            all_samples = {j: list(rows) for j, rows in self.joint_samples[arm_id].items()}
+        if current_model.effector_model:
+            updated_model, reports = identify_gripper_payload(
+                all_samples, current_model, torque_source=torque_source,
+                grid_step=grid_step, trim_ratio=trim_ratio)
+        else:
+            report = identify_joint_gravity(
+                samples, torque_source=torque_source, grid_step=grid_step, trim_ratio=trim_ratio)
+            reports = {report.joint: report}
             updated_model = current_model.with_joint(report.joint, report.model)
+        with self.lock:
             self.arm_models[arm_id] = updated_model
             self.fleet.gravity_models[arm_id] = updated_model
             if output_yaml:
@@ -821,14 +857,17 @@ class GravityWorkbenchNode(Node):
                 _sync_static_friction_to_yaml(
                     Path(update_friction_yaml),
                     arm_id,
-                    {report.joint: report.model.static_friction},
+                    {j: report.model.static_friction for j, report in reports.items()},
                 )
-            payload = serialize_gravity_report(report, updated_model)
-            self.joint_fits.setdefault(arm_id, {})[report.joint] = payload
+            for j, report in reports.items():
+                self.joint_fits.setdefault(arm_id, {})[j] = serialize_gravity_report(report, updated_model)
+            payload = self.joint_fits[arm_id][joint]
             for j_payload in self.joint_fits[arm_id].values():
                 j_payload['yaml_text'] = payload['yaml_text']
             self.latest_fit = payload
-            return payload
+        if output_yaml:
+            self.reload_saved_model(arm_id, output_yaml)
+        return payload
 
     def run_fit_all_demo(
         self,
@@ -838,7 +877,7 @@ class GravityWorkbenchNode(Node):
     ) -> dict[str, Any]:
         last_payload: dict[str, Any] = {}
         for j in range(1, 7):
-            demo_samples = synthesize_demo_probe_samples(joint=j)
+            demo_samples = synthesize_demo_probe_samples(joint=j, arm_model=self.arm_models[arm_id])
             with self.lock:
                 self.joint_samples.setdefault(arm_id, {})[j] = demo_samples
                 self.samples = demo_samples
@@ -1067,7 +1106,8 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                     return
                 if source == 'demo':
                     joint = int(body.get('joint', 2))
-                    samples = synthesize_demo_probe_samples(joint=joint)
+                    samples = synthesize_demo_probe_samples(
+                        joint=joint, arm_model=self.node.arm_models.get(arm_id))
                     with self.node.lock:
                         self.node.samples = samples
                         self.node.joint_samples.setdefault(arm_id, {})[joint] = samples
@@ -1108,6 +1148,7 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                             arm_id,
                             {j: m.static_friction for j, m in model.joints.items()},
                         )
+                self.node.reload_saved_model(arm_id, out_path)
                 self._send_json(200, {'ok': True, 'path': str(saved)})
                 return
 
@@ -1116,8 +1157,10 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                 positions = [float(x) for x in body.get('position', [0.0] * 6)]
                 with self.node.lock:
                     model = self.node.arm_models.get(arm_id, ArmGravityModel(arm_id=arm_id))
-                cad = gravity_torques(tuple(positions))
-                cal = model.torques(positions)
+                    arm = self.node.fleet.arm(arm_id)
+                    effector = self.node.effector_kwargs[arm.namespace]
+                cad = gravity_torques(tuple(positions), **effector)
+                cal = model.torques(positions, **effector)
                 fs_vec = [model.joint(i).static_friction for i in range(1, 7)]
                 self._send_json(200, {
                     'ok': True,

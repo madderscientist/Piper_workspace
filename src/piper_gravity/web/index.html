@@ -54,7 +54,7 @@
         <div class="wf-num">④</div>
         <div class="wf-body">
           <strong>半和算重力 · 半差算静摩擦</strong>
-          <span>拟合 scale / angle_offset / bias 与静摩擦 Fs</span>
+          <span>辨识夹爪附加质量或关节重力参数，同时测量静摩擦 Fs</span>
         </div>
       </div>
       <span class="wf-arrow" aria-hidden="true">→</span>
@@ -217,6 +217,11 @@
           </header>
 
           <div class="kpi-grid">
+            <div class="kpi-card" id="payload-mass-card" hidden>
+              <span class="kpi-label">夹爪附加质量 / 末端总质量</span>
+              <strong class="kpi-val" id="kpi-payload-mass">-- / -- kg</strong>
+              <span>相机等附件按夹爪外形均匀分布</span>
+            </div>
             <div class="kpi-card">
               <span class="kpi-label">重力比例系数 scale</span>
               <strong class="kpi-val" id="kpi-scale">1.0000</strong>

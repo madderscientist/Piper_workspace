@@ -13,6 +13,7 @@ import yaml
 
 from .friction import ArmFrictionModel, load_friction_model
 from .gravity import ArmGravityModel, load_gravity_model, max_critical_kd
+from .terminal import terminal_body, terminal_profiles
 
 
 @dataclass(frozen=True)
@@ -62,11 +63,23 @@ class FleetConfig:
         self.path = Path(path).resolve(strict=True)
         with self.path.open(encoding='utf-8') as stream:
             data = yaml.safe_load(stream)
-        if not isinstance(data, dict) or set(data) != {'version', 'effectors', 'arms'}:
-            raise ValueError('Fleet configuration requires version, effectors and arms')
+        if (not isinstance(data, dict) or not {'version', 'arms'} <= set(data)
+                or set(data) - {'version', 'effectors', 'arms'}):
+            raise ValueError('Fleet configuration requires version and arms')
         if type(data['version']) is not int or data['version'] != 1:
             raise ValueError('Unsupported fleet configuration version')
-        profiles, arms = data['effectors'], data['arms']
+        self._inline_effectors = data.get('effectors')
+        profiles = self._inline_effectors
+        if profiles is None:
+            profiles = {}
+            for key, profile in terminal_profiles().items():
+                body = terminal_body(key)
+                profiles[key] = {
+                    'label': profile['label'], 'model': profile['model'],
+                    'source': profile['source'], 'mass_kg': body.mass_kg,
+                    'com_m': list(body.com_m),
+                }
+        arms = data['arms']
         if not isinstance(profiles, dict) or not profiles:
             raise ValueError('At least one effector profile is required')
         self.effectors: dict[str, Effector] = {}
@@ -79,6 +92,7 @@ class FleetConfig:
                     raise ValueError(f'Effector {name} must be a non-empty string')
             if profile['model'] not in (
                 'piper_description.urdf', 'piper_description_with_teach.urdf',
+                'piper_description_with_wrench.urdf',
                 'piper_no_gripper_description.urdf',
             ):
                 raise ValueError('Unsupported visualization model')
@@ -153,6 +167,10 @@ class FleetConfig:
                 except OSError as error:
                     raise ValueError(f'gravity_config file not found: {gravity_str}') from error
                 gravity_model = load_gravity_model(resolved_g_path)
+            candidate = (gravity_model or ArmGravityModel(arm_id=values['id'])).for_effector(
+                self.effectors[values['end_effector']].model)
+            if gravity_model is not None or candidate.effector_model:
+                gravity_model = candidate
             self.gravity_models[values['id']] = gravity_model
             auto_kd = max_critical_kd(debug_kp, str(values.get('end_effector', '')), gravity_model)
             raw_kd = _vector(values['debug_kd'], 'debug_kd', 6, -100.0, 100.0)
@@ -187,11 +205,22 @@ class FleetConfig:
         return self.gravity_models.get(arm_id)
 
     def public(self, arm: ArmConfig) -> dict:
-        return {
+        data = {
             **asdict(arm), 'config_file': str(self.path),
             'effector': asdict(self.effectors[arm.end_effector]),
             'effectors': {key: asdict(value) for key, value in self.effectors.items()},
         }
+        model = self.gravity_model(arm)
+        if model is not None and model.effector_model:
+            effector = self.effectors[arm.end_effector]
+            body = model.effector_body(effector.mass_kg, effector.com_m)
+            data['gravity_payload'] = {
+                'added_mass_kg': model.added_mass_kg,
+                'total_mass_kg': body.mass_kg,
+                'com_m': body.com_m,
+                'inertia_kg_m2': body.inertia.tolist(),
+            }
+        return data
 
     def save_arm(
         self,
@@ -216,7 +245,6 @@ class FleetConfig:
                 raise ValueError('Configuration changed externally; restart drivers before saving')
             data = {
                 'version': 1,
-                'effectors': {key: asdict(value) for key, value in latest.effectors.items()},
                 'arms': [
                     asdict(replace(
                         arm,
@@ -227,6 +255,8 @@ class FleetConfig:
                     for arm in latest.arms
                 ],
             }
+            if latest._inline_effectors is not None:
+                data['effectors'] = latest._inline_effectors
             temporary = None
             try:
                 with tempfile.NamedTemporaryFile(

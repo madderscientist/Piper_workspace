@@ -12,8 +12,26 @@
 2. **再基于校准后的重力模型运行 `piper_friction` 标定动摩擦与空间周期谐波**。
 
 ### 1.2 重力比例与 $3\times 3$ 惯性张量的等比例缩放
-- **等比例缩放不改变惯性张量几何形状**：在 [gravity.py](../piper_x_driver/piper_x_driver/gravity.py) 中内嵌了来自 `piper_description` URDF 的各连杆与末端执行器（`teaching_handle` / `gripper`）完整 $3\times 3$ 惯性张量 $\mathbf{I}_k$。标定出重力比例因子 $s_j$ 后，`ArmGravityModel.inertias(q)` 与 `scaled_inertia_tensors()` 按比例缩放转动惯量而不改变张量主轴方向与形状，供 `piper_friction` 扣除低加速度过渡段的惯性力矩 $J_j^{\text{cal}}\ddot{q}_j$。
+- **等比例缩放不改变惯性张量几何形状**：各连杆惯性张量保存在 [gravity.py](../piper_x_driver/piper_x_driver/gravity.py)，三种末端的质量属性统一保存在 [effectors.yaml](../piper_x_driver/config/effectors.yaml)，通过同一加载逻辑得到完整 $3\times 3$ 惯性张量 $\mathbf{I}_k$。标定出重力比例因子 $s_j$ 后，`ArmGravityModel.inertias(q)` 与 `scaled_inertia_tensors()` 按比例缩放转动惯量而不改变张量主轴方向与形状，供 `piper_friction` 扣除低加速度过渡段的惯性力矩 $J_j^{\text{cal}}\ddot{q}_j$。
 - **为什么仍需限制大加速度段**：电机转子反射惯量 $N_i^2 I_{\text{rotor}, i}$ 关于转轴对称，对静态重力无贡献，但占高速角加速惯量的显著比例；因此摩擦标定仅对小加速度过渡段做惯量修正与余弦降权，大加速度段直接硬截断剔除。
+
+### 1.3 带力传感器、法兰和相机的复合末端
+
+arm3、arm4 的 `gripper_with_wrench` 使用六个部件的 mesh 体积积分计算质心和完整惯性张量。每个部件内部按均匀密度处理，质量采用 URDF 中的已知值；通过安装变换和平行轴定理合成到驱动原 `link6` 坐标系。传感器、两片法兰、夹爪底座和两片手指的名义总质量为 **0.685505 kg**。
+
+该末端的重力辨识保留已有机械臂各轴 `scale / angle_offset / bias`，将相机等未建模附件统一辨识为一个全臂共享的 `added_mass_kg`，只加到 `gripper_base_without_flange.STL`，不改变传感器、法兰和手指的质量。每次拟合共同使用已采集的各轴双向半和数据；J1、关闭重力补偿的 J6 不提供质量信息，仍可测量静摩擦。保存的 `arm_X_gravity.yaml` 包含 `effector_model` 和 `added_mass_kg`，驱动据此更新总质量、总质心及惯量。
+
+附加质量的重力矩对质量呈线性关系：`g(q) = g_nominal(q) + added_mass_kg * g_gripper_per_kg(q)`。相机的等效质心与单位质量惯量采用夹爪底座 mesh；准静态重力数据只能辨识这里的等效质量，不能独立测出相机真实的惯性张量。CSV 必须包含实际采样姿态 `q1..q6`。Web 工作台会显示附加质量和末端总质量；写入驱动当前使用的标定文件后会请求驱动重新加载。
+
+更新统一配置中的 `gripper_with_wrench` mesh 质量属性，保留其余末端参数：
+
+```bash
+python3 -m piper_x_driver.mesh_inertia \
+  src/piper_description/urdf/piper_description_with_wrench.urdf \
+  --reference-urdf src/piper_description/urdf/piper_description.urdf \
+  --effector gripper_with_wrench \
+  --output src/piper_x_driver/config/effectors.yaml
+```
 
 ---
 
@@ -78,4 +96,8 @@ ros2 run piper_gravity fit \
 ros2 run piper_gravity evaluate \
   --model src/piper_gravity/config/arm_1_gravity.yaml \
   --position 0.0 0.9 -1.5 0.0 0.0 0.0
+
+# arm3 的复合末端：从 J2～J5 的数据共同拟合夹爪附加质量
+ros2 run piper_gravity fit /tmp/arm3_j*_gravity_probe.csv \
+  --arm-id arm_3 --output src/piper_gravity/config/arm_3_gravity.yaml
 ```

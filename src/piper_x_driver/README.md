@@ -23,7 +23,9 @@
 
 ## 1. 启动与配置
 
-配置文件默认位于 [config/arms.yaml](config/arms.yaml)，定义四臂的 CAN 端口、命名空间、末端负载模型（`teaching_handle` / `gripper`）、重力补偿系数 `gravity_scale`、摩擦参数文件路径 `friction_config` 以及默认 `debug_kp / debug_kd`。
+[config/arms.yaml](config/arms.yaml) 定义四臂的 CAN 端口、命名空间、末端选择、补偿系数、标定文件路径和默认 `debug_kp / debug_kd`。三种末端 `teaching_handle / gripper / gripper_with_wrench` 的模型、质量属性、来源及自动阻尼所需的最大关节惯量统一保存在 [config/effectors.yaml](config/effectors.yaml)，通过同一加载和合成逻辑得到总质量、质心与惯性张量。旧末端保留原 CAD 聚合参数，带传感器的末端保留各部件的均匀密度 mesh 参数；运行时保存机械臂配置不会把这些参数复制回 `arms.yaml`。旧版内嵌末端参数的配置仍可读取。
+
+arm3、arm4 默认使用 `gripper_with_wrench`，加载 `piper_description_with_wrench.urdf`，名义总质量为 0.685505 kg。各部件参数已变换到驱动原 `link6` 坐标系。重力标定文件中的 `added_mass_kg` 只增加夹爪底座的质量，用于等效表示未建模的相机等附件；驱动同时更新重力、惯量和自动阻尼计算，配置遥测中的 `gravity_payload` 提供应用后的总质量、质心和惯性张量。
 
 ```bash
 # 启动四臂驱动（启动后自动退出可能残留的原生 Leader 模式、使能六关节并进入 MIT 补偿模式）
@@ -81,7 +83,7 @@ $$
 
 ### 3.1 静态重力矩与标定模型计算 ([gravity.py](piper_x_driver/gravity.py))
 
-在每个控制周期，驱动根据当前六轴实测位置 $q_{1..6}$ 与当前配置的末端质量/质心（`teaching_handle` 示教手柄或 `gripper` 标准夹爪）计算静态重力支撑力矩。若在 [config/arms.yaml](config/arms.yaml) 中配置了 `gravity_config`（如 `src/piper_gravity/config/arm_1_gravity.yaml`），驱动通过 `ArmGravityModel.torques(q)` 应用各关节标定比例因子 $\text{scale}_i$ 与零位偏置 $\text{angle\_offset}_i$，并乘以平滑过渡的重力比例系数 $\alpha_g \in [0, 1]$（运行时修改 `gravity_scale` 按最大 $1.0\text{ s}^{-1}$ 斜率渐变）：
+在每个控制周期，驱动根据当前六轴实测位置 $q_{1..6}$ 与当前配置的末端质量/质心（示教手柄、标准夹爪或带 PX6D-75A 的夹爪）计算静态重力支撑力矩。若在 [config/arms.yaml](config/arms.yaml) 中配置了 `gravity_config`（如 `src/piper_gravity/config/arm_1_gravity.yaml`），驱动通过 `ArmGravityModel.torques(q)` 应用各关节标定比例因子 $\text{scale}_i$ 与零位偏置 $\text{angle\_offset}_i$，并乘以平滑过渡的重力比例系数 $\alpha_g \in [0, 1]$（运行时修改 `gravity_scale` 按最大 $1.0\text{ s}^{-1}$ 斜率渐变）：
 
 $$
 g_i(q) = \alpha_g \cdot \tau_{\text{grav}, i}^{\text{cal}}(q, \text{effector})
@@ -260,7 +262,7 @@ $$
 |---|---|---|---|
 | `enable_srv` | [`Enable`](../piper_x_interfaces/srv/Enable.srv) | `bool enable_request` | `enable_response=true` 表示在 `3.0 s` 内收到了请求之后的新鲜使能位确认（`true` 使能六关节并保持夹爪零力释放；`false` 七轴全失能，不要求先有正常反馈） |
 | `set_mode` | [`SetMode`](../piper_x_interfaces/srv/SetMode.srv) | `string mode` | 发送模式切换请求（不阻塞等待固件到位）：<br/>• `standby`：`0x151.ctrl_mode=0` 待机（不等于失能）<br/>• `joint`：`0x151` J 模式（期望 `ctrl_mode=1, mode_feedback=1`）<br/>• `point`：`0x151` P 模式（期望 `ctrl_mode=1, mode_feedback=0`）<br/>• `linear`：`0x151` L 模式（期望 `ctrl_mode=1, mode_feedback=2`）<br/>• `mit`：预装六轴 MIT 目标后发 `0x151` MIT（期望 `ctrl_mode=1, mode_feedback=6`；若无外部预装目标则自动以实测位置预装重力补偿目标）<br/>• `drag`：固件原生零力拖动（`0x470: 0xFA` + `0x191: mode=0`）<br/>• `hold`：结束原生拖动记录请求（`0x150.B2=2`） |
-| `configure_arm` | [`ConfigureArm`](../piper_x_interfaces/srv/ConfigureArm.srv) | `string end_effector`, `float64 gravity_scale`, `float64 friction_scale` | 原子保存并应用末端键（`teaching_handle` / `gripper`，切换末端需七轴失能且非 MIT/示教）、`gravity_scale`（`0..1`）与 `friction_scale`（`0..1` 持久化写盘；`-1.0` 保持原值；`< -1.0` 按 `-(2.0 + s)` 临时覆盖内存摩擦比例供标定使用而不写盘） |
+| `configure_arm` | [`ConfigureArm`](../piper_x_interfaces/srv/ConfigureArm.srv) | `string end_effector`, `float64 gravity_scale`, `float64 friction_scale` | 原子保存并应用末端键（`teaching_handle` / `gripper` / `gripper_with_wrench`，切换末端需七轴失能且非 MIT/示教）、`gravity_scale`（`0..1`）与 `friction_scale`（`0..1` 持久化写盘；`-1.0` 保持原值；`< -1.0` 按 `-(2.0 + s)` 临时覆盖内存摩擦比例供标定使用而不写盘） |
 | `debug_mit` | [`DebugMit`](../piper_x_interfaces/srv/DebugMit.srv) | `string action`, `string session`, `float64[6] position` | 调试台专用 MIT 会话：<br/>• `start`：以实测六轴角度初始化并返回新 `session`（旧会话超过 `0.3 s` 过期时允许直接接管）<br/>• `target`：携带同一 `session` 更新 6 轴目标角并刷新 `0.3 s` 心跳<br/>• `stop`：退出调试会话并保持在 MIT 重力补偿模式 |
 | `calibrate_effector` | [`CalibrateEffector`](../piper_x_interfaces/srv/CalibrateEffector.srv) | `bool confirm_closed` | 要求 `confirm_closed=true`、待机模式、七轴全失能且反馈新鲜；经 CAN `0x159` 写入夹爪零点，等待 `0x476` ACK（上限 `1.0 s`）并在 `0.5 s` 内校验新鲜零位回读（`0..0.1 mm`） |
 

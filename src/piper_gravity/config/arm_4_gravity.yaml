@@ -10,24 +10,26 @@ joints:
     scale: 1.092854
     angle_offset: 0.0
     bias: 0.0
-    static_friction: 0.748916
+    static_friction: 0.833905
   joint3:
     scale: 1.111329
     angle_offset: 0.0
     bias: 0.0
-    static_friction: 0.73336
+    static_friction: 0.861105
   joint4:
     scale: 1.025
     angle_offset: 0.0
     bias: 0.0
-    static_friction: 0.118564
+    static_friction: 0.166853
   joint5:
     scale: 1.0
     angle_offset: 0.0
     bias: 0.0
-    static_friction: 0.092926
+    static_friction: 0.118706
   joint6:
     scale: 0.0
     angle_offset: 0.0
     bias: 0.0
     static_friction: 0.090815
+effector_model: piper_description_with_wrench.urdf
+added_mass_kg: 0.16859652531490513

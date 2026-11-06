@@ -6,12 +6,14 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
+from piper_x_driver.configuration import default_config_path, FleetConfig
 from piper_x_driver.friction import load_friction_model, save_friction_model
 import rclpy
 
 from .collector import DEFAULT_PROBE_KP, ProbeCollectorNode, ProbeConfig
 from .identification import (
     GravityIdentificationReport,
+    identify_gripper_payload,
     identify_joint_gravity,
     load_probe_samples_csv,
     save_probe_samples_csv,
@@ -34,7 +36,26 @@ def format_report(report: GravityIdentificationReport) -> str:
         f'  Nominal CAD RMSE = {report.rmse_cad:.5f} Nm',
         f'  Calibrated RMSE  = {report.rmse_calibrated:.5f} Nm',
     ]
+    if report.added_mass_kg is not None:
+        lines += [
+            f'Added gripper mass = {report.added_mass_kg:.6f} kg',
+            f'Total terminal mass = {report.total_effector_mass_kg:.6f} kg',
+            'Extra mass uses the uniform gripper mesh; arm calibration and known parts are retained.',
+        ]
     return '\n'.join(lines)
+
+
+def _fit_for_arm(by_joint, arm_model, fleet, arm_id, **kwargs):
+    arm = fleet.arm(arm_id)
+    arm_model = arm_model.for_effector(fleet.effectors[arm.end_effector].model)
+    if arm_model.effector_model:
+        return identify_gripper_payload(by_joint, arm_model, **kwargs)
+    reports = {}
+    for joint, samples in sorted(by_joint.items()):
+        report = identify_joint_gravity(samples, **kwargs)
+        reports[joint] = report
+        arm_model = arm_model.with_joint(joint, report.model)
+    return arm_model, reports
 
 
 def _sync_static_friction_to_yaml(
@@ -61,6 +82,7 @@ def probe_main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument('--namespace', default='/arm_1', help='Target arm ROS namespace (default: /arm_1)')
     parser.add_argument('--arm-id', default='arm_1', help='Arm identifier for YAML output (default: arm_1)')
+    parser.add_argument('--config-file', type=Path, default=default_config_path())
     parser.add_argument('--joint', type=int, required=True, choices=range(1, 7), help='Joint index 1..6')
     parser.add_argument('--q-min', type=float, required=True, help='Probe minimum angle in rad')
     parser.add_argument('--q-max', type=float, required=True, help='Probe maximum angle in rad')
@@ -116,14 +138,16 @@ def probe_main(argv: Sequence[str] | None = None) -> int:
     print(f'Saved {len(node.samples)} samples to {args.output_csv}')
 
     if args.fit_output is not None:
-        report = identify_joint_gravity(node.samples)
-        print(format_report(report))
+        fleet = FleetConfig(args.config_file)
         arm_model = (
             load_gravity_model(args.fit_output)
             if args.fit_output.exists()
-            else ArmGravityModel(arm_id=args.arm_id)
+            else fleet.gravity_model(args.arm_id) or ArmGravityModel(arm_id=args.arm_id)
         )
-        arm_model = arm_model.with_joint(args.joint, report.model)
+        arm_model, reports = _fit_for_arm(
+            {args.joint: node.samples}, arm_model, fleet, args.arm_id)
+        report = reports[args.joint]
+        print(format_report(report))
         save_gravity_model(arm_model, args.fit_output)
         print(f'Updated gravity model saved to {args.fit_output}')
         if args.update_friction_yaml is not None:
@@ -142,6 +166,7 @@ def fit_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument('csv_files', nargs='+', type=Path, help='Input probe or sweep CSV file(s)')
     parser.add_argument('--output', '-o', type=Path, required=True, help='Output YAML gravity model path')
     parser.add_argument('--arm-id', default='arm_1', help='Arm identifier (default: arm_1)')
+    parser.add_argument('--config-file', type=Path, default=default_config_path())
     parser.add_argument(
         '--torque-source', choices=('auto', 'kp_error', 'motor_torque'), default='auto',
         help='Torque signal to use for decomposition (default: auto)',
@@ -159,22 +184,18 @@ def fit_main(argv: Sequence[str] | None = None) -> int:
         for sample in load_probe_samples_csv(csv_path):
             by_joint.setdefault(sample.joint, []).append(sample)
 
+    fleet = FleetConfig(args.config_file)
     arm_model = (
         load_gravity_model(args.output)
         if args.output.exists()
-        else ArmGravityModel(arm_id=args.arm_id)
+        else fleet.gravity_model(args.arm_id) or ArmGravityModel(arm_id=args.arm_id)
     )
-    fs_updates: dict[int, float] = {}
-
-    for joint_idx in sorted(by_joint):
-        report = identify_joint_gravity(
-            by_joint[joint_idx],
-            torque_source=args.torque_source,
-            trim_ratio=args.trim_ratio,
-            grid_step=args.grid_step,
-        )
+    arm_model, reports = _fit_for_arm(
+        by_joint, arm_model, fleet, args.arm_id,
+        torque_source=args.torque_source, trim_ratio=args.trim_ratio, grid_step=args.grid_step)
+    fs_updates = {}
+    for joint_idx, report in sorted(reports.items()):
         print(format_report(report))
-        arm_model = arm_model.with_joint(joint_idx, report.model)
         fs_updates[joint_idx] = report.model.static_friction
 
     save_gravity_model(arm_model, args.output)

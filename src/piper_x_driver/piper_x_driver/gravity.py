@@ -29,12 +29,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from pathlib import Path
 
 import numpy as np
 import yaml
+
+from .terminal import RigidBody, terminal_body, terminal_for_model, terminal_profiles
 
 
 def _euler_xyz_matrix(rpy: tuple[float, float, float]) -> np.ndarray:
@@ -59,12 +61,13 @@ _RPY = [
     (-1.5707963, 1.5707963, 0), (1.5707963, 0, 0),
 ]
 _ROTATIONS = np.array([_euler_xyz_matrix(r) for r in _RPY])
-_MASS = np.array([0.71, 1.16, 0.67, 0.39, 0.35, 0.01655408133, 0.54])
+_DEFAULT_TERMINAL = terminal_body('gripper')
+_MASS = np.array([0.71, 1.16, 0.67, 0.39, 0.35, 0.01655408133, _DEFAULT_TERMINAL.mass_kg])
 _COM = np.array([
     (0.00053, -0.00039, -0.00315), (0.21856, -0.00859, 0.00227),
     (0.2014, -0.00418, -0.00141), (0.059, -0.05831, 0.002),
     (0.00005, -0.01282, -0.00429), (0.00134940815, 0, -0.00344975303),
-    (0.00001822434565775221, -0.00009521502789096145, 0.03953134028382456),
+    _DEFAULT_TERMINAL.com_m,
 ])
 _DESCENDANT = np.arange(7)[:, None] >= np.arange(6)[None, :]
 _GRAVITY = np.array([0.0, 0.0, -9.81])
@@ -76,27 +79,15 @@ _LINK_INERTIAS = np.array([
     [[0.00171172, -9.89e-06, -1e-07], [-9.89e-06, 0.00017936, 2.42e-06], [-1e-07, 2.42e-06, 0.00172318]],
     [[0.00138626, -2.02e-06, -3e-08], [-2.02e-06, 0.00152112, 2.75e-06], [-3e-08, 2.75e-06, 0.00031152]],
 ])
-_TEACH_INERTIA = np.array([
-    [0.00126369, 1.041e-05, -8e-08],
-    [1.041e-05, 0.00104075, 8.975e-05],
-    [-8e-08, 8.975e-05, 0.00067711],
-])
-_GRIPPER_INERTIA = np.array([
-    [0.00099737, -2.4e-07, -2.5e-07],
-    [-2.4e-07, 0.00121497, -7.74e-06],
-    [-2.5e-07, -7.74e-06, 0.00041479],
-])
 _EFFECTOR_INERTIAS = {
-    'teaching_handle': _TEACH_INERTIA,
-    'piper_description_with_teach.urdf': _TEACH_INERTIA,
-    'gripper': _GRIPPER_INERTIA,
-    'piper_description.urdf': _GRIPPER_INERTIA,
+    alias: terminal_body(key).inertia
+    for key, profile in terminal_profiles().items()
+    for alias in (key, profile['model'])
 }
 _MAX_INERTIA = {
-    'teaching_handle': (0.712418, 0.722116, 0.169451, 0.015078, 0.014926, 0.001023),
-    'piper_description_with_teach.urdf': (0.712418, 0.722116, 0.169451, 0.015078, 0.014926, 0.001023),
-    'gripper': (0.694602, 0.704391, 0.163588, 0.014434, 0.014274, 0.000726),
-    'piper_description.urdf': (0.694602, 0.704391, 0.163588, 0.014434, 0.014274, 0.000726),
+    alias: terminal_for_model(key).max_joint_inertia_kg_m2
+    for key, profile in terminal_profiles().items()
+    for alias in (key, profile['model'])
 }
 _XYZ_T = tuple(tuple(map(float, row)) for row in _XYZ)
 _ROT_T = tuple(tuple(tuple(map(float, row)) for row in mat) for mat in _ROTATIONS)
@@ -115,12 +106,27 @@ def max_critical_kd(
     gravity_model: 'ArmGravityModel | None' = None,
 ) -> tuple[float, ...]:
     """Return maximum critical damping kd (Nm/(rad/s)) across all URDF poses for kp."""
+    if gravity_model is not None and gravity_model.effector_model:
+        end_effector = gravity_model.effector_model
     inertias = _MAX_INERTIA.get(end_effector, _MAX_INERTIA['teaching_handle'])
     scales = (
         (1.0,) * 6
         if gravity_model is None
         else tuple(gravity_model.joint(i).scale or 1.0 for i in range(1, 7))
     )
+    terminal = terminal_for_model(end_effector)
+    if (terminal is not None and terminal.payload_link is not None
+            and gravity_model is not None and gravity_model.added_mass_kg):
+        shape = terminal.components[terminal.payload_link]
+        unit = shape.inertia / shape.mass_kg
+        radius = float(np.linalg.norm(shape.com_m))
+        unit_max = float(np.linalg.eigvalsh(unit).max())
+        increment = [
+            (sum(float(np.linalg.norm(v)) for v in _XYZ[j + 1:]) + radius) ** 2 + unit_max
+            for j in range(6)
+        ]
+        increment[5] = unit[2, 2] + shape.com_m[0] ** 2 + shape.com_m[1] ** 2
+        inertias = tuple(v + gravity_model.added_mass_kg * d for v, d in zip(inertias, increment))
     return tuple(
         round(math.sqrt(2.0 * (scale * inertia) * max(0.0, float(k))), 2)
         for scale, inertia, k in zip(scales, inertias, kp)
@@ -184,18 +190,26 @@ def _fast_fk(position, effector_com=None):
 def joint_inertias(
     position: tuple[float, ...] | list[float],
     end_effector: str = 'teaching_handle',
-    mass_kg: float = float(_MASS[6]),
-    com_m: tuple[float, ...] = tuple(_COM[6]),
+    mass_kg: float | None = None,
+    com_m: tuple[float, ...] | None = None,
     scales: tuple[float, ...] = (1.0,) * 6,
+    inertia_tensor=None,
 ) -> tuple[float, ...]:
     """Return pose-dependent diagonal joint-space inertias J_j(q) (kg*m^2) from URDF 3x3 tensors.
 
     When `scales` is provided (e.g. from gravity calibration), each joint's effective inertia
     is scaled proportionally without altering the 3x3 inertia tensor's geometric shape.
     """
+    terminal = terminal_for_model(end_effector)
+    nominal = terminal_body(end_effector) if terminal is not None and terminal.payload_link else None
+    if mass_kg is None:
+        mass_kg = float(_MASS[6]) if nominal is None else nominal.mass_kg
+    if com_m is None:
+        com_m = tuple(_COM[6]) if nominal is None else nominal.com_m
     origins, axes, centers, rots = _fast_fk(position[:6], com_m)
     masses = (*_MASS_T[:6], float(mass_kg))
-    eff_t = _EFF_I_T.get(end_effector, _EFF_I_T['teaching_handle'])
+    eff_t = (_EFF_I_T.get(end_effector, _EFF_I_T['teaching_handle'])
+             if inertia_tensor is None else np.asarray(inertia_tensor, dtype=float).tolist())
     tensors = (*_LINK_I_T, eff_t)
     out: list[float] = []
     for j in range(6):
@@ -297,8 +311,8 @@ def estimate_joint_torques(
     acceleration: tuple[float, ...] | list[float] = (0.0,) * 6,
     *,
     end_effector: str = 'teaching_handle',
-    mass_kg: float = float(_MASS[6]),
-    com_m: tuple[float, ...] = tuple(_COM[6]),
+    mass_kg: float | None = None,
+    com_m: tuple[float, ...] | None = None,
     gravity_model: 'ArmGravityModel | None' = None,
 ) -> tuple[float, ...]:
     """Estimate 6-joint load/external torques (Nm) from MIT impedance error minus inertial torque."""
@@ -487,8 +501,8 @@ def estimate_end_wrench(
     acceleration: tuple[float, ...] | list[float] = (0.0,) * 6,
     *,
     end_effector: str = 'teaching_handle',
-    mass_kg: float = float(_MASS[6]),
-    com_m: tuple[float, ...] = tuple(_COM[6]),
+    mass_kg: float | None = None,
+    com_m: tuple[float, ...] | None = None,
     gravity_model: 'ArmGravityModel | None' = None,
     tool_offset_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.0),
     damping: float = 1e-2,
@@ -554,6 +568,31 @@ class ArmGravityModel:
 
     arm_id: str = 'arm_1'
     joints: dict[int, JointGravityModel] = field(default_factory=dict)
+    effector_model: str = ''
+    added_mass_kg: float = 0.0
+
+    def __post_init__(self):
+        if not math.isfinite(self.added_mass_kg) or self.added_mass_kg < 0:
+            raise ValueError('Added gripper mass must be finite and non-negative')
+
+    def for_effector(self, model: str) -> 'ArmGravityModel':
+        terminal = terminal_for_model(model)
+        if terminal is None or terminal.payload_link is None:
+            return replace(self, effector_model='', added_mass_kg=0.0)
+        mass = self.added_mass_kg if self.effector_model in ('', terminal.model) else 0.0
+        return replace(self, effector_model=terminal.model, added_mass_kg=mass)
+
+    def with_added_mass(self, mass_kg: float) -> 'ArmGravityModel':
+        return replace(self, added_mass_kg=float(mass_kg))
+
+    def effector_body(self, mass_kg=None, com_m=None, end_effector='teaching_handle') -> RigidBody:
+        name = self.effector_model or end_effector
+        if not self.effector_model:
+            mass_kg = float(_MASS[6]) if mass_kg is None else mass_kg
+            com_m = tuple(_COM[6]) if com_m is None else com_m
+        return terminal_body(
+            name if terminal_for_model(name) is not None else 'teaching_handle',
+            self.added_mass_kg, mass_kg, None if com_m is None else tuple(com_m))
 
     def joint(self, index: int) -> JointGravityModel:
         if not 1 <= index <= 6:
@@ -565,13 +604,13 @@ class ArmGravityModel:
             raise ValueError(f'Joint index must be in 1..6, got {index}')
         updated = dict(self.joints)
         updated[index] = model
-        return ArmGravityModel(arm_id=self.arm_id, joints=updated)
+        return replace(self, joints=updated)
 
     def torques(
         self,
         position: tuple[float, ...] | list[float],
-        mass_kg: float = float(_MASS[6]),
-        com_m: tuple[float, ...] = tuple(_COM[6]),
+        mass_kg: float | None = None,
+        com_m: tuple[float, ...] | None = None,
     ) -> tuple[float, ...]:
         if len(position) < 6:
             raise ValueError('Six joint positions are required')
@@ -579,7 +618,8 @@ class ArmGravityModel:
             float(position[i]) + self.joint(i + 1).angle_offset
             for i in range(6)
         )
-        cad = gravity_torques(q_eff, mass_kg=mass_kg, com_m=com_m)
+        body = self.effector_body(mass_kg, com_m)
+        cad = gravity_torques(q_eff, mass_kg=body.mass_kg, com_m=body.com_m)
         return tuple(
             float(self.joint(i + 1).scale * cad[i] + self.joint(i + 1).bias)
             for i in range(6)
@@ -589,8 +629,8 @@ class ArmGravityModel:
         self,
         position: tuple[float, ...] | list[float],
         end_effector: str = 'teaching_handle',
-        mass_kg: float = float(_MASS[6]),
-        com_m: tuple[float, ...] = tuple(_COM[6]),
+        mass_kg: float | None = None,
+        com_m: tuple[float, ...] | None = None,
     ) -> tuple[float, ...]:
         """Return pose-dependent joint inertias J_j(q) scaled proportionally by calibrated gravity scale."""
         if len(position) < 6:
@@ -600,8 +640,10 @@ class ArmGravityModel:
             for i in range(6)
         )
         scales = tuple(self.joint(i + 1).scale or 1.0 for i in range(6))
+        body = self.effector_body(mass_kg, com_m, end_effector)
         return joint_inertias(
-            q_eff, end_effector=end_effector, mass_kg=mass_kg, com_m=com_m, scales=scales,
+            q_eff, end_effector=end_effector, mass_kg=body.mass_kg, com_m=body.com_m,
+            scales=scales, inertia_tensor=body.inertia,
         )
 
     def jacobian(
@@ -625,7 +667,7 @@ class ArmGravityModel:
         end_effector: str = 'teaching_handle',
     ) -> tuple[np.ndarray, ...]:
         """Return the 6 link 3x3 inertia tensors (plus effector) scaled proportionally without changing shape."""
-        eff_inertia = _EFFECTOR_INERTIAS.get(end_effector, _EFFECTOR_INERTIAS['teaching_handle'])
+        eff_inertia = self.effector_body(end_effector=end_effector).inertia
         tensors = [
             _LINK_INERTIAS[i] * (self.joint(i + 1).scale or 1.0)
             for i in range(6)
@@ -634,7 +676,7 @@ class ArmGravityModel:
         return tuple(tensors)
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             'version': 1,
             'arm_id': self.arm_id,
             'joints': {
@@ -642,6 +684,9 @@ class ArmGravityModel:
                 for index in sorted(self.joints)
             },
         }
+        if self.effector_model:
+            data.update(effector_model=self.effector_model, added_mass_kg=float(self.added_mass_kg))
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> 'ArmGravityModel':
@@ -661,7 +706,11 @@ class ArmGravityModel:
             if not 1 <= idx <= 6:
                 raise ValueError(f'Joint index out of range: {key}')
             joints[idx] = JointGravityModel.from_dict(value)
-        return cls(arm_id=str(data.get('arm_id', 'arm_1')), joints=joints)
+        return cls(
+            arm_id=str(data.get('arm_id', 'arm_1')), joints=joints,
+            effector_model=str(data.get('effector_model', '')),
+            added_mass_kg=float(data.get('added_mass_kg', 0.0)),
+        )
 
 
 def save_gravity_model(model: ArmGravityModel, path: str | Path) -> Path:
@@ -686,7 +735,8 @@ def damping_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Compute six-joint critical damping kd from kp.')
     parser.add_argument('--kp', '-k', type=float, nargs=6, required=True)
     parser.add_argument(
-        '--effector', '-e', default='teaching_handle', choices=('teaching_handle', 'gripper'),
+        '--effector', '-e', default='teaching_handle',
+        choices=('teaching_handle', 'gripper', 'gripper_with_wrench'),
     )
     parser.add_argument('--gravity-config', '-g', type=Path, default=None)
     args = parser.parse_args(argv)

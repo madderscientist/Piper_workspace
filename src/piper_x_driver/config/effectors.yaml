@@ -1,0 +1,182 @@
+version: 1
+reference_frame: original link6
+effectors:
+  teaching_handle:
+    label: 示教手柄
+    model: piper_description_with_teach.urdf
+    source: piper_description/urdf/piper_description_with_teach.urdf; combined terminal
+      inertials in link6; CAD assumed accurate, not hardware calibrated
+    max_joint_inertia_kg_m2:
+    - 0.712418
+    - 0.722116
+    - 0.169451
+    - 0.015078
+    - 0.014926
+    - 0.001023
+    density_assumption: original CAD aggregate inertia; existing driver values retained
+    payload_link: null
+    components:
+      terminal:
+        mass_kg: 0.54
+        com_m:
+        - 0.007963485290706084
+        - 5.55501947027822e-05
+        - 0.03788358878334557
+        inertia_per_kg:
+        - - 0.0023401666666666666
+          - 1.9277777777777776e-05
+          - -1.4814814814814815e-07
+        - - 1.9277777777777776e-05
+          - 0.0019273148148148146
+          - 0.0001662037037037037
+        - - -1.4814814814814815e-07
+          - 0.0001662037037037037
+          - 0.0012539074074074074
+  gripper:
+    label: 标准夹爪
+    model: piper_description.urdf
+    source: agilexrobotics/agx_arm_urdf@680fa925cd00db7e2628563d2edc5540963045de;
+      PiPER-X empty stock gripper
+    max_joint_inertia_kg_m2:
+    - 0.694602
+    - 0.704391
+    - 0.163588
+    - 0.014434
+    - 0.014274
+    - 0.000726
+    density_assumption: original CAD aggregate inertia; existing driver values retained
+    payload_link: null
+    components:
+      terminal:
+        mass_kg: 0.54
+        com_m:
+        - 1.822434565775221e-05
+        - -9.521502789096145e-05
+        - 0.03953134028382456
+        inertia_per_kg:
+        - - 0.0018469814814814813
+          - -4.444444444444444e-07
+          - -4.629629629629629e-07
+        - - -4.444444444444444e-07
+          - 0.002249944444444444
+          - -1.4333333333333334e-05
+        - - -4.629629629629629e-07
+          - -1.4333333333333334e-05
+          - 0.0007681296296296296
+  gripper_with_wrench:
+    label: PX6D-75A 力传感器与夹爪
+    model: piper_description_with_wrench.urdf
+    source: uniform-density mesh volumes at URDF component masses, transformed to
+      the driver original link6 frame
+    max_joint_inertia_kg_m2:
+    - 0.972
+    - 0.973
+    - 0.273
+    - 0.0291
+    - 0.014274
+    - 0.000872
+    density_assumption: uniform within each mesh; URDF component masses retained
+    payload_link: gripper_base
+    components:
+      arm_sensor_flange:
+        mesh: package://piper_description/meshes/px6d75_arm_flange.stl
+        mass_kg: 0.024668705402650353
+        com_m:
+        - 0.00010370641164084035
+        - 5.9716921939996956e-05
+        - 0.004106191626030105
+        inertia_per_kg:
+        - - 0.0003747251388209394
+          - -1.2802940111796e-06
+          - 2.1791463545218936e-07
+        - - -1.2802940111796553e-06
+          - 0.0003762059739492873
+          - 1.2656719844799332e-07
+        - - 2.17914635452189e-07
+          - 1.2656719844799292e-07
+          - 0.0007418995853001705
+      wrench_sensor:
+        mesh: package://piper_description/meshes/px6d75.stl
+        mass_kg: 0.18
+        com_m:
+        - -0.00012658508793566108
+        - 2.059358568836107e-11
+        - 0.01863998113906839
+        inertia_per_kg:
+        - - 0.00037474108224221884
+          - -2.6068305112760698e-15
+          - -7.696648766771528e-07
+        - - -2.6068288172101753e-15
+          - 0.00037995149802044965
+          - -2.0820158192812277e-13
+        - - -7.696648766771545e-07
+          - -2.0820158235163925e-13
+          - 0.0006674176776748794
+      sensor_gripper_flange:
+        mesh: package://piper_description/meshes/px6d75_gripper_flange.stl
+        mass_kg: 0.0171253823
+        com_m:
+        - 0.00014409395812765022
+        - -8.265815834973114e-07
+        - 0.0352330408431627
+        inertia_per_kg:
+        - - 0.00028002397303109554
+          - -3.6718514132703596e-09
+          - -2.945547777248599e-07
+        - - -3.6718514132662833e-09
+          - 0.000282482077390732
+          - -6.382292098022117e-10
+        - - -2.9455477772486016e-07
+          - -6.382292098027543e-10
+          - 0.0005488617051790835
+      gripper_base:
+        mesh: package://piper_description/meshes/gripper_base_without_flange.STL
+        mass_kg: 0.413710499490316
+        com_m:
+        - -0.00033754467706133154
+        - -2.5814553759719235e-06
+        - 0.06513037123336593
+        inertia_per_kg:
+        - - 0.0008531266396000381
+          - -7.079999846042477e-08
+          - 4.0383760172501025e-06
+        - - -7.0799998460424e-08
+          - 0.00038755735377443565
+          - 1.6349304359869095e-08
+        - - 4.038376017250096e-06
+          - 1.6349304359865495e-08
+          - 0.0008567295108899683
+      link7:
+        mesh: package://piper_description/meshes/link7.STL
+        mass_kg: 0.025
+        com_m:
+        - 0.0006503301757723838
+        - -0.009719060435037645
+        - 0.11640333649786766
+        inertia_per_kg:
+        - - 0.0004332533504227987
+          - 2.0710560433158953e-06
+          - 1.3284357100138476e-05
+        - - 2.0710560433158957e-06
+          - 0.0005673141625845205
+          - -7.029715614938141e-05
+        - - 1.3284357100138478e-05
+          - -7.029715614938141e-05
+          - 0.0002175758919184931
+      link8:
+        mesh: package://piper_description/meshes/link8.STL
+        mass_kg: 0.025
+        com_m:
+        - -0.0006502587755500817
+        - 0.009719065212367602
+        - 0.11640333649786766
+        inertia_per_kg:
+        - - 0.0004332533808596886
+          - 2.0720409088110798e-06
+          - -1.3283840668034508e-05
+        - - 2.0720409088110798e-06
+          - 0.0005673141321476307
+          - 7.029725373982106e-05
+        - - -1.328384066803451e-05
+          - 7.029725373982106e-05
+          - 0.0002175758919184931

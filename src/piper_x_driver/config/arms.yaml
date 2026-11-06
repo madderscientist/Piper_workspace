@@ -1,25 +1,4 @@
 version: 1
-effectors:
-  teaching_handle:
-    label: 示教手柄
-    mass_kg: 0.54
-    com_m:
-    - 0.007963485290706084
-    - 5.55501947027822e-05
-    - 0.03788358878334557
-    source: piper_description/urdf/piper_description_with_teach.urdf; combined terminal
-      inertials in link6; CAD assumed accurate, not hardware calibrated
-    model: piper_description_with_teach.urdf
-  gripper:
-    label: 标准夹爪
-    mass_kg: 0.54
-    com_m:
-    - 1.822434565775221e-05
-    - -9.521502789096145e-05
-    - 0.03953134028382456
-    source: agilexrobotics/agx_arm_urdf@680fa925cd00db7e2628563d2edc5540963045de;
-      PiPER-X empty stock gripper
-    model: piper_description.urdf
 arms:
 - id: arm_1
   name: 机械臂 1
@@ -73,7 +52,7 @@ arms:
   name: 机械臂 3
   namespace: /arm_3
   can_port: can2
-  end_effector: gripper
+  end_effector: gripper_with_wrench
   gravity_scale: 1.0
   mounting: upright
   debug_kp:
@@ -97,7 +76,7 @@ arms:
   name: 机械臂 4
   namespace: /arm_4
   can_port: can3
-  end_effector: gripper
+  end_effector: gripper_with_wrench
   gravity_scale: 1.0
   mounting: upright
   debug_kp:

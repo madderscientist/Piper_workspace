@@ -1,13 +1,13 @@
 """Bidirectional quasi-static decomposition and regularized gravity + static friction fitting."""
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import numpy as np
-from piper_x_driver.gravity import JointGravityModel, gravity_torques
+from piper_x_driver.gravity import ArmGravityModel, JointGravityModel
 from scipy.optimize import least_squares
 
 
@@ -58,6 +58,9 @@ class GravityIdentificationReport:
     rmse_calibrated: float
     static_friction_mean: float
     static_friction_p85: float
+    added_mass_kg: float | None = None
+    total_effector_mass_kg: float | None = None
+    mass_identified: bool = False
 
 
 CSV_COLUMNS = (
@@ -240,8 +243,6 @@ def identify_joint_gravity(
     torque_source: str = 'auto',
     trim_ratio: float = 0.08,
     grid_step: float = 0.005,
-    effector_mass_kg: float | None = None,
-    effector_com_m: tuple[float, ...] | None = None,
 ) -> GravityIdentificationReport:
     """Identify per-joint gravity calibration (scale, angle_offset, bias) and static friction Fs."""
     if not samples:
@@ -329,3 +330,83 @@ def identify_joint_gravity(
         static_friction_mean=fs_mean,
         static_friction_p85=fs_p85,
     )
+
+
+def identify_gripper_payload(
+    samples_by_joint: dict[int, Sequence[ProbeSample]],
+    arm_model: ArmGravityModel,
+    *,
+    torque_source: str = 'auto',
+    trim_ratio: float = 0.08,
+    grid_step: float = 0.005,
+) -> tuple[ArmGravityModel, dict[int, GravityIdentificationReport]]:
+    """Fit one added gripper mass across probes, keeping calibrated arm/known parts fixed.
+
+    Extra mass shares the gripper-base mesh centroid and unit-mass inertia.
+    Quasi-static data identifies mass; the mesh supplies its inertia shape.
+    """
+    if not arm_model.effector_model:
+        raise ValueError('A composite effector model is required for gripper mass identification')
+    nominal = arm_model.with_added_mass(0.0)
+    unit_mass = nominal.with_added_mass(1.0)
+    decompositions = {}
+    regressors = {}
+    x_rows, y_rows = [], []
+    for joint, samples in sorted(samples_by_joint.items()):
+        if not samples:
+            continue
+        if any(s.joint != joint or len(s.q_full) < 6 for s in samples):
+            raise ValueError('Added-mass identification requires q1..q6 for each joint sample')
+        decomp = decompose_bidirectional_gravity(
+            samples, torque_source=torque_source, trim_ratio=trim_ratio, grid_step=grid_step)
+        pos, neg = _extract_quasi_static_subsets(samples, trim_ratio)
+        aligned = []
+        for direction_samples in (pos, neg):
+            values, coefficients = [], []
+            for sample in direction_samples:
+                q = list(sample.q_full[:6])
+                q[joint - 1] = sample.q
+                base = nominal.torques(q)[joint - 1]
+                values.append(base)
+                coefficients.append(unit_mass.torques(q)[joint - 1] - base)
+            angles = [s.q for s in direction_samples]
+            aligned.append((
+                _interp_sorted(angles, values, decomp.theta_grid),
+                _interp_sorted(angles, coefficients, decomp.theta_grid)))
+        base = 0.5 * (aligned[0][0] + aligned[1][0])
+        coefficient = 0.5 * (aligned[0][1] + aligned[1][1])
+        decompositions[joint] = decomp
+        regressors[joint] = (base, coefficient)
+        x_rows.extend(coefficient)
+        y_rows.extend(decomp.gravity_measured - base)
+    if not decompositions:
+        raise ValueError('No gravity probe samples provided')
+    x, y = np.asarray(x_rows), np.asarray(y_rows)
+    observable = bool(float(x @ x) > np.finfo(float).eps * len(x))
+    mass = arm_model.added_mass_kg
+    if observable:
+        initial = max(0.0, float(x @ y) / float(x @ x))
+        fitted = least_squares(
+            lambda value: x * value[0] - y, [initial],
+            bounds=(0.0, np.inf), loss='soft_l1', f_scale=0.05)
+        mass = float(fitted.x[0])
+    updated = arm_model.with_added_mass(mass)
+    reports = {}
+    for joint, decomp in decompositions.items():
+        base, coefficient = regressors[joint]
+        fitted = base + mass * coefficient
+        fs_mean = float(np.mean(decomp.stiction_profile))
+        joint_model = replace(updated.joint(joint), static_friction=round(fs_mean, 6))
+        updated = updated.with_joint(joint, joint_model)
+        reports[joint] = GravityIdentificationReport(
+            joint=joint, model=joint_model,
+            decomposition=replace(decomp, gravity_cad=base, gravity_fitted=fitted),
+            rmse_cad=float(np.sqrt(np.mean((base - decomp.gravity_measured) ** 2))),
+            rmse_calibrated=float(np.sqrt(np.mean((fitted - decomp.gravity_measured) ** 2))),
+            static_friction_mean=fs_mean,
+            static_friction_p85=float(np.percentile(decomp.stiction_profile, 85)),
+            added_mass_kg=mass,
+            total_effector_mass_kg=nominal.effector_body().mass_kg + mass,
+            mass_identified=observable,
+        )
+    return updated, reports

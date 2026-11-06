@@ -14,10 +14,10 @@
          Recessed side faces the arm; flat side faces the sensor.
          COM/inertia are computed from the transformed uniform STL volume. -->
     <inertial>
-      <origin xyz="0.0000311060413 0.000115557158 0.00410619173" rpy="0 0 0"/>
+      <origin xyz="3.11052664684e-05 0.0001155577473791 0.00410619162603" rpy="0 0 0"/>
       <mass value="${0.242 / 9.81}"/>
-      <inertia ixx="9.29383215e-6" ixy="-1.82651329e-8" ixz="1.59341322e-9"
-               iyy="9.23066586e-6" iyz="6.00893181e-9" izz="1.83017019e-5"/>
+      <inertia ixx="9.293832395097e-06" ixy="-1.826514276555e-08" ixz="1.593410693193e-09"
+               iyy="9.230666003516e-06" iyz="6.008937478148e-09" izz="1.830170230812e-05"/>
     </inertial>
     <visual>
       <geometry><mesh filename="package://piper_description/meshes/px6d75_arm_flange.stl"/></geometry>
@@ -28,12 +28,12 @@
     </collision>
   </link>
   <link name="wrench_sensor">
-    <!-- Official PX6D-75A mass; COM and inertia approximate a uniform cylinder. -->
+    <!-- Official PX6D-75A mass; COM/inertia from its uniform-density outline mesh. -->
     <inertial>
-      <origin xyz="0 0 0.012" rpy="0 0 0"/>
+      <origin xyz="-2.059358673173e-11 -0.0001265850879357 0.01113998113907" rpy="0 0 0"/>
       <mass value="0.18"/>
-      <inertia ixx="7.192125e-5" ixy="0" ixz="0"
-               iyy="7.192125e-5" iyz="0" izz="1.265625e-4"/>
+      <inertia ixx="6.839126964368e-05" ixy="4.692331118388e-16" ixz="3.747628359679e-14"
+               iyy="6.74533948036e-05" iyz="-1.385396778019e-07" izz="0.0001201351819815"/>
     </inertial>
     <visual>
       <geometry><mesh filename="package://piper_description/meshes/px6d75.stl"/></geometry>
@@ -54,10 +54,10 @@
   <link name="sensor_gripper_flange">
     <!-- Printed flange: 0.168 N / 9.81 m/s^2. COM/inertia from uniform STL volume. -->
     <inertial>
-      <origin xyz="0.000144094 -0.000000826582 0.003733041" rpy="0 0 0"/>
+      <origin xyz="0.0001440939581277 -8.265815834953e-07 0.003733040843163" rpy="0 0 0"/>
       <mass value="0.0171253823"/>
-      <inertia ixx="4.79551758e-6" ixy="-6.28818591e-11" ixz="-5.04436317e-9"
-               iyy="4.83761356e-6" iyz="-1.09299192e-11" izz="9.39946651e-6"/>
+      <inertia ixx="4.795517580961e-06" ixy="-6.288185906547e-11" ixz="-5.04436316593e-09"
+               iyy="4.837613557762e-06" iyz="-1.092991918914e-11" izz="9.399466510712e-06"/>
     </inertial>
     <visual>
       <geometry><mesh filename="package://piper_description/meshes/px6d75_gripper_flange.stl"/></geometry>
@@ -75,13 +75,12 @@
 
   <link name="gripper_base">
     <!-- Original 0.45 kg base includes the old flange. Subtract its measured
-         0.356 N mass. COM/inertia are the original URDF minus the STL-shaped
-         flange at that mass, then referred to the shifted mesh origin. -->
+         0.356 N mass. COM/inertia use the remaining uniform-density mesh. -->
     <inertial>
-      <origin xyz="-0.000301397362 0.0000190203633 0.0240422141" rpy="0 0 0"/>
+      <origin xyz="-0.0003375446770613 -2.581455375968e-06 0.02483037123337" rpy="0 0 0"/>
       <mass value="${0.45 - removed_flange_mass}"/>
-      <inertia ixx="8.90907746e-4" ixy="6.96798539e-7" ixz="-8.98102461e-6"
-               iyy="6.75476611e-4" iyz="-7.86054516e-7" izz="3.76732181e-4"/>
+      <inertia ixx="0.0003529474481974" ixy="-2.929070272696e-08" ixz="1.670718559226e-06"
+               iyy="0.0001603365464112" iyz="6.763878873048e-09" izz="0.0003544379938784"/>
     </inertial>
     <visual>
       <geometry><mesh filename="package://piper_description/meshes/gripper_base_without_flange.STL"/></geometry>
@@ -101,10 +100,10 @@
        Their joint origins move down with the gripper-base mesh by 10.5 mm. -->
   <link name="link7">
     <inertial>
-      <origin xyz="0.00065123185041968 -0.0491929869131989 0.00972258769184025" rpy="0 0 0"/>
+      <origin xyz="0.0006503301757724 -0.0491966278017 0.009719241144408" rpy="0 0 0"/>
       <mass value="0.025"/>
-      <inertia ixx="0.00007371" ixy="-0.00000113" ixz="0.00000021"
-               iyy="0.00000781" iyz="-0.00001372" izz="0.0000747"/>
+      <inertia ixx="1.083133376057e-05" ixy="3.321087373159e-07" ixz="-5.177762098675e-08"
+               iyy="5.439410208874e-06" iyz="1.757461020197e-06" izz="1.41828411537e-05"/>
     </inertial>
     <visual>
       <geometry><mesh filename="package://piper_description/meshes/link7.STL"/></geometry>
@@ -122,10 +121,10 @@
 
   <link name="link8">
     <inertial>
-      <origin xyz="0.000651231850419722 -0.0491929869131991 0.00972258769184024" rpy="0 0 0"/>
+      <origin xyz="0.0006503301757724 -0.0491966278017 0.009719241144408" rpy="0 0 0"/>
       <mass value="0.025"/>
-      <inertia ixx="0.00007371" ixy="-0.00000113" ixz="0.00000021"
-               iyy="0.00000781" iyz="-0.00001372" izz="0.0000747"/>
+      <inertia ixx="1.083133376057e-05" ixy="3.321087373159e-07" ixz="-5.177762098675e-08"
+               iyy="5.439410208874e-06" iyz="1.757461020197e-06" izz="1.41828411537e-05"/>
     </inertial>
     <visual>
       <geometry><mesh filename="package://piper_description/meshes/link8.STL"/></geometry>

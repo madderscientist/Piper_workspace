@@ -200,7 +200,12 @@
     if (modelYaml && el('yaml-preview').textContent !== modelYaml) {
       el('yaml-preview').textContent = modelYaml;
     }
+    el('payload-mass-card').hidden = !fit?.payload;
     if (!fit) return;
+    if (fit.payload) {
+      const p = fit.payload;
+      el('kpi-payload-mass').textContent = `${p.added_mass_kg.toFixed(4)} / ${p.total_mass_kg.toFixed(4)} kg${p.mass_identified ? '' : '（待重力轴数据）'}`;
+    }
     const m = fit.model;
     const met = fit.metrics;
     el('kpi-scale').textContent = m.scale.toFixed(4);

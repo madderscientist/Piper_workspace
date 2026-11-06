@@ -116,7 +116,7 @@ def test_invalid_or_unwritable_runtime_configuration_never_changes_active_model(
         original = driver.control.effector
         before = path.read_bytes()
         response = driver._configure(
-            ConfigureArm.Request(end_effector='gripper', gravity_scale=float('nan')),
+            ConfigureArm.Request(end_effector=driver.arm_config.end_effector, gravity_scale=float('nan')),
             ConfigureArm.Response())
         assert not response.success
         assert driver.control.gravity_scale == 1
@@ -127,7 +127,7 @@ def test_invalid_or_unwritable_runtime_configuration_never_changes_active_model(
 
         monkeypatch.setattr(driver.fleet, 'save_arm', fail)
         response = driver._configure(
-            ConfigureArm.Request(end_effector='gripper', gravity_scale=0.5),
+            ConfigureArm.Request(end_effector=driver.arm_config.end_effector, gravity_scale=0.5),
             ConfigureArm.Response())
         assert not response.success
         assert 'not writable' in response.message
@@ -147,7 +147,7 @@ def test_all_four_drivers_use_configured_can_and_effector_without_startup_action
         drivers = [DriverNode(namespace=f'/arm_{index}') for index in range(1, 5)]
         assert [driver.arm.channel for driver in drivers] == ['can0', 'can1', 'can2', 'can3']
         assert [driver.arm_config.end_effector for driver in drivers] == [
-            'teaching_handle', 'teaching_handle', 'gripper', 'gripper']
+            'teaching_handle', 'teaching_handle', 'gripper_with_wrench', 'gripper_with_wrench']
         assert all(driver.control.gravity_scale == 1 for driver in drivers)
         assert all(driver.control.mode == 'mit' and all(driver.arm.enabled) for driver in drivers)
     finally:

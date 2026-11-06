@@ -15,6 +15,7 @@ import yaml
 
 from piper_x_driver.configuration import default_config_path, FleetConfig
 from piper_x_driver.gravity import _GRAVITY, _MASS, _kinematics, gravity_torques
+from piper_x_driver.terminal import terminal_body, terminal_for_model
 
 
 @pytest.fixture
@@ -29,13 +30,20 @@ def test_hardware_mapping_and_defaults(fleet_path):
     assert [arm.can_port for arm in fleet.arms] == ['can0', 'can1', 'can2', 'can3']
     assert [arm.namespace for arm in fleet.arms] == [f'/arm_{i}' for i in range(1, 5)]
     assert [arm.end_effector for arm in fleet.arms] == [
-        'teaching_handle', 'teaching_handle', 'gripper', 'gripper']
+        'teaching_handle', 'teaching_handle',
+        'gripper_with_wrench', 'gripper_with_wrench']
+    assert fleet.effectors['gripper_with_wrench'].model == 'piper_description_with_wrench.urdf'
     assert all(arm.gravity_scale == 1 for arm in fleet.arms)
     assert all(0 < arm.friction_scale <= 1 for arm in fleet.arms)
     assert all(arm.friction_config.endswith(f'{arm.id}_friction.yaml') for arm in fleet.arms)
     assert all(fleet.friction_model(arm) is not None for arm in fleet.arms)
     assert all(arm.gravity_config.endswith(f'{arm.id}_gravity.yaml') for arm in fleet.arms)
     assert all(fleet.gravity_model(arm) is not None for arm in fleet.arms)
+    for key, profile in fleet.effectors.items():
+        body = terminal_body(key)
+        assert profile.mass_kg == pytest.approx(body.mass_kg)
+        assert profile.com_m == pytest.approx(body.com_m)
+        assert terminal_for_model(profile.model).model == profile.model
 
 
 @pytest.mark.parametrize('field,value', [
@@ -79,6 +87,7 @@ def test_concurrent_updates_preserve_other_arms_and_resolve_install_symlink(flee
     updated = FleetConfig(link)
     assert [arm.gravity_scale for arm in updated.arms] == [0, 0.25, 0.5, 0.75]
     assert all(arm.end_effector == 'gripper' for arm in updated.arms)
+    assert 'effectors' not in yaml.safe_load(fleet_path.read_text())
     assert not list(fleet_path.parent.glob('.arms-*'))
 
 
@@ -129,7 +138,44 @@ def test_teaching_profile_matches_urdf_combined_terminal_mass_and_com(width):
     assert profile.com_m == pytest.approx(moment / mass, abs=1e-8)
 
 
-@pytest.mark.parametrize('effector', ['teaching_handle', 'gripper'])
+def test_wrench_gripper_profile_matches_uniform_mesh_terminal():
+    from piper_x_driver.mesh_inertia import terminal_from_meshes
+
+    path = Path(get_package_share_directory('piper_description')) / 'urdf'
+    generated = terminal_from_meshes(
+        path / 'piper_description_with_wrench.urdf', path / 'piper_description.urdf')
+    config = Path(get_package_share_directory('piper_x_driver')) / 'config/effectors.yaml'
+    data = yaml.safe_load(config.read_text())
+    profile = data['effectors']['gripper_with_wrench']
+    for key, value in generated.items():
+        assert value == profile.get(key, data.get(key)), key
+    terminal = terminal_for_model('gripper_with_wrench')
+    assert len(terminal.components) == 6
+    assert terminal.payload_link == 'gripper_base'
+
+
+def test_uniform_stl_inertia_matches_translated_box(tmp_path):
+    from piper_x_driver.mesh_inertia import stl_mass_properties
+
+    center = np.array([4.0, -5.0, 6.0])
+    vertices = np.array([[x, y, z] for x in (-1, 1) for y in (-2, 2) for z in (-3, 3)]) + center
+    # Two outward-facing triangles on each box face.
+    triangles = [(0, 1, 3), (0, 3, 2), (4, 6, 7), (4, 7, 5),
+                 (0, 4, 5), (0, 5, 1), (2, 3, 7), (2, 7, 6),
+                 (0, 2, 6), (0, 6, 4), (1, 5, 7), (1, 7, 3)]
+    lines = ['solid box']
+    for indices in triangles:
+        lines += ['facet normal 0 0 0', 'outer loop']
+        lines += ['vertex ' + ' '.join(map(str, vertex)) for vertex in vertices[list(indices)]]
+        lines += ['endloop', 'endfacet']
+    path = tmp_path / 'box.stl'
+    path.write_text('\n'.join(lines + ['endsolid box']))
+    actual_center, unit_inertia = stl_mass_properties(path)
+    assert actual_center == pytest.approx(center)
+    np.testing.assert_allclose(unit_inertia, np.diag([52 / 12, 40 / 12, 20 / 12]), atol=1e-12)
+
+
+@pytest.mark.parametrize('effector', ['teaching_handle', 'gripper', 'gripper_with_wrench'])
 def test_configured_gravity_matches_potential_energy_gradient(effector):
     profile = FleetConfig(default_config_path()).effectors[effector]
     position = (0.1, 0.5, -0.5, 0.2, -0.1, 0.3)
