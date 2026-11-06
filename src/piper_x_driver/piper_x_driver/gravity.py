@@ -133,6 +133,13 @@ def max_critical_kd(
     )
 
 
+def link6_rotation_in_base(position: tuple[float, ...] | list[float]) -> np.ndarray:
+    """Return the SDK-compatible link6 rotation for measured joint angles (rad)."""
+    if len(position) < 6:
+        raise ValueError('Six joint positions are required')
+    return np.asarray(_fast_fk(position[:6], (0.0, 0.0, 0.0))[3][5], dtype=float)
+
+
 def _kinematics(position: tuple[float, ...], effector_com=None):
     origins, axes, centers, _ = _fast_fk(position, effector_com)
     return np.asarray(origins, dtype=float), np.asarray(axes, dtype=float), np.asarray(centers, dtype=float)
