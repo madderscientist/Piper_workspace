@@ -100,13 +100,22 @@ class JointFrictionModel:
     fv: float = 0.0
     v0: float = 0.01
     vr: float = 0.5
+    load_ratio: float = 0.0
+    error_epsilon: float = 0.05
+    velocity_epsilon: float = 0.02
     harmonics: tuple[SpatialHarmonic, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ('fc', 'fs', 'vs', 'delta', 'fv', 'v0', 'vr'):
+        for name in (
+            'fc', 'fs', 'vs', 'delta', 'fv', 'v0', 'vr',
+            'load_ratio', 'error_epsilon', 'velocity_epsilon',
+        ):
             val = getattr(self, name)
             if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
                 raise ValueError(f'{name} must be finite')
+        for nonneg in ('load_ratio', 'error_epsilon', 'velocity_epsilon'):
+            if getattr(self, nonneg) < 0.0:
+                raise ValueError(f'{nonneg} must be finite and non-negative')
         if self.vs <= 0:
             raise ValueError('vs must be finite and positive')
         if self.v0 <= 0:
@@ -141,36 +150,89 @@ class JointFrictionModel:
         dry = self.fc + (self.fs - self.fc) * math.exp(-((s / self.vs) ** self.delta))
         return dry * math.tanh(velocity / self.v0) + self.fv * velocity
 
+    def stiction_torque(
+        self,
+        theta: float,
+        position_error: float = 0.0,
+        target_velocity: float = 0.0,
+        *,
+        gravity_torque: float = 0.0,
+        static_friction: float = 0.0,
+        error_epsilon: float | None = None,
+        velocity_epsilon: float | None = None,
+    ) -> float:
+        """Smooth breakaway stiction torque driven by position error and target velocity:
+
+            tau_stiction = max(0, load_ratio * |G| + tau_0) * tanh(e / eps_e + dq_target / eps_v)
+        """
+        eps_e = self.error_epsilon if error_epsilon is None else float(error_epsilon)
+        eps_v = self.velocity_epsilon if velocity_epsilon is None else float(velocity_epsilon)
+        drive = 0.0
+        if eps_e > 0.0:
+            drive += float(position_error) / eps_e
+        if eps_v > 0.0:
+            drive += float(target_velocity) / eps_v
+        if drive == 0.0:
+            return 0.0
+        floor = float(static_friction) if float(static_friction) > 0.0 else max(self.fs, self.fc)
+        magnitude = max(
+            0.0,
+            self.load_ratio * abs(float(gravity_torque))
+            + floor
+            + self.modulation_torque(float(theta)),
+        )
+        return float(magnitude * math.tanh(drive))
+
     def torque(
         self,
         theta: float,
         velocity: float,
         *,
+        position_error: float = 0.0,
+        target_velocity: float = 0.0,
+        gravity_torque: float = 0.0,
+        static_friction: float = 0.0,
+        error_epsilon: float | None = None,
+        velocity_epsilon: float | None = None,
         cogging_scale: float = 1.0,
         friction_scale: float = 1.0,
     ) -> float:
-        """Total modeled joint friction torque tau_fric(theta, velocity) in Nm.
+        """Total modeled joint friction torque tau_fric in Nm.
 
-        Smoothly gated by tanh(|velocity| / v0) so torque is strictly 0 at rest (velocity == 0)
-        while preserving direction-independent cogging sign and full amplitude once moving.
+        Combines Stribeck + periodic ripple when moving with error/target-velocity
+        breakaway stiction at rest so static friction deadband is overcome smoothly.
         """
         s = abs(velocity)
+        stiction = self.stiction_torque(
+            theta,
+            position_error,
+            target_velocity,
+            gravity_torque=gravity_torque,
+            static_friction=static_friction,
+            error_epsilon=error_epsilon,
+            velocity_epsilon=velocity_epsilon,
+        )
         if s == 0.0:
-            return 0.0
+            return float(friction_scale * stiction)
         # 1. 高速衰减包络 w(dq) = exp(-(dq / vr)^2)：低速接近 1（完整补偿齿轮感），高速趋近 0（平滑退火）
         env = self.envelope(velocity)
         # 2. 零速平滑门控 tanh(|dq| / v0)：静止时为 0 防止齿槽补偿在零速自激，一旦运动迅速升至 1
         motion_gate = math.tanh(s / self.v0)
-        # 3. 与运动方向相关的摩擦项：(Stribeck 干摩擦 + 周期啮合调制) * tanh(dq / v0) + 粘滞摩擦 fv * dq
-        dry = self.fc + (self.fs - self.fc) * math.exp(-((s / self.vs) ** self.delta))
+        # 3. 与运动方向相关的摩擦项：随 |dq| 从静摩擦平滑过渡到 Stribeck + 周期啮合调制 + 粘滞摩擦
+        dry = (
+            self.load_ratio * abs(float(gravity_torque))
+            + self.fc
+            + (self.fs - self.fc) * math.exp(-((s / self.vs) ** self.delta))
+        )
         mod = env * self.modulation_torque(theta)
-        directional = (dry + mod) * math.tanh(velocity / self.v0) + self.fv * velocity
+        kinetic = max(0.0, dry + mod) * math.tanh(velocity / self.v0) + self.fv * velocity
+        directional = (1.0 - motion_gate) * stiction + motion_gate * kinetic
         # 4. 与运动方向无关的齿槽转矩项：w(dq) * tanh(|dq| / v0) * tau_cog(theta)
         cog = env * motion_gate * self.cogging_torque(theta)
-        return friction_scale * directional + cogging_scale * cog
+        return float(friction_scale * directional + cogging_scale * cog)
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             'fc': float(self.fc),
             'fs': float(self.fs),
             'vs': float(self.vs),
@@ -180,6 +242,13 @@ class JointFrictionModel:
             'vr': float(self.vr),
             'harmonics': [h.to_dict() for h in self.harmonics],
         }
+        if self.load_ratio != 0.0:
+            out['load_ratio'] = float(self.load_ratio)
+        if self.error_epsilon != 0.05:
+            out['error_epsilon'] = float(self.error_epsilon)
+        if self.velocity_epsilon != 0.02:
+            out['velocity_epsilon'] = float(self.velocity_epsilon)
+        return out
 
     @classmethod
     def from_dict(cls, data: dict) -> 'JointFrictionModel':
@@ -197,6 +266,9 @@ class JointFrictionModel:
             fv=float(data.get('fv', 0.0)),
             v0=float(data.get('v0', 0.01)),
             vr=float(data.get('vr', 0.5)),
+            load_ratio=float(data.get('load_ratio', 0.0)),
+            error_epsilon=float(data.get('error_epsilon', 0.05)),
+            velocity_epsilon=float(data.get('velocity_epsilon', 0.02)),
             harmonics=harmonics,
         )
 
@@ -444,6 +516,12 @@ class ArmFrictionModel:
         positions: tuple[float, ...] | list[float],
         velocities: tuple[float, ...] | list[float],
         *,
+        position_errors: tuple[float, ...] | list[float] = (0.0,) * 6,
+        target_velocities: tuple[float, ...] | list[float] = (0.0,) * 6,
+        gravity_torques: tuple[float, ...] | list[float] = (0.0,) * 6,
+        static_frictions: tuple[float, ...] | list[float] = (0.0,) * 6,
+        error_epsilon: float | None = None,
+        velocity_epsilon: float | None = None,
         cogging_scale: float = 1.0,
         friction_scale: float = 1.0,
     ) -> tuple[float, ...]:
@@ -453,6 +531,20 @@ class ArmFrictionModel:
             self.joint(index).torque(
                 float(positions[index - 1]),
                 float(velocities[index - 1]),
+                position_error=(
+                    float(position_errors[index - 1]) if index - 1 < len(position_errors) else 0.0
+                ),
+                target_velocity=(
+                    float(target_velocities[index - 1]) if index - 1 < len(target_velocities) else 0.0
+                ),
+                gravity_torque=(
+                    float(gravity_torques[index - 1]) if index - 1 < len(gravity_torques) else 0.0
+                ),
+                static_friction=(
+                    float(static_frictions[index - 1]) if index - 1 < len(static_frictions) else 0.0
+                ),
+                error_epsilon=error_epsilon,
+                velocity_epsilon=velocity_epsilon,
                 cogging_scale=cogging_scale,
                 friction_scale=friction_scale,
             )

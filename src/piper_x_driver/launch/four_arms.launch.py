@@ -13,6 +13,8 @@ def _drivers(context):
         extra['rate_hz'] = float(LaunchConfiguration('rate_hz').perform(context))
     if 'telemetry_hz' in context.launch_configurations:
         extra['telemetry_hz'] = float(LaunchConfiguration('telemetry_hz').perform(context))
+    if 'wrench_estimation_enabled' in context.launch_configurations:
+        extra['wrench_estimation_enabled'] = LaunchConfiguration('wrench_estimation_enabled').perform(context).lower() in ('true', '1', 'yes')
     return [
         Node(
             package='piper_x_driver', executable='driver',
@@ -31,5 +33,6 @@ def generate_launch_description():
         DeclareLaunchArgument('config_file', default_value=str(default_config_path())),
         DeclareLaunchArgument('rate_hz', default_value='200.0'),
         DeclareLaunchArgument('telemetry_hz', default_value='200.0'),
+        DeclareLaunchArgument('wrench_estimation_enabled', default_value='false'),
         OpaqueFunction(function=_drivers),
     ])

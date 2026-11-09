@@ -34,11 +34,30 @@ class ArmConfig:
     end_effector: str
     gravity_scale: float
     mounting: str
-    debug_kp: tuple[float, ...]
-    debug_kd: tuple[float, ...]
+    kp: tuple[float, ...]
+    kd: tuple[float, ...]
+    s_a: float = 2.0
     friction_scale: float = 1.0
     friction_config: str = ''
     gravity_config: str = ''
+    friction_error_epsilon: float = 0.05
+    friction_velocity_epsilon: float = 0.02
+    target_velocity_cutoff_hz: float = 5.0
+    adaptive_stiffness_b: float = 0.08
+    adaptive_stiffness_power: float = 3.0
+    offset_ramp_s: float = 2.0
+
+    @property
+    def debug_kp(self) -> tuple[float, ...]:
+        return self.kp
+
+    @property
+    def debug_kd(self) -> tuple[float, ...]:
+        return self.kd
+
+    @property
+    def adaptive_stiffness_scale(self) -> float:
+        return self.s_a
 
 
 def default_config_path() -> Path:
@@ -111,13 +130,44 @@ class FleetConfig:
         for values in arms:
             if not isinstance(values, dict):
                 raise ValueError('Invalid arm configuration fields')
-            debug_kp = _vector(values.get('debug_kp'), 'debug_kp', 6, 0.0, 500.0)
+            raw_values = dict(values)
+            if 'kp' not in raw_values and 'debug_kp' in raw_values:
+                raw_values['kp'] = raw_values.pop('debug_kp')
+            elif 'debug_kp' in raw_values:
+                legacy_kp = _vector(raw_values.pop('debug_kp'), 'debug_kp', 6, 0.0, 500.0)
+                if 'kp' not in values:
+                    raw_values['kp'] = list(legacy_kp)
+            if 'kd' not in raw_values and 'debug_kd' in raw_values:
+                raw_values['kd'] = raw_values.pop('debug_kd')
+            elif 'debug_kd' in raw_values:
+                legacy_kd = _vector(raw_values.pop('debug_kd'), 'debug_kd', 6, -100.0, 100.0)
+                if 'kd' not in values:
+                    raw_values['kd'] = list(legacy_kd)
+            if 's_a' not in raw_values and 'adaptive_stiffness_scale' in raw_values:
+                raw_values['s_a'] = raw_values.pop('adaptive_stiffness_scale')
+            elif 'adaptive_stiffness_scale' in raw_values:
+                legacy_sa = bounded(
+                    raw_values.pop('adaptive_stiffness_scale'),
+                    'adaptive_stiffness_scale',
+                    0.0,
+                    20.0,
+                )
+                if 's_a' not in values:
+                    raw_values['s_a'] = legacy_sa
+            kp_vec = _vector(raw_values.get('kp'), 'kp', 6, 0.0, 500.0)
             values = {
-                'debug_kd': list(max_critical_kd(debug_kp, str(values.get('end_effector', '')))),
+                'kd': list(max_critical_kd(kp_vec, str(raw_values.get('end_effector', '')))),
+                's_a': 2.0,
                 'friction_scale': 1.0,
                 'friction_config': '',
                 'gravity_config': '',
-                **values,
+                'friction_error_epsilon': 0.05,
+                'friction_velocity_epsilon': 0.02,
+                'target_velocity_cutoff_hz': 5.0,
+                'adaptive_stiffness_b': 0.08,
+                'adaptive_stiffness_power': 3.0,
+                'offset_ramp_s': 2.0,
+                **raw_values,
             }
             if values.get('friction_config') is None:
                 values['friction_config'] = ''
@@ -172,19 +222,49 @@ class FleetConfig:
             if gravity_model is not None or candidate.effector_model:
                 gravity_model = candidate
             self.gravity_models[values['id']] = gravity_model
-            auto_kd = max_critical_kd(debug_kp, str(values.get('end_effector', '')), gravity_model)
-            raw_kd = _vector(values['debug_kd'], 'debug_kd', 6, -100.0, 100.0)
+            auto_kd = max_critical_kd(kp_vec, str(values.get('end_effector', '')), gravity_model)
+            raw_kd = _vector(values['kd'], 'kd', 6, -100.0, 100.0)
             resolved_kd = tuple(auto if v < 0.0 else v for v, auto in zip(raw_kd, auto_kd))
+            error_eps = bounded(
+                values['friction_error_epsilon'], 'friction_error_epsilon', 0.0, 10.0,
+            )
+            vel_eps = bounded(
+                values['friction_velocity_epsilon'], 'friction_velocity_epsilon', 0.0, 100.0,
+            )
+            vel_cutoff = bounded(
+                values['target_velocity_cutoff_hz'], 'target_velocity_cutoff_hz', 0.0, 1000.0,
+            )
+            if vel_cutoff <= 0.0:
+                raise ValueError('target_velocity_cutoff_hz must be finite and positive')
+            adapt_scale = bounded(values['s_a'], 's_a', 0.0, 20.0)
+            adapt_b = bounded(
+                values['adaptive_stiffness_b'], 'adaptive_stiffness_b', 0.0, 10.0,
+            )
+            if adapt_b <= 0.0:
+                raise ValueError('adaptive_stiffness_b must be finite and positive')
+            adapt_power = bounded(
+                values['adaptive_stiffness_power'], 'adaptive_stiffness_power', 0.0, 20.0,
+            )
+            if adapt_power <= 0.0:
+                raise ValueError('adaptive_stiffness_power must be finite and positive')
+            ramp_s = bounded(values['offset_ramp_s'], 'offset_ramp_s', 0.0, 30.0)
             self.arms.append(ArmConfig(
                 values['id'], values['name'], values['namespace'],
                 values['can_port'], values['end_effector'],
                 bounded(values['gravity_scale'], 'gravity_scale', 0, 1),
                 values['mounting'],
-                debug_kp,
+                kp_vec,
                 resolved_kd,
+                adapt_scale,
                 bounded(values['friction_scale'], 'friction_scale', 0, 1),
                 friction_str,
                 gravity_str,
+                error_eps,
+                vel_eps,
+                vel_cutoff,
+                adapt_b,
+                adapt_power,
+                ramp_s,
             ))
         for name in ('id', 'namespace', 'can_port'):
             if len({getattr(arm, name) for arm in self.arms}) != 4:
@@ -207,6 +287,9 @@ class FleetConfig:
     def public(self, arm: ArmConfig) -> dict:
         data = {
             **asdict(arm), 'config_file': str(self.path),
+            'debug_kp': list(arm.kp),
+            'debug_kd': list(arm.kd),
+            'adaptive_stiffness_scale': float(arm.s_a),
             'effector': asdict(self.effectors[arm.end_effector]),
             'effectors': {key: asdict(value) for key, value in self.effectors.items()},
         }

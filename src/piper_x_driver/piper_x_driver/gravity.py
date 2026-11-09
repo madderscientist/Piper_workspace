@@ -30,6 +30,7 @@ SOFTWARE.
 """
 
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 import math
 from pathlib import Path
 
@@ -213,10 +214,18 @@ def joint_inertias(
         mass_kg = float(_MASS[6]) if nominal is None else nominal.mass_kg
     if com_m is None:
         com_m = tuple(_COM[6]) if nominal is None else nominal.com_m
-    origins, axes, centers, rots = _fast_fk(position[:6], com_m)
-    masses = (*_MASS_T[:6], float(mass_kg))
     eff_t = (_EFF_I_T.get(end_effector, _EFF_I_T['teaching_handle'])
              if inertia_tensor is None else np.asarray(inertia_tensor, dtype=float).tolist())
+    return _joint_inertias_cached(
+        tuple(float(v) for v in position[:6]), float(mass_kg), tuple(float(v) for v in com_m),
+        tuple(float(v) for v in scales), tuple(tuple(float(v) for v in row) for row in eff_t),
+    )
+
+
+@lru_cache(maxsize=256)
+def _joint_inertias_cached(position, mass_kg, com_m, scales, eff_t):
+    origins, axes, centers, rots = _fast_fk(position, com_m)
+    masses = (*_MASS_T[:6], mass_kg)
     tensors = (*_LINK_I_T, eff_t)
     out: list[float] = []
     for j in range(6):
@@ -249,7 +258,14 @@ def gravity_torques(
     com_m: tuple[float, ...] = tuple(_COM[6]),
 ) -> tuple[float, ...]:
     """Return joint-side Nm opposing gravity, not motor-side current/torque."""
-    origins, axes, centers, _ = _fast_fk(position[:6], com_m)
+    return _gravity_torques_cached(
+        tuple(float(v) for v in position[:6]), float(mass_kg), tuple(float(v) for v in com_m),
+    )
+
+
+@lru_cache(maxsize=256)
+def _gravity_torques_cached(position, mass_kg, com_m):
+    origins, axes, centers, _ = _fast_fk(position, com_m)
     masses = (*_MASS_T[:6], float(mass_kg))
     out = [0.0] * 6
     acc_m = masses[6]

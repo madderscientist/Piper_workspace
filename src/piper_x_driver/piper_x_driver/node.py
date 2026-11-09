@@ -18,16 +18,18 @@ from piper_x_interfaces.msg import (
 from piper_x_interfaces.srv import (
     CalibrateEffector, ConfigureArm, DebugMit, Enable, SetMode,
 )
+from rcl_interfaces.msg import SetParametersResult
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 import yaml
 
 from .backend import fresh, SdkArm
@@ -50,6 +52,7 @@ class DriverNode(Node):
         self.declare_parameter('arm_id', default_arm)
         self.declare_parameter('rate_hz', 200.0)
         self.declare_parameter('telemetry_hz', 200.0)
+        self.declare_parameter('wrench_estimation_enabled', False)
         self.rate_hz = bounded(
             float(self.get_parameter('rate_hz').value), 'rate_hz', 10.0, 1000.0,
         )
@@ -66,6 +69,30 @@ class DriverNode(Node):
         )
         if namespace not in ('/', self.arm_config.namespace):
             raise ValueError('Driver namespace does not match configured arm')
+        self.declare_parameter(
+            'friction_error_epsilon', float(self.arm_config.friction_error_epsilon),
+        )
+        self.declare_parameter(
+            'friction_velocity_epsilon', float(self.arm_config.friction_velocity_epsilon),
+        )
+        self.declare_parameter(
+            'target_velocity_cutoff_hz', float(self.arm_config.target_velocity_cutoff_hz),
+        )
+        self.declare_parameter(
+            's_a', float(self.arm_config.s_a),
+        )
+        self.declare_parameter(
+            'adaptive_stiffness_scale', float(self.arm_config.adaptive_stiffness_scale),
+        )
+        self.declare_parameter(
+            'adaptive_stiffness_b', float(self.arm_config.adaptive_stiffness_b),
+        )
+        self.declare_parameter(
+            'adaptive_stiffness_power', float(self.arm_config.adaptive_stiffness_power),
+        )
+        self.declare_parameter(
+            'offset_ramp_s', float(self.arm_config.offset_ramp_s),
+        )
         self.arm: Any = SdkArm(self.arm_config.can_port)
         self.control = Controller(
             self.arm, effector=self.fleet.effectors[self.arm_config.end_effector],
@@ -73,7 +100,15 @@ class DriverNode(Node):
             gravity_model=self.fleet.gravity_model(self.arm_config),
             friction_scale=self.arm_config.friction_scale,
             friction_model=self.fleet.friction_model(self.arm_config),
-            debug_kp=self.arm_config.debug_kp, debug_kd=self.arm_config.debug_kd)
+            friction_error_epsilon=float(self.get_parameter('friction_error_epsilon').value),
+            friction_velocity_epsilon=float(self.get_parameter('friction_velocity_epsilon').value),
+            target_velocity_cutoff_hz=float(self.get_parameter('target_velocity_cutoff_hz').value),
+            s_a=float(self.get_parameter('s_a').value),
+            adaptive_stiffness_b=float(self.get_parameter('adaptive_stiffness_b').value),
+            adaptive_stiffness_power=float(self.get_parameter('adaptive_stiffness_power').value),
+            offset_ramp_s=float(self.get_parameter('offset_ramp_s').value),
+            kp=self.arm_config.kp, kd=self.arm_config.kd)
+        self.add_on_set_parameters_callback(self._on_parameters_set)
         self.last_error = ''
         self.teaching_active = False
         self.teaching_received = 0.0
@@ -107,6 +142,8 @@ class DriverNode(Node):
         self._last_control_state_pub = 0.0
         self._last_state_key = None
         self._last_err_code = None
+        self._wrench_estimation_active = self.wrench_estimation_enabled
+        self._wrench_estimate_ready = False
         self.create_service(Enable, 'enable_srv', self._enable, callback_group=self.power_group)
         self.create_service(CalibrateEffector, 'calibrate_effector', self._calibrate_effector,
                             callback_group=self.power_group)
@@ -114,6 +151,7 @@ class DriverNode(Node):
             self.create_service(SetMode, 'set_mode', self._mode),
             self.create_service(ConfigureArm, 'configure_arm', self._configure),
             self.create_service(DebugMit, 'debug_mit', self._debug),
+            self.create_service(SetBool, 'set_wrench_estimation', self._set_wrench_estimation),
         )
         realtime_sub_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -140,11 +178,76 @@ class DriverNode(Node):
             f'(inner={self.rate_hz:g} Hz, telemetry={self.telemetry_hz:g} Hz)'
         )
 
+    @property
+    def wrench_estimation_enabled(self):
+        return bool(self.get_parameter('wrench_estimation_enabled').value)
+
+    @property
+    def wrench_estimate_available(self):
+        return (self.wrench_estimation_enabled and self._wrench_estimate_ready
+                and self.control.mode == 'mit' and self.control.mit_ready
+                and not self.control.hold_reason)
+
+    def _sync_wrench_estimation(self):
+        enabled = self.wrench_estimation_enabled
+        if enabled != self._wrench_estimation_active:
+            self.control.reset_wrench_estimation()
+            self._wrench_pub_rate.clear()
+            self._wrench_estimate_ready = False
+            self._wrench_estimation_active = enabled
+        return enabled
+
+    def _on_parameters_set(self, parameters):
+        result = SetParametersResult(successful=True)
+        updates = {}
+        for param in parameters:
+            name = param.name
+            if name not in (
+                'friction_error_epsilon',
+                'friction_velocity_epsilon',
+                'target_velocity_cutoff_hz',
+                's_a',
+                'adaptive_stiffness_scale',
+                'adaptive_stiffness_b',
+                'adaptive_stiffness_power',
+                'offset_ramp_s',
+            ):
+                continue
+            raw = param.value
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                result.successful = False
+                result.reason = f'{name} must be a finite number'
+                return result
+            updates[name] = float(raw)
+        if updates:
+            try:
+                self.control.reconfigure(**updates)
+            except ValueError as error:
+                result.successful = False
+                result.reason = str(error)
+        return result
+
+    def _set_wrench_estimation(self, request, response):
+        result = self.set_parameters([Parameter('wrench_estimation_enabled', value=request.data)])[0]
+        response.success = result.successful
+        response.message = result.reason or ('Wrench estimation enabled' if request.data else 'Wrench estimation disabled')
+        self._sync_wrench_estimation()
+        self._publish_control_state()
+        return response
+
     def _error(self, error):
         message = str(error)
-        if message != self.last_error:
+        if self._error_key(message) != self._error_key(self.last_error):
             self.get_logger().error(message)
         self.last_error = message
+
+    @staticmethod
+    def _error_key(message):
+        # Ages change every tick during one feedback outage. Preserve the full
+        # diagnostic, but avoid flooding logs and triggering extra telemetry.
+        if message.startswith('Complete fresh joint/gripper/status/enable feedback required:'):
+            return 'feedback_stale'
+        return message
 
     def _teaching(self, message):
         self.teaching_active = message.data
@@ -201,6 +304,13 @@ class DriverNode(Node):
                 gravity_model=updated.gravity_model(self.arm_config),
                 friction_scale=self.arm_config.friction_scale,
                 friction_model=updated.friction_model(self.arm_config),
+                friction_error_epsilon=self.arm_config.friction_error_epsilon,
+                friction_velocity_epsilon=self.arm_config.friction_velocity_epsilon,
+                target_velocity_cutoff_hz=self.arm_config.target_velocity_cutoff_hz,
+                s_a=self.arm_config.s_a,
+                adaptive_stiffness_b=self.arm_config.adaptive_stiffness_b,
+                adaptive_stiffness_power=self.arm_config.adaptive_stiffness_power,
+                offset_ramp_s=self.arm_config.offset_ramp_s,
                 update_models=True,
             )
             self.last_error = ''
@@ -374,13 +484,19 @@ class DriverNode(Node):
                 0.0 if sample is None else float(getattr(sample, 'gripper_force', 0.0))
             ),
             'output_torque': list(self.control.output_torque),
-            'inertia_torque': list(self.control.inertia_torque),
-            'external_torque': list(self.control.external_torque),
-            'end_wrench': list(self.control.end_wrench),
-            'end_force': list(self.control.end_force),
-            'end_torque': list(self.control.end_torque),
+            'applied_kp': list(self.control.applied_kp),
+            'applied_kd': list(self.control.applied_kd),
+            'wrench_estimation_enabled': self.wrench_estimation_enabled,
+            'wrench_estimate_available': self.wrench_estimate_available,
+            'inertia_torque': list(self.control.inertia_torque) if self.wrench_estimate_available else None,
+            'external_torque': list(self.control.external_torque) if self.wrench_estimate_available else None,
+            'end_wrench': list(self.control.end_wrench) if self.wrench_estimate_available else None,
+            'end_force': list(self.control.end_force) if self.wrench_estimate_available else None,
+            'end_torque': list(self.control.end_torque) if self.wrench_estimate_available else None,
             'gravity_scale_applied': self.control.gravity_scale_applied,
             'friction_scale_applied': self.control.friction_scale_applied,
+            's_a_applied': self.control.adaptive_stiffness_scale_applied,
+            'adaptive_stiffness_scale_applied': self.control.adaptive_stiffness_scale_applied,
             'holding': bool(self.control.hold_reason),
             'hold_reason': self.control.hold_reason,
             'calibration_active': self.calibration_active,
@@ -480,12 +596,15 @@ class DriverNode(Node):
 
     def _publish(self):
         now = time.monotonic()
+        estimate = self._sync_wrench_estimation()
         self._loop_rate.mark(now)
         if self.teaching_active and now - self.teaching_received > 0.3:
             self.teaching_active = False
             self.get_logger().error('Teaching heartbeat expired')
         try:
-            sample = self.control.watchdog()
+            sample = self.control.watchdog(compute_wrench=estimate)
+            if estimate and self.control.mode == 'mit' and self.control.mit_ready:
+                self._wrench_estimate_ready = True
             if 'retaining last MIT output' in self.last_error:
                 self.last_error = ''
         except (ValueError, RuntimeError, CanError) as error:
@@ -502,7 +621,9 @@ class DriverNode(Node):
             self.control.mode,
             self.control.mit_ready,
             bool(self.control.hold_reason),
-            self.last_error,
+            self._error_key(self.last_error),
+            self.wrench_estimation_enabled,
+            self.wrench_estimate_available,
             bool(self.control.debug_session),
             self.calibration_active,
             sample.enabled,
@@ -565,7 +686,7 @@ class DriverNode(Node):
             p_msg.pose.orientation.w = float(cx * cy * cz + sx * sy * sz)
             self.pose_pub.publish(p_msg)
             self._pose_pub_rate.mark(now)
-        if (self.control.mode == 'mit' and self.control.mit_ready
+        if (self.wrench_estimate_available
                 and sample.position is not None and fresh(sample.age[:3])):
             wrench_msg = self._wrench_msg
             wrench_msg.header.stamp = stamp

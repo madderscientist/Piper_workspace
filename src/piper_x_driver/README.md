@@ -6,7 +6,7 @@
 
 因此，本工程以硬件 `200 Hz` 上限为基准，采用 **200 Hz（驱动 + 示教）/ 50 Hz（上层控制与状态汇总）分层控制架构**：
 
-- **200 Hz 底层驱动层（`rate_hz=200.0`，周期 `5 ms`）**：1:1 对齐固件 200 Hz CAN 反馈，每周期完成 MIT 看门狗、重力补偿 $g(q)$、关节与夹爪摩擦力补偿 $f(q, \dot{q})$、末端六维力螺旋估计、CAN MIT 帧下发，并以 **200 Hz** 发布 `joint_states_feedback` 与 `end_wrench_stamped`。
+- **200 Hz 底层驱动层（`rate_hz=200.0`，周期 `5 ms`）**：1:1 对齐固件 200 Hz CAN 反馈，每周期完成 MIT 看门狗、重力补偿 $g(q)$、关节与夹爪摩擦力补偿 $f(q, \dot{q})$、CAN MIT 帧下发，并以 **200 Hz** 发布 `joint_states_feedback`；关节末端力估计默认关闭，启用后同频计算并发布 `end_wrench_stamped`。
 - **200 Hz 示教耦合层（`piper_teaching`，`rate_hz=200.0`，周期 `5 ms`）**：主从/双向示教节点与驱动同频运行，以 **200 Hz** 订阅关节反馈并发送 `command/mit`、`command/gripper` 与参考轨迹 `target`。
 - **50 Hz 上层控制与状态汇总（周期 `20 ms`）**：驱动以 **50 Hz** 发布 `control_state` JSON（含各层实时频率 `rates`）、`arm_status` 与 `end_pose_stamped`；上层策略/规划节点以 **50 Hz** 发送目标时，驱动在相邻两帧目标之间仍以 **200 Hz** 紧跟实测反馈高频刷新重力与摩擦力补偿。
 
@@ -16,7 +16,7 @@
 |---|---|---|
 | [`backend.py`](piper_x_driver/backend.py) | `SdkArm`, `Feedback`, `MitTarget`, `fresh` | **唯一接触 `pyAgxArm` 与 SocketCAN 的边界层**。负责固件版本校验（`S-V1.9-0/1`）、11 段 CAN 报文时效追踪、夹爪 `30 ms` 滑窗速度估计、200 Hz 夹爪指令插值线程、原生零力拖动（`Leader`）切换，以及关节侧 `kp/kd` 减速比折算（`MIT_GAIN_SCALE`）与 12-bit `kp` 量化重力残差校准。 |
 | [`controller.py`](piper_x_driver/controller.py) | `Controller`, `RateMeter` | **与 ROS 及 CAN 传输解耦的控制状态机与动力学律层**。管理模式状态（`standby/joint/point/linear/mit/drag/hold`）、200 Hz MIT 看门狗（`watchdog`）、MIT 调试会话（`debug_start/update/stop`）、重力补偿两级守恒分配、关节与夹爪摩擦力补偿、一阶滤波角加速度 $\ddot{q}$、惯性力矩 $I(q)\ddot{q}$、六轴外力矩 $\hat{\tau}_{\text{ext}}$ 与末端六维力螺旋 $\hat{\mathcal{F}}$ 估计。 |
-| [`node.py`](piper_x_driver/node.py) | `DriverNode`, `main`, `power_off_main` | **ROS 2 适配层**。将 `Controller` 与 `FleetConfig` 映射为单臂命名空间下的 5 个反馈话题、4 个命令话题和 5 个服务；以 200 Hz 发布关节与末端六维力，以 50 Hz 汇总发布状态、位姿与 JSON `control_state`（含各层实时频率 `rates`）。 |
+| [`node.py`](piper_x_driver/node.py) | `DriverNode`, `main`, `power_off_main` | **ROS 2 适配层**。将 `Controller` 与 `FleetConfig` 映射为单臂命名空间下的反馈话题、命令话题和服务；以 200 Hz 发布关节及按需启用的末端六维力，以 50 Hz 汇总发布状态、位姿与 JSON `control_state`（含各层实时频率 `rates`）。 |
 | [`configuration.py`](piper_x_driver/configuration.py) | `FleetConfig`, `ArmConfig`, `Effector` | **四臂共享配置管理**。严格校验 [`config/arms.yaml`](config/arms.yaml)，加载各臂标定的重力/摩擦模型 YAML，并通过 `.yaml.lock` 文件锁 + 临时文件原子替换（`os.replace`）持久化运行时配置修改。 |
 | [`gravity.py`](piper_x_driver/gravity.py) | `ArmGravityModel`, `gravity_torques`, `joint_inertias`, `geometric_jacobian`, `end_effector_wrench`, `max_critical_kd` | **运动学、重力/惯量与末端六维力求解器**。采用纯标量快速正运动学 `_fast_fk` 计算静态重力矩、随姿态变化的对角连杆惯量、临界阻尼包络、夹爪局部系/基座系 $6\times 6$ 几何雅可比矩阵及阻尼转置伪逆六维力。 |
 | [`friction.py`](piper_x_driver/friction.py) | `ArmFrictionModel`, `JointFrictionModel`, `GripperFrictionModel`, `SpatialHarmonic` | **关节与夹爪摩擦力模型**。对旋转关节 J1..J6 提供 Stribeck + 空间谐波（齿槽 `a,b` + 啮合调制 `c,d`）零速门控补偿；对夹爪/示教手柄提供非周期开度网格插值剖面与串级反演补偿。 |
@@ -54,7 +54,7 @@ ros2 launch piper_x_driver power_off.launch.py
 |---|---|---|---|
 | **电机驱动板硬件环** | **`> 10 kHz`** | 驱动器硬件内部闭环 | 电机侧高频执行 $K_p(p_{\text{des}} - q) + K_d(v_{\text{des}} - \dot{q}) + t_{\text{ff}}$ |
 | **CAN 硬件状态上报** | **`200 Hz`** (`5 ms`) | 固件固定（`can_rx_hz`） | `0x2A5..0x2A7` 六轴角度、`0x251..0x256` 转速/电流、`0x2A8` 夹爪、`0x2A1` 状态、`0x2A2..0x2A4` 位姿（`0x261..0x266` 驱动状态约 `40 Hz`） |
-| **底层驱动内环与高频遥测** (`piper_x_driver`) | **`200 Hz`** (`5 ms`) | `rate_hz:=200.0`<br/>`telemetry_hz:=200.0` | 重力补偿 $g(q)$、关节/夹爪摩擦补偿 $f(q,\dot{q})$、末端六维力估计、CAN MIT 下发（`0x15A..0x15F`），以及发布 `joint_states_feedback` 与 `end_wrench_stamped` |
+| **底层驱动内环与高频遥测** (`piper_x_driver`) | **`200 Hz`** (`5 ms`) | `rate_hz:=200.0`<br/>`telemetry_hz:=200.0` | 重力补偿 $g(q)$、关节/夹爪摩擦补偿 $f(q,\dot{q})$、按需启用的末端六维力估计、CAN MIT 下发（`0x15A..0x15F`），以及发布 `joint_states_feedback`（启用估计后发布 `end_wrench_stamped`） |
 | **四臂示教耦合层** (`piper_teaching`) | **`200 Hz`** (`5 ms`) | `rate_hz:=200.0` | 与驱动 1:1 同频订阅 `joint_states_feedback`，解算并下发 `command/mit`、`command/gripper` 与 `/bilateral_teaching/arm_{1..4}/target` |
 | **上层控制与状态汇总层** | **`50 Hz`** (`20 ms`) | 驱动内置节流 / 上层节点 | 驱动以 **50 Hz**（及状态跳变时立即）发布 `control_state` JSON（含 `rates` 实时频率字典）、`arm_status` 与 `end_pose_stamped`；上层算法以 **50 Hz** 发送目标时，驱动在每两帧目标之间仍以 **200 Hz** 紧跟实测反馈实时更新重力与摩擦补偿 |
 
@@ -166,6 +166,14 @@ $$
 
 每轮控制周期，驱动读取当前六轴实测关节角 $q_{1..6}$ 与实测角速度 $\dot{q}_{1..6}$，调用 `ArmFrictionModel.torques(q, dq)` 计算六轴摩擦力矩 $f_i(q_i, \dot{q}_i)$（含 Stribeck 干摩擦、粘滞阻尼、方向相关的周期性啮合摩擦调制 $\tau_{\text{mod}}$ 以及方向无关的齿槽转矩 $\tau_{\text{cog}}$）。
 
+- **静摩擦死区克服（Breakaway Stiction Feedforward）**：
+  针对位置跟踪时的静摩擦死区 $2\tau_f / k_p$，以跟踪位置误差 $e_i = q_{\text{cmd}, i} - q_i$ 为主、阶梯保持时长还原的目标速度 $\dot{q}_{\text{target}, i}$ 为辅构造平滑破静驱动：
+  $$\tau_{\text{stiction}, i} = \max\!\bigl(0,\ \mu_i |G_i| + \tau_{0, i} + \tau_{\text{mod}, i}(q_i)\bigr)\tanh\!\left(\frac{e_i}{\varepsilon_e} + \frac{\dot{q}_{\text{target}, i}}{\varepsilon_v}\right)$$
+  当关节静止（$\dot{q}_i = 0$）但滞后于目标时输出平滑破静力矩，随 $|\dot{q}_i|$ 增长经 $\tanh(|\dot{q}_i| / v_{0,i})$ 平滑过渡到运动态 Stribeck + 齿槽补偿；当关节已到位（$e_i = 0, \dot{q}_{\text{target}, i} = 0$）或处于零刚度自由拖动（$k_{p,i}=0$）时严格为 $0$。
+- **误差自适应刚度（Adaptive Stiffness）**：
+  通过无量纲归一化幂律在小误差精细跟踪区提高刚度、大误差处平滑退回标称 $k_{p,i}$，阻尼按 $\sqrt{\cdot}$ 同步缩放以保持阻尼比恒定：
+  $$k_{p, i}' = k_{p, i}\left(1 + \frac{s_a}{(|e_i| / b)^p + 1}\right), \qquad k_{d, i}' = k_{d, i}\sqrt{\frac{k_{p, i}'}{k_{p, i}}}$$
+  每次周期均从指令标称增益起算（不复乘发散），且重力折合 $\Delta p_i = g_i / k_{p, i}'$ 与末端力估计均使用实际下发的 $k_{p, i}'$。可通过 `arms.yaml` 或 `ros2 param set` 运行时在线调节 `adaptive_stiffness_scale`（$s_a$，默认 `0.0`）、`adaptive_stiffness_b`（默认 `0.08 rad`）、`adaptive_stiffness_power`（默认 `3.0`）以及 `friction_error_epsilon`（默认 `0.05 rad`）、`friction_velocity_epsilon`（默认 `0.02 rad/s`）。
 - **完整数学公式、物理推导与标定流程**：详见 [`piper_friction` README](../piper_friction/README.md#12-总摩擦力矩公式全景拆解)。
 
 ### 4.2 作用通道（直接叠加至 `t_ff`）
@@ -187,7 +195,9 @@ $$
 
 ## 5. 末端六轴力与力矩估计
 
-驱动在每个 200 Hz MIT 周期内同步估计**作用在机械臂上的六轴外力矩**与**夹爪局部坐标系下的末端六维力螺旋（三维力 + 三维力矩）**：
+四臂启动时可用 `wrench_estimation_enabled:=true` 显式开启全部臂；运行中可调用 `/arm_4/set_wrench_estimation`（`std_srvs/srv/SetBool`），或设置对应节点的同名 ROS 参数。Insert 控制台根据选中的力来源自动开关所选臂的估计。重力与对角惯量使用完整数值输入缓存，不对关节角取整；姿态或末端模型改变时重新计算。
+
+关节末端力估计默认关闭（ROS 参数 `wrench_estimation_enabled=false`），重力与摩擦补偿照常执行。开启后，驱动在每个 200 Hz MIT 周期内同步估计**作用在机械臂上的六轴外力矩**与**夹爪局部坐标系下的末端六维力螺旋（三维力 + 三维力矩）**：
 
 1. **夹爪局部坐标系定义（`frame='gripper'`）**：
    原点位于法兰/夹爪基准点，采用右手正交系（$\hat{x} \times \hat{y} = \hat{z}$）：
@@ -223,7 +233,7 @@ $$
 | 相对话题名 | 消息类型 | 发布条件与内容 |
 |---|---|---|
 | `joint_states_feedback` | `sensor_msgs/msg/JointState` | **200 Hz**：`name` 固定为 `joint1..joint6, gripper`；`position[7]` 为六轴 `rad` + 夹爪开度 `m`（来自 `0x2A5..0x2A8`，任一超过 `1.0 s` 则整帧不发）；高速反馈 `0x251..0x256` 均新鲜时附带 6 轴 `velocity`（`rad/s`）与 `effort`（电流估计力矩 `Nm`） |
-| `end_wrench_stamped` | `geometry_msgs/msg/WrenchStamped` | **200 Hz**：`header.frame_id = gripper`（夹爪局部系：`+X` 左、`+Y` 上、`+Z` 前），在 `mode == 'mit'` 且 `mit_ready` 且关节位置新鲜时发布作用在夹爪上的三维外力 `wrench.force.{x,y,z}`（`N`）与三维外力矩 `wrench.torque.{x,y,z}`（`Nm`） |
+| `end_wrench_stamped` | `geometry_msgs/msg/WrenchStamped` | **200 Hz**：`header.frame_id = gripper`（夹爪局部系：`+X` 左、`+Y` 上、`+Z` 前），在估计启用、`mode == 'mit'`、`mit_ready`、未保留过期输出且关节位置新鲜时发布作用在夹爪上的三维外力 `wrench.force.{x,y,z}`（`N`）与三维外力矩 `wrench.torque.{x,y,z}`（`Nm`） |
 | `arm_status` | `piper_x_interfaces/msg/ArmStatus` | **50 Hz**（及状态跳变时立即）：来自 `0x2A1` 的 `ctrl_mode/arm_status/mode_feedback/teach_status/motion_status/trajectory_num/err_code`、六轴限位与通信异常位、`motor_enabled[6]` / `motor_enable_valid[6]`、`gripper_enabled` / `gripper_valid`、11 段 CAN 报文时效 `feedback_age[11]`（索引 `0..2` 为 `0x2A5..2A7`，`3` 为 `0x2A8` 夹爪，`4` 为 `0x2A1` 状态，`5..10` 为 `0x261..266` 驱动器，单位 `s`，缺失为 `-1`）、`teaching_active`、`last_error` |
 | `end_pose_stamped` | `geometry_msgs/msg/PoseStamped` | **50 Hz**：`header.frame_id = base_link`，来自 `0x2A2..0x2A4` 的基座到法兰末端位置（`m`）与四元数姿态 |
 | `control_state` | `std_msgs/msg/String` (JSON) | **50 Hz**（及状态跳变时立即）：主机控制、补偿、力估计与各层实时频率字典（完整键名见下表） |
@@ -239,6 +249,7 @@ $$
 | `gravity_torque`, `friction_torque` | 当前 6 轴重力补偿力矩 $g_i(q)$ 与旋转关节摩擦补偿力矩 $f_i(q,\dot{q})$（`Nm`） |
 | `gripper_friction`, `gripper_velocity`, `gripper_force` | 夹爪非周期摩擦与偏置补偿力（`N`）、`30 ms` 滑窗实测开合速度（`m/s`）、`0x2A8` 实测力 |
 | `output_torque` | 实际随 MIT 帧提交给 SDK 的 6 轴前馈力矩 $t_{\text{ff}, i} = \tau_{\text{cmd}, i} + r_{1,i} + f_i$（`Nm`） |
+| `wrench_estimation_enabled`, `wrench_estimate_available` | 估计开关及当前估计是否有效；关闭或暂不可用时，下列估计字段为 `null`，不发布 `end_wrench_stamped` |
 | `inertia_torque`, `external_torque` | 6 轴连杆惯性力矩 $I_i(q)\ddot{q}_i$ 与受载外力矩估计 $\hat{\tau}_{\text{ext}, i}$（`Nm`） |
 | `end_wrench`, `end_force`, `end_torque` | 夹爪局部系（`+X` 左、`+Y` 上、`+Z` 前）下的末端六维外力螺旋 `[fx, fy, fz, tx, ty, tz]`、三维力 `[fx, fy, fz]`（`N`）、三维力矩 `[tx, ty, tz]`（`Nm`） |
 | `gravity_scale_applied`, `friction_scale_applied` | 按最大 `1.0/s` 斜率渐变后的当前生效重力/摩擦补偿比例（`0..1`） |
@@ -261,6 +272,7 @@ $$
 | 相对服务名 | 服务类型 | 请求字段 | 返回与语义说明 |
 |---|---|---|---|
 | `enable_srv` | [`Enable`](../piper_x_interfaces/srv/Enable.srv) | `bool enable_request` | `enable_response=true` 表示在 `3.0 s` 内收到了请求之后的新鲜使能位确认（`true` 使能六关节并保持夹爪零力释放；`false` 七轴全失能，不要求先有正常反馈） |
+| `set_wrench_estimation` | `std_srvs/srv/SetBool` | `bool data` | 按臂启停关节末端力估计，只影响计算与发布；关闭时清除估计历史，不改变使能、模式或控制目标 |
 | `set_mode` | [`SetMode`](../piper_x_interfaces/srv/SetMode.srv) | `string mode` | 发送模式切换请求（不阻塞等待固件到位）：<br/>• `standby`：`0x151.ctrl_mode=0` 待机（不等于失能）<br/>• `joint`：`0x151` J 模式（期望 `ctrl_mode=1, mode_feedback=1`）<br/>• `point`：`0x151` P 模式（期望 `ctrl_mode=1, mode_feedback=0`）<br/>• `linear`：`0x151` L 模式（期望 `ctrl_mode=1, mode_feedback=2`）<br/>• `mit`：预装六轴 MIT 目标后发 `0x151` MIT（期望 `ctrl_mode=1, mode_feedback=6`；若无外部预装目标则自动以实测位置预装重力补偿目标）<br/>• `drag`：固件原生零力拖动（`0x470: 0xFA` + `0x191: mode=0`）<br/>• `hold`：结束原生拖动记录请求（`0x150.B2=2`） |
 | `configure_arm` | [`ConfigureArm`](../piper_x_interfaces/srv/ConfigureArm.srv) | `string end_effector`, `float64 gravity_scale`, `float64 friction_scale` | 原子保存并应用末端键（`teaching_handle` / `gripper` / `gripper_with_wrench`，切换末端需七轴失能且非 MIT/示教）、`gravity_scale`（`0..1`）与 `friction_scale`（`0..1` 持久化写盘；`-1.0` 保持原值；`< -1.0` 按 `-(2.0 + s)` 临时覆盖内存摩擦比例供标定使用而不写盘） |
 | `debug_mit` | [`DebugMit`](../piper_x_interfaces/srv/DebugMit.srv) | `string action`, `string session`, `float64[6] position` | 调试台专用 MIT 会话：<br/>• `start`：以实测六轴角度初始化并返回新 `session`（旧会话超过 `0.3 s` 过期时允许直接接管）<br/>• `target`：携带同一 `session` 更新 6 轴目标角并刷新 `0.3 s` 心跳<br/>• `stop`：退出调试会话并保持在 MIT 重力补偿模式 |

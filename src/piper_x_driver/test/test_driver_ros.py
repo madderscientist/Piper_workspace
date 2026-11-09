@@ -1,5 +1,6 @@
 import json
 import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import String
+from std_srvs.srv import SetBool
 
 
 def spin_until(executor, predicate, timeout=4):
@@ -19,6 +21,22 @@ def spin_until(executor, predicate, timeout=4):
     while not predicate() and time.monotonic() < deadline:
         executor.spin_once(timeout_sec=0.01)
     assert predicate()
+
+
+def test_feedback_outage_logs_once_and_keeps_latest_diagnostic():
+    logs = []
+    node = SimpleNamespace(
+        last_error='', _error_key=DriverNode._error_key,
+        get_logger=lambda: SimpleNamespace(error=logs.append),
+    )
+    prefix = 'Complete fresh joint/gripper/status/enable feedback required: '
+    for age in (1100, 1200, 1500):
+        DriverNode._error(node, ValueError(f'{prefix}driver6(0x266) age={age} ms'))
+    assert len(logs) == 1
+    assert '1500 ms' in node.last_error
+    node.last_error = ''
+    DriverNode._error(node, ValueError(f'{prefix}driver6(0x266) age=1100 ms'))
+    assert len(logs) == 2
 
 
 @pytest.mark.usefixtures('fake_arm')
@@ -38,10 +56,21 @@ def test_driver_real_ros_services_commands_and_telemetry():
         String, 'control_state', lambda msg: ctrl_states.append(json.loads(msg.data)), 10,
     )
     power = client.create_client(Enable, 'enable_srv')
+    estimation = client.create_client(SetBool, 'set_wrench_estimation')
     mode = client.create_client(SetMode, 'set_mode')
     publisher = client.create_publisher(JointCommand, 'command/joints', 1)
     try:
         spin_until(executor, lambda: power.service_is_ready() and mode.service_is_ready())
+        spin_until(executor, lambda: bool(ctrl_states) and estimation.service_is_ready())
+        assert driver.wrench_estimation_enabled is False
+        assert not wrenches and ctrl_states[-1]['end_wrench'] is None
+        with patch.object(driver.control, '_update_wrench_estimate', wraps=driver.control._update_wrench_estimate) as estimate:
+            driver._publish()
+            assert estimate.call_count == 0
+        future = estimation.call_async(SetBool.Request(data=True))
+        spin_until(executor, future.done)
+        assert future.result().success
+        spin_until(executor, lambda: bool(wrenches) and any(s['wrench_estimate_available'] for s in ctrl_states))
         future = power.call_async(Enable.Request(enable_request=True))
         spin_until(executor, future.done)
         power_res = future.result()
@@ -59,11 +88,12 @@ def test_driver_real_ros_services_commands_and_telemetry():
         assert all(states[-1].motor_enable_valid)
         assert states[-1].gripper_enabled
         assert wrenches[-1].header.frame_id == 'gripper'
-        assert len(ctrl_states[-1]['end_wrench']) == 6
-        assert len(ctrl_states[-1]['end_force']) == 3
-        assert len(ctrl_states[-1]['end_torque']) == 3
-        assert len(ctrl_states[-1]['external_torque']) == 6
-        assert len(ctrl_states[-1]['inertia_torque']) == 6
+        valid_estimate = next(s for s in ctrl_states if s['wrench_estimate_available'])
+        assert len(valid_estimate['end_wrench']) == 6
+        assert len(valid_estimate['end_force']) == 3
+        assert len(valid_estimate['end_torque']) == 3
+        assert len(valid_estimate['external_torque']) == 6
+        assert len(valid_estimate['inertia_torque']) == 6
         assert driver.rate_hz == 200.0
         assert driver.telemetry_hz == 200.0
         rates = ctrl_states[-1]['rates']
@@ -75,6 +105,14 @@ def test_driver_real_ros_services_commands_and_telemetry():
             'pose_pub_hz', 'status_pub_hz', 'control_pub_hz',
         ):
             assert key in rates
+        before = len(driver.arm.calls)
+        future = estimation.call_async(SetBool.Request(data=False))
+        spin_until(executor, future.done)
+        assert future.result().success
+        assert driver.wrench_estimation_enabled is False
+        spin_until(executor, lambda: ctrl_states[-1]['wrench_estimation_enabled'] is False)
+        assert ctrl_states[-1]['end_wrench'] is None
+        assert all(c[0] not in ('power', 'mode') for c in driver.arm.calls[before:])
     finally:
         client.destroy_subscription(subscription)
         client.destroy_subscription(wrench_sub)
@@ -98,8 +136,8 @@ def test_driver_has_only_can_backend_and_never_acts_on_startup(fake_arm):
         assert all(driver.arm.enabled)
         assert [call[0] for call in driver.arm.calls] == ['power', 'mit', 'mode']
         mit_cmd = driver.arm.calls[1][1]
-        assert mit_cmd.kp == driver.control.debug_kp
-        assert mit_cmd.kd == driver.control.debug_kd
+        assert mit_cmd.kp == driver.control.kp
+        assert mit_cmd.kd == driver.control.kd
         profile = driver.fleet.effectors[driver.arm_config.end_effector]
         pose = (0.0, 0.5, -0.5, 0.0, 0.0, 0.0)
         expected_g = (
@@ -108,7 +146,7 @@ def test_driver_has_only_can_backend_and_never_acts_on_startup(fake_arm):
             else driver.control.gravity_model.torques(pose, profile.mass_kg, profile.com_m)
         )
         assert mit_cmd.position == pytest.approx([
-            q + g / kp for q, g, kp in zip(pose, expected_g, driver.control.debug_kp)
+            q + g / kp for q, g, kp in zip(pose, expected_g, driver.control.kp)
         ])
         assert 'simulated' not in ArmStatus.get_fields_and_field_types()
     finally:

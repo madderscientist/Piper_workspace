@@ -7,20 +7,21 @@ arms:
   end_effector: teaching_handle
   gravity_scale: 1.0
   mounting: upright
-  debug_kp:
+  kp:
+  - 20.0
+  - 18.0
   - 15.0
-  - 15.0
-  - 15.0
-  - 3.0
-  - 2.0
-  - 2.0
-  debug_kd:
-  - 4.62
-  - 4.65
-  - 2.25
-  - 0.3
-  - 0.24
-  - 0.06
+  - 6.0
+  - 5.0
+  - 4.0
+  kd:
+  - 5.34
+  - 5.24
+  - 2.39
+  - 0.43
+  - 0.39
+  - 0.09
+  s_a: 2.0
   friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_1_gravity.yaml
@@ -31,20 +32,21 @@ arms:
   end_effector: teaching_handle
   gravity_scale: 1.0
   mounting: upright
-  debug_kp:
+  kp:
+  - 20.0
+  - 18.0
   - 15.0
-  - 15.0
-  - 15.0
-  - 3.0
-  - 2.0
-  - 2.0
-  debug_kd:
-  - 4.62
-  - 4.65
-  - 2.25
-  - 0.3
-  - 0.24
-  - 0.06
+  - 6.0
+  - 5.0
+  - 4.0
+  kd:
+  - 5.34
+  - 5.31
+  - 2.36
+  - 0.43
+  - 0.39
+  - 0.09
+  s_a: 2.0
   friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_2_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_2_gravity.yaml
@@ -55,20 +57,21 @@ arms:
   end_effector: gripper_with_wrench
   gravity_scale: 1.0
   mounting: upright
-  debug_kp:
+  kp:
+  - 20.0
+  - 18.0
   - 15.0
-  - 15.0
-  - 15.0
-  - 3.0
-  - 2.0
-  - 2.0
-  debug_kd:
-  - 4.56
-  - 4.6
-  - 2.22
-  - 0.29
-  - 0.24
-  - 0.05
+  - 6.0
+  - 5.0
+  - 4.0
+  kd:
+  - 6.49
+  - 6.43
+  - 3.16
+  - 0.65
+  - 0.4
+  - 0.09
+  s_a: 2.0
   friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_3_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_3_gravity.yaml
@@ -79,20 +82,21 @@ arms:
   end_effector: gripper_with_wrench
   gravity_scale: 1.0
   mounting: upright
-  debug_kp:
+  kp:
+  - 20.0
+  - 18.0
   - 15.0
-  - 15.0
-  - 15.0
-  - 3.0
-  - 2.0
-  - 2.0
-  debug_kd:
-  - 4.56
-  - 4.6
-  - 2.22
-  - 0.29
-  - 0.24
-  - 0.05
+  - 6.0
+  - 5.0
+  - 4.0
+  kd:
+  - 6.52
+  - 6.47
+  - 3.2
+  - 0.65
+  - 0.4
+  - 0.09
+  s_a: 2.0
   friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_4_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_4_gravity.yaml

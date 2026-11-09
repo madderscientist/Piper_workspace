@@ -466,6 +466,113 @@ def test_controller_applies_configured_friction_compensation_in_mit(fake_arm):
     assert arm.calls[-1][1].torque[0] == pytest.approx(0.0)
 
 
+def test_stiction_breakaway_and_adaptive_stiffness_match_g1_laws(fake_arm):
+    from piper_x_driver.controller import adaptive_stiffness_scale
+    from piper_x_driver.friction import ArmFrictionModel, JointFrictionModel
+    from piper_x_driver.gravity import ArmGravityModel, JointGravityModel, gravity_torques
+
+    # 1. Adaptive stiffness law: intercept 1+scale at 0, half-extra at b, never <1, kd ~ sqrt(scale)
+    assert adaptive_stiffness_scale(0.0, scale=2.0, b=0.05, power=1.0) == pytest.approx(3.0)
+    assert adaptive_stiffness_scale(0.05, scale=2.0, b=0.05, power=1.0) == pytest.approx(2.0)
+    assert adaptive_stiffness_scale(0.08, scale=2.0, b=0.08, power=3.0) == pytest.approx(2.0)
+    assert adaptive_stiffness_scale(-0.08, scale=2.0, b=0.08, power=3.0) == pytest.approx(2.0)
+    assert adaptive_stiffness_scale(100.0, scale=2.0, b=0.08, power=3.0) > 1.0
+    assert adaptive_stiffness_scale(100.0, scale=2.0, b=0.08, power=3.0) == pytest.approx(1.0, abs=1e-4)
+
+    # 2. Target velocity step estimator recovers 50 Hz staircase velocity at 200 Hz control rate
+    now = [0.0]
+    arm = fake_arm()
+    j1_fric = JointFrictionModel(
+        fc=0.2, fs=0.4, load_ratio=0.15, error_epsilon=0.05, velocity_epsilon=0.02,
+    )
+    g_model = ArmGravityModel(
+        arm_id='arm_4',
+        joints={1: JointGravityModel(scale=1.0, static_friction=0.4), 2: JointGravityModel(scale=1.0, static_friction=0.5)},
+    )
+    f_model = ArmFrictionModel(arm_id='arm_4', joints={1: j1_fric, 2: j1_fric})
+    control = Controller(
+        arm,
+        clock=lambda: now[0],
+        gravity_model=g_model,
+        friction_model=f_model,
+        adaptive_stiffness_scale=2.0,
+        adaptive_stiffness_b=0.05,
+        adaptive_stiffness_power=2.0,
+        offset_ramp_s=2.0,
+    )
+    control.start_mit()
+    arm.status['ctrl_mode'] = 1
+    arm.status['mode_feedback'] = 6
+    base_q = arm.position[:6]
+
+    # Activation fade-in over offset_ramp_s=2.0s: starts at 1.0x, reaches 1.5x at 0.5s, 2.0x at 1.0s, and settles at 3.0x
+    base_kp = (20.0, 18.0, 15.0, 6.0, 5.0, 4.0)
+    base_kd = (6.0, 6.0, 3.0, 0.6, 0.4, 0.1)
+    assert control.applied_kp == pytest.approx(base_kp)
+    now[0] = 0.5
+    control.mit(target(position=list(base_q), kp=list(base_kp), kd=list(base_kd)))
+    control.watchdog()
+    assert control.applied_kp == pytest.approx(tuple(1.5 * k for k in base_kp))
+    now[0] = 1.0
+    control.mit(target(position=list(base_q), kp=list(base_kp), kd=list(base_kd)))
+    control.watchdog()
+    assert control.applied_kp == pytest.approx(tuple(2.0 * k for k in base_kp))
+    now[0] = 2.0
+    for step in range(1, 20):
+        now[0] = 2.0 + step * 0.005
+        control.mit(target(position=list(base_q), kp=list(base_kp), kd=list(base_kd)))
+        control.watchdog()
+    sent = arm.calls[-1][1]
+    assert control.friction == (0.0,) * 6
+    assert sent.kp == pytest.approx(tuple(3.0 * k for k in base_kp))
+    assert sent.kd == pytest.approx(tuple(math.sqrt(3.0) * d for d in base_kd))
+    expected_g = g_model.torques(base_q)
+    # Gravity offset divides by the adaptive kp' the motor actually receives
+    assert sent.position == pytest.approx([
+        q + g / (3.0 * k) for q, g, k in zip(base_q, expected_g, base_kp)
+    ])
+
+    # Crawling / stuck in stiction deadband (dq_meas == 0, error = +0.10 rad on J2):
+    # gets breakaway push (load_ratio * |G2| + static_friction) * tanh(0.10 / 0.05),
+    # and adaptive kp at |e| = 2*b with power=2 is 1 + 2 / (2^2 + 1) = 1.4x
+    base_snapshot = arm.snapshot
+    arm.snapshot = lambda: replace(base_snapshot(), position=(*base_q, 0.02), velocity=(0.0,) * 6)
+    q_cmd = list(base_q)
+    q_cmd[1] = base_q[1] + 0.10
+    now[0] += 0.1  # > 50 ms hold decay so target_velocity contribution is separated
+    control.mit(target(position=q_cmd, kp=list(base_kp), kd=list(base_kd)))
+    control.watchdog()
+    # Advance past hold decay so only position error drives stiction
+    for _ in range(80):
+        now[0] += 0.005
+        control.mit(target(position=q_cmd, kp=list(base_kp), kd=list(base_kd)))
+        control.watchdog()
+    expected_scale_j2 = 1.0 + 2.0 / ((0.10 / 0.05) ** 2 + 1.0)
+    assert control.applied_kp[1] == pytest.approx(base_kp[1] * expected_scale_j2)
+    assert control.applied_kd[1] == pytest.approx(base_kd[1] * math.sqrt(expected_scale_j2))
+    expected_stiction_j2 = (0.15 * abs(expected_g[1]) + 0.5) * math.tanh(0.10 / 0.05)
+    assert control.friction[1] == pytest.approx(expected_stiction_j2, rel=1e-3)
+
+    # Reversal cancellation: error = +0.05 rad (+1 drive) and target_velocity = -0.02 rad/s (-1 drive) cancel to 0
+    q_rev = list(base_q)
+    q_rev[0] = base_q[0] + 0.05
+    now[0] += 0.005
+    control.mit(target(position=q_rev, velocity=[-0.02, 0.0, 0.0, 0.0, 0.0, 0.0], kp=list(base_kp), kd=list(base_kd)))
+    control.watchdog()
+    assert control.friction[0] == pytest.approx(0.0, abs=1e-9)
+
+    # Staircase target velocity recovery (50 Hz steps sampled at 200 Hz)
+    control._reset_dynamics_state()
+    q_step = list(base_q)
+    control._update_target_velocity(q_step, 0.005)
+    speed = 0.25
+    for tick in range(1, 401):
+        if tick % 4 == 0:
+            q_step[0] += speed * 0.02
+        vel_est = control._update_target_velocity(q_step, 0.005)
+    assert vel_est[0] == pytest.approx(speed, abs=0.005)
+
+
 def test_controller_applies_nonperiodic_gripper_friction_in_active_and_free_drag(fake_arm):
     from piper_x_driver.friction import ArmFrictionModel, GripperFrictionModel
 
@@ -547,6 +654,11 @@ def test_negative_kd_in_mit_command_auto_derives_damping_in_driver(fake_arm, cap
     control.watchdog()
     sent = [call[1] for call in arm.calls if call[0] == 'mit'][-1]
     assert sent.kd == max_critical_kd(kp) == (9.25, 9.31, 4.51, 0.6, 0.49, 0.13)
+    control.mit(target(kp=[-1.0] * 6, kd=[-1.0] * 6))
+    control.watchdog()
+    sent_auto = [call[1] for call in arm.calls if call[0] == 'mit'][-1]
+    assert sent_auto.kp == control.kp
+    assert sent_auto.kd == control.kd
     assert max_critical_kd((15.0, 15.0, 15.0, 3.0, 2.0, 2.0), 'gripper') == (
         4.56, 4.6, 2.22, 0.29, 0.24, 0.05)
     assert damping_main(['--kp', '60', '60', '60', '12', '8', '8']) == 0

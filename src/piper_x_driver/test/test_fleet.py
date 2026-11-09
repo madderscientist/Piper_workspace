@@ -34,6 +34,7 @@ def test_hardware_mapping_and_defaults(fleet_path):
         'gripper_with_wrench', 'gripper_with_wrench']
     assert fleet.effectors['gripper_with_wrench'].model == 'piper_description_with_wrench.urdf'
     assert all(arm.gravity_scale == 1 for arm in fleet.arms)
+    assert all(arm.s_a == 2.0 for arm in fleet.arms)
     assert all(0 < arm.friction_scale <= 1 for arm in fleet.arms)
     assert all(arm.friction_config.endswith(f'{arm.id}_friction.yaml') for arm in fleet.arms)
     assert all(fleet.friction_model(arm) is not None for arm in fleet.arms)
@@ -53,6 +54,7 @@ def test_hardware_mapping_and_defaults(fleet_path):
     ('friction_scale', float('nan')), ('friction_scale', True),
     ('end_effector', 'unknown'), ('mounting', 'sideways'),
     ('can_port', '../can0'), ('namespace', '/bad name'),
+    ('kp', [-1.0] * 6), ('kd', [101.0] * 6), ('s_a', -0.1),
     ('debug_kp', [-1.0] * 6), ('debug_kd', [101.0] * 6),
     ('friction_config', '/nonexistent/friction.yaml'),
 ])
