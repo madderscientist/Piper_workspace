@@ -130,6 +130,8 @@ def test_telemetry_store_freshness_frequency_and_concurrency():
     store = TelemetryStore(list(DEFAULT_NAMESPACES), clock=lambda: now[0])
     initial = store.snapshot()
     assert initial['read_only'] is True and len(initial['arms']) == 4
+    assert initial['arms'][3]['camera_calibration']['camera'] == 'camera_arm_4'
+    assert initial['arms'][3]['camera_calibration']['parent'] == 'gripper_base_top'
     assert all(
         arm['connection'] == 'waiting' and arm['joints'] is None
         and all(s['age_ms'] is None for s in arm['streams'].values())

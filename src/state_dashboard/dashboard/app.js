@@ -503,8 +503,8 @@ function syncStudioInputsFromArm(arm) {
     const deg = arm.joints?.position_deg?.[j];
     if (Number.isFinite(deg)) setStudioJointTargetInputs(j, deg);
     if (velInput) velInput.value = "0.0";
-    if (kpInput) kpInput.value = String(cfg?.debug_kp?.[j] ?? 15.0);
-    if (kdInput) kdInput.value = String(cfg?.debug_kd?.[j] ?? 0.5);
+    if (kpInput) kpInput.value = String(cfg?.kp?.[j] ?? cfg?.debug_kp?.[j] ?? 15.0);
+    if (kdInput) kdInput.value = String(cfg?.kd?.[j] ?? cfg?.debug_kd?.[j] ?? 0.5);
     if (tauInput) tauInput.value = "0.0";
   });
   studioViewer?.update({ghostJoints: null, targetPose: null});
@@ -590,6 +590,12 @@ function initStudio() {
     if (!studioViewer) return;
     studioViewer.showGhost = !studioViewer.showGhost;
     e.currentTarget.classList.toggle("active", studioViewer.showGhost);
+    studioViewer.draw();
+  });
+  document.querySelector("#studio-camera-btn")?.addEventListener("click", e => {
+    if (!studioViewer) return;
+    studioViewer.showCamera = !studioViewer.showCamera;
+    e.currentTarget.classList.toggle("active", studioViewer.showCamera);
     studioViewer.draw();
   });
 
@@ -975,6 +981,41 @@ function renderStudio(snapshot, backendOnline) {
   document.querySelector("#studio-hud-effector").textContent = cfg
     ? `末端：${cfg.effector.label} (${cfg.effector.mass_kg} kg) · 重力系数 ${(arm.control.gravity_scale_applied * 100).toFixed(0)}%`
     : "末端配置：等待驱动配置";
+  const camCalib = arm.camera_calibration || null;
+  const hudCam = document.querySelector("#studio-hud-camera");
+  if (hudCam) {
+    if (camCalib && Array.isArray(camCalib.translation) && Array.isArray(camCalib.rpy)) {
+      const tMm = camCalib.translation.map(v => (v * 1000).toFixed(1));
+      const rDeg = camCalib.rpy.map(v => toDegrees(v).toFixed(1));
+      const intr0 = Array.isArray(camCalib.intrinsics) && camCalib.intrinsics.length ? camCalib.intrinsics[0] : null;
+      const intrText = intr0 ? ` · 内参 ${intr0.width}×${intr0.height} (RMS=${intr0.rms}px, FOV=${intr0.fov_deg?.join("°×")}°)` : "";
+      hudCam.textContent = `腕部相机 ${camCalib.camera} 相对 ${camCalib.parent}：XYZ=[${tMm.join(", ")}] mm · RPY=[${rDeg.join(", ")}]°${intrText}`;
+    } else {
+      hudCam.textContent = "腕部相机：未配置或尚未保存外参";
+    }
+  }
+  const camStampEl = document.querySelector("#studio-cam-calib-stamp");
+  const camBodyEl = document.querySelector("#studio-cam-calib-body");
+  if (camStampEl && camBodyEl) {
+    if (camCalib && Array.isArray(camCalib.translation) && Array.isArray(camCalib.rpy)) {
+      const tMm = camCalib.translation.map(v => (v * 1000).toFixed(2));
+      const rDeg = camCalib.rpy.map(v => toDegrees(v).toFixed(2));
+      const origins = camCalib.mesh_origins || {};
+      const wf = origins.gripper_base_with_flange ? origins.gripper_base_with_flange.map(v => (v * 1000).toFixed(2)).join(", ") : "—";
+      const wof = origins.gripper_base_without_flange ? origins.gripper_base_without_flange.map(v => (v * 1000).toFixed(2)).join(", ") : "—";
+      const l6w = origins.link6_with_wrench ? origins.link6_with_wrench.map(v => (v * 1000).toFixed(2)).join(", ") : "—";
+      const intr0 = Array.isArray(camCalib.intrinsics) && camCalib.intrinsics.length ? camCalib.intrinsics[0] : null;
+      const k = intr0?.camera_matrix || [];
+      camStampEl.textContent = `${camCalib.camera} · ${camCalib.method} (${camCalib.samples} 组, 残差 ${camCalib.residual_mm ?? "—"} mm) · ${camCalib.stamp || ""}`;
+      camBodyEl.innerHTML =
+        `<div><b>外参 (${camCalib.parent} → ${camCalib.camera})</b>：XYZ = [${tMm.join(", ")}] mm · RPY = [${rDeg.join(", ")}]° · Quat = [${(camCalib.rotation || []).map(v => v.toFixed(4)).join(", ")}]</div>` +
+        `<div><b>折算至各原点</b>：gripper_base_without_flange.STL (+52.5mm) = [${wof}] mm · link6 (+92.8mm 含力传感器) = [${l6w}] mm · gripper_base.STL (+63.0mm) = [${wf}] mm</div>` +
+        (intr0 ? `<div><b>内参 (${intr0.width}×${intr0.height})</b>：fx=${Number(k[0]).toFixed(2)}, fy=${Number(k[4]).toFixed(2)}, cx=${Number(k[2]).toFixed(2)}, cy=${Number(k[5]).toFixed(2)} · RMS=${intr0.rms} px · FOV=${(intr0.fov_deg || []).join("°×")}°</div>` : "");
+    } else {
+      camStampEl.textContent = "未标定";
+      camBodyEl.textContent = "当前机械臂暂无已保存的腕部相机标定结果。";
+    }
+  }
 
   if (studioViewer) {
     const qRad = arm.joints?.position_deg?.map(v => Number.isFinite(v) ? toRadians(v) : 0) || [0, 0, 0, 0, 0, 0];
@@ -985,7 +1026,8 @@ function renderStudio(snapshot, backendOnline) {
       targetPose: studioTargetPose,
       wrench: wrenchArr,
       gripper: arm.joints?.gripper_m ?? 0.02,
-      effector: cfg?.end_effector || (studioIndex < 2 ? "teaching_handle" : "gripper"),
+      effector: cfg?.end_effector || (studioIndex < 2 ? "teaching_handle" : "gripper_with_wrench"),
+      cameraCalib: camCalib,
     });
   }
   const trackingActive = window.PiperControls.isMitTracking(studioIndex);

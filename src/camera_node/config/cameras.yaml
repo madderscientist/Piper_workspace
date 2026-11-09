@@ -1,0 +1,66 @@
+# PiPER-X 腕部相机驱动配置：维护相机名称、所属机械臂、别名（aliases）与 IP / RTSP 的对应关系。
+# 仅 arm_3 (192.168.123.97) 与 arm_4 (192.168.123.98) 装有腕部相机。
+#
+# 启动方式：
+#   - 同时启动双臂相机：ros2 launch camera_node camera.launch.py
+#   - 只启动单个臂相机：ros2 launch camera_node camera.launch.py arm:=arm_3
+#   - 按别名或 IP 启动：ros2 launch camera_node camera.launch.py camera:=arm4_camera
+
+version: 1
+defaults:
+  rtsp_user: admin
+  rtsp_password: "123456"
+  default_stream: stream1
+  image_width: 0
+  image_height: 0
+  fps: 0
+  jpeg_quality: 60
+
+cameras:
+  camera_arm_3:
+    arm: arm_3
+    label: 机械臂 3 腕部相机
+    ip: 192.168.123.97
+    rtsp_url: rtsp://admin:123456@192.168.123.97/stream1
+    stream0_url: rtsp://admin:123456@192.168.123.97/stream0
+    stream1_url: rtsp://admin:123456@192.168.123.97/stream1
+    image_topic: /camera_arm_3/image_raw
+    camera_info_topic: /camera_arm_3/camera_info
+    frame_id: camera_arm_3
+    server_port: 0
+    aliases:
+      - camera_arm_3
+      - arm_3_camera
+      - arm3_camera
+      - camera_arm3
+      - camera_3
+      - cam3
+      - arm_3
+      - arm3
+      - /arm_3
+      - "3"
+      - 192.168.123.97
+
+  camera_arm_4:
+    arm: arm_4
+    label: 机械臂 4 腕部相机
+    ip: 192.168.123.98
+    rtsp_url: rtsp://admin:123456@192.168.123.98/stream1
+    stream0_url: rtsp://admin:123456@192.168.123.98/stream0
+    stream1_url: rtsp://admin:123456@192.168.123.98/stream1
+    image_topic: /camera_arm_4/image_raw
+    camera_info_topic: /camera_arm_4/camera_info
+    frame_id: camera_arm_4
+    server_port: 0
+    aliases:
+      - camera_arm_4
+      - arm_4_camera
+      - arm4_camera
+      - camera_arm4
+      - camera_4
+      - cam4
+      - arm_4
+      - arm4
+      - /arm_4
+      - "4"
+      - 192.168.123.98

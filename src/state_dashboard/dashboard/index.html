@@ -67,6 +67,7 @@
             <div class="hud-line" id="studio-hud-pose">法兰 XYZ / RPY：—</div>
             <div class="hud-line" id="studio-hud-wrench">末端受载 F / M：—</div>
             <div class="hud-line" id="studio-hud-effector">末端模型：—</div>
+            <div class="hud-line" id="studio-hud-camera">腕部相机：—</div>
           </div>
           <div class="studio-cam-bar">
             <button type="button" data-cam="iso">等轴测</button>
@@ -75,6 +76,7 @@
             <button type="button" data-cam="top">俯视</button>
             <button type="button" id="studio-wireframe-btn">线框/实体</button>
             <button type="button" id="studio-ghost-btn" class="active">目标虚影</button>
+            <button type="button" id="studio-camera-btn" class="active">相机视锥</button>
           </div>
         </div>
         <div class="studio-viewport-wrench" aria-label="末端六维力实时监控">
@@ -225,6 +227,10 @@
           <div class="studio-card">
             <div class="studio-card-head"><h3>11 路 CAN 原始报文分段时效 (feedback_age)</h3><span>窗口 ≤ 1000 ms</span></div>
             <div class="can-age-grid" id="studio-can-ages"></div>
+          </div>
+          <div class="studio-card" id="studio-card-camera-calib">
+            <div class="studio-card-head"><h3>腕部相机内外参标定参数 (camera_calibration)</h3><span id="studio-cam-calib-stamp">—</span></div>
+            <div id="studio-cam-calib-body" class="control-help">当前机械臂暂无已保存的腕部相机标定结果。</div>
           </div>
         </div>
 

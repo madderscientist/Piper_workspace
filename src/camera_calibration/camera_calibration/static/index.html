@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PiPER-X 相机标定</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<header>
+  <h1>PiPER-X 腕部相机标定</h1>
+  <span id="arm-badge" class="badge">加载中…</span>
+  <nav class="tabs">
+    <button class="tab active" data-tab="intrinsic">① 第一步：内参标定</button>
+    <button class="tab" data-tab="extrinsic">② 第二步：外参（手眼）标定</button>
+  </nav>
+  <span id="board-info" class="muted"></span>
+</header>
+
+<div id="banner" class="banner"></div>
+
+<main>
+
+<div id="next-step-coach" class="coach-card">
+  <div class="coach-title" id="coach-title">🧭 正在连接标定节点…</div>
+  <div class="coach-body" id="coach-body">请稍候，正在获取当前机械臂与腕部相机状态。</div>
+</div>
+
+<section id="board-card" class="card">
+  <div class="cam-head">
+    <span class="title">ChArUco 标定板规格配置（默认 9×12 · Checker 30 mm · Marker 22.5 mm · ArUco DICT_5X5）</span>
+    <span class="grow"></span>
+    <span id="board-path" class="muted"></span>
+  </div>
+  <p class="hint" style="margin-bottom:8px">
+    开标前请先核对实物标定板：数一下<b>黑+白方格总数</b>（横向 X 格 × 纵向 Y 格），用尺子量<b>单个方格边长（Checker mm）</b>和<b>二维码黑框边长（Marker mm）</b>。
+    如果不确定方向是 9×12 还是 12×9，可对准板子后点下方「探测板参数」自动识别。
+  </p>
+  <div class="board-form">
+    <label>横向格数 X
+      <input type="number" id="board-squares-x" min="3" max="40" step="1" value="9">
+    </label>
+    <label>纵向格数 Y
+      <input type="number" id="board-squares-y" min="3" max="40" step="1" value="12">
+    </label>
+    <label>Checker 尺寸 (mm)
+      <input type="number" id="board-square-mm" min="1" max="500" step="0.1" value="30">
+    </label>
+    <label>Marker 尺寸 (mm)
+      <input type="number" id="board-marker-mm" min="1" max="500" step="0.1" value="22.5">
+    </label>
+    <label>ArUco 字典
+      <input type="text" id="board-dictionary" list="dict-options" value="DICT_5X5">
+      <datalist id="dict-options">
+        <option value="DICT_5X5">
+        <option value="DICT_5X5_50">
+        <option value="DICT_5X5_100">
+        <option value="DICT_5X5_250">
+        <option value="DICT_5X5_1000">
+        <option value="DICT_4X4">
+        <option value="DICT_4X4_50">
+        <option value="DICT_4X4_100">
+        <option value="DICT_4X4_250">
+        <option value="DICT_6X6">
+        <option value="DICT_6X6_50">
+        <option value="DICT_6X6_100">
+        <option value="DICT_6X6_250">
+        <option value="DICT_7X7">
+        <option value="DICT_7X7_50">
+        <option value="DICT_7X7_100">
+        <option value="DICT_7X7_250">
+        <option value="DICT_ARUCO_ORIGINAL">
+      </datalist>
+    </label>
+    <button id="btn-apply-board" class="primary" data-done="标定板规格已更新">应用板规格</button>
+  </div>
+</section>
+
+<section id="tab-intrinsic" class="tab-body">
+  <div class="guide-grid" id="intrinsic-steps">
+    <div class="step-card" id="int-step-1">
+      <div class="step-head"><span class="step-num">步骤 1</span><b>选分辨率并确认识别</b><span class="step-tag" id="int-tag-1">待检查</span></div>
+      <p>在相机卡片右上角选择要标定的分辨率（默认 <code>720×480</code>，或 <code>1920×1080</code>），如与「在推」尺寸不符先点<b>「切换」</b>。把标定板放到镜头前，画面出现彩色框和红点、且「角点 ≥ 8」即表示识别成功。</p>
+    </div>
+    <div class="step-card" id="int-step-2">
+      <div class="step-head"><span class="step-num">步骤 2</span><b>换位置/换角度拍 15～20 张</b><span class="step-tag" id="int-tag-2">待拍摄</span></div>
+      <p>手持板子或移动机械臂，每次<b>停稳</b>后点<b>「拍摄当前帧」</b>：<br>
+      • <b>铺满画面</b>：中心 + 左上、右上、左下、右下<b>四个角落</b>都要拍到（角落用来算镜头畸变，目标覆盖率 &gt; 60%）；<br>
+      • <b>有倾斜变化</b>：除了正对镜头，还要把板子上下俯仰、左右侧倾 15°～35° 以及远近各拍几张。</p>
+    </div>
+    <div class="step-card" id="int-step-3">
+      <div class="step-head"><span class="step-num">步骤 3</span><b>求解 → 删离群 → 保存</b><span class="step-tag" id="int-tag-3">待求解</span></div>
+      <p>拍够至少 6 张（推荐 ≥ 15 张）后点<b>「求解」</b>：<br>
+      • 看 <b>RMS 重投影误差</b>：<code>720×480</code> 下 &lt; 0.5 px、<code>1080p</code> 下 &lt; 0.8 px 即合格；<br>
+      • 若表格中有标红的模糊图，点<b>「删离群」</b>自动剔除重算；<br>
+      • 最后务必点<b>「保存」</b>写入配置文件，再进入「② 外参标定」。</p>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <button id="btn-capture" class="primary" data-done="已拍摄">📸 拍摄当前帧</button>
+    <button id="btn-probe">🔍 探测板参数</button>
+    <label><input type="checkbox" id="chk-overlay" checked> 叠加角点检测结果</label>
+    <span class="grow"></span>
+    <span id="calib-path" class="muted"></span>
+  </div>
+
+  <div id="cameras" class="grid"></div>
+
+  <div id="probe-panel" class="card" hidden>
+    <h3>板参数探测</h3>
+    <p class="hint">
+      朝向猜错时角点数一样多，只有<b>共面残差</b>能区分。残差在几个像素以内的才是正确规格；
+      可点击「采用」直接应用对应字典与格数。
+    </p>
+    <div id="probe-table"></div>
+  </div>
+</section>
+
+<section id="tab-extrinsic" class="tab-body" hidden>
+  <div class="guide-grid" id="extrinsic-steps">
+    <div class="step-card" id="ext-step-1">
+      <div class="step-head"><span class="step-num">步骤 1</span><b>固定标定板（全程严禁移动）</b><span class="step-tag" id="ext-tag-1">准备</span></div>
+      <p>把标定板平放在机械臂前方的桌面上或固定在支架上（必要时用胶带粘牢）。<b>从采第 1 组到最后一组，标定板绝对不能动！</b>如果中途不小心碰动了板子，必须点「清空姿态」重采。</p>
+    </div>
+    <div class="step-card" id="ext-step-2">
+      <div class="step-head"><span class="step-num">步骤 2</span><b>多角度旋转手腕采 6～10 组</b><span class="step-tag" id="ext-tag-2">待采集</span></div>
+      <p>拖动或控制机械臂换不同姿态看同一块板，<b>停手静置 0.5 秒</b>待下方「采集前检查」5 项全绿 <code>✓</code> 后点<b>「采集一组」</b>：<br>
+      • <b>关键要领</b>：手腕必须<b>绕不同方向的轴旋转</b>（既有俯仰 Pitch 低头/抬头，又有左右侧倾 Roll 和旋转 Yaw，角度变化 15°～35°）；<br>
+      • <b>切忌</b>：只做纯上下左右平移而不转手腕，或只绕同一根轴旋转（会导致手眼方程欠定无解）。</p>
+    </div>
+    <div class="step-card" id="ext-step-3">
+      <div class="step-head"><span class="step-num">步骤 3</span><b>求解 → 核对残差 → 保存</b><span class="step-tag" id="ext-tag-3">待求解</span></div>
+      <p>采满至少 3 组（推荐 6～10 组）后点<b>「求解」</b>：<br>
+      • 看<b>「板位姿一致性残差」</b>：&lt; 5 mm rms 为优秀，&lt; 10 mm rms 可用；<br>
+      • 看<b>「非线性精化 vs AX=XB 差异」</b>：&lt; 2° / 10 mm 说明两种独立算法互相印证；<br>
+      • 点击推荐解旁的<b>「保存这一组」</b>，外参即写入配置并自动发布静态 TF。</p>
+    </div>
+  </div>
+
+  <details class="card pose-playbook">
+    <summary>💡 <b>不知道怎么摆机械臂？点此展开「8 组推荐手眼标定姿态清单」（照着做即可）</b></summary>
+    <table>
+      <tr><th>组号</th><th>机械臂位置</th><th>手腕朝向（确保标定板在画面内且角点 ≥ 6）</th><th>作用</th></tr>
+      <tr><td><b>第 1 组</b></td><td>标定板正上方居中，距离约 40～55 cm</td><td>镜头大致垂直正对标定板</td><td>建立基准中心视角</td></tr>
+      <tr><td><b>第 2 组</b></td><td>向<b>左</b>平移约 10～15 cm</td><td>手腕向<b>右</b>侧倾（Roll 约 +20°）斜看标定板</td><td>激励 Roll 旋转轴与横向平移</td></tr>
+      <tr><td><b>第 3 组</b></td><td>向<b>右</b>平移约 10～15 cm</td><td>手腕向<b>左</b>侧倾（Roll 约 -20°）斜看标定板</td><td>双向对称约束 Roll 轴</td></tr>
+      <tr><td><b>第 4 组</b></td><td>向<b>前（远离基座）</b>伸出约 10 cm</td><td>手腕向<b>后仰</b>（Pitch 约 +20°）回看标定板</td><td>激励 Pitch 俯仰轴与前后平移</td></tr>
+      <tr><td><b>第 5 组</b></td><td>向<b>后（靠近基座）</b>收回约 10 cm</td><td>手腕向<b>前低头</b>（Pitch 约 -20°）看标定板</td><td>双向对称约束 Pitch 轴</td></tr>
+      <tr><td><b>第 6 组</b></td><td>左前方 + 高度降低约 8 cm</td><td>末端 J6 顺时针转约 25° + 复合倾斜对准板子</td><td>激励 Yaw 轴与高度 Z 方向</td></tr>
+      <tr><td><b>第 7 组</b></td><td>右前方 + 高度抬高约 8 cm</td><td>末端 J6 逆时针转约 25° + 复合倾斜对准板子</td><td>消除单轴简并、降低条件数</td></tr>
+      <tr><td><b>第 8 组</b></td><td>任意斜上方视角</td><td>与前几组不同的组合旋转角对准板子</td><td>提供冗余交叉检验</td></tr>
+    </table>
+  </details>
+
+
+  <div class="card" id="ref-point-card">
+    <div class="cam-head">
+      <span class="title">📐 外参参考坐标系：夹爪底座 Mesh 最高点中心（<code>gripper_base_top</code>）</span>
+    </div>
+    <p class="hint" style="margin-bottom:8px">
+      标定出的外参 $X = T_{	ext{gripper\_base\_top}\leftarrow	ext{cam}}$ 统一以夹爪底座顶面最高点中心（$X=0, Y=0, Z=Z_{\max}$）为原点，因此<b>无论使用 <code>gripper_base.STL</code>（有底法兰）还是 <code>gripper_base_without_flange.STL</code>（无底法兰），相机相对于该最高点的外参完全相同</b>。<br>
+      请确认当前标定时机械臂末端安装的是哪一种结构（用于从法兰 <code>link6</code> 推算当前最高点在基座下的位置）：
+    </p>
+    <div class="board-form">
+      <label>当前机械臂上安装的夹爪底座结构
+        <select id="ref-variant" style="width:360px">
+          <option value="gripper_with_wrench">piper_description_with_wrench.urdf（力传感器+夹爪，最高点 Z = +92.8 mm）</option>
+          <option value="with_flange">gripper_base.STL（含 10.5 mm 底法兰，最高点 Z = +63.0 mm）</option>
+          <option value="without_flange">gripper_base_without_flange.STL（无底法兰直装，最高点 Z = +52.5 mm）</option>
+          <option value="custom">自定义 link6 → 夹爪最高点 +Z 距离 (mm)</option>
+        </select>
+      </label>
+      <label>link6 → 最高点 +Z (mm)
+        <input type="number" id="ref-z-mm" min="1" max="300" step="0.1" value="92.8">
+      </label>
+      <button id="btn-apply-ref" class="primary" data-done="外参参考点设置已更新">应用参考点设置</button>
+    </div>
+  </div>
+
+  <div id="ext-cameras" class="grid"></div>
+
+  <div id="preflight" class="card"></div>
+
+  <div class="toolbar">
+    <button id="btn-capture-pose" class="primary" data-done="已采集">📸 采集一组姿态</button>
+    <button id="btn-solve-extrinsic" data-done="已求解">🧮 求解外参</button>
+    <button id="btn-clear-poses" class="danger">清空姿态</button>
+  </div>
+
+  <div id="pose-list" class="card"></div>
+  <div id="extrinsic-result"></div>
+</section>
+
+</main>
+
+<script src="/common.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

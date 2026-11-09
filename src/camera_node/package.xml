@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>camera_node</name>
+  <version>0.1.0</version>
+  <description>PiPER-X wrist IP camera node (arm_3 / arm_4) for RTSP streaming and CameraInfo publishing</description>
+  <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang1989</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>ffmpeg</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

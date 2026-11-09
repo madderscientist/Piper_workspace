@@ -116,9 +116,26 @@ window.PiperMesh = (() => {
     const links = [];
     let current = mat4Identity();
     links.push({mesh: "base_link.STL", matrix: current, color: LINK_COLORS[0]});
+    const isWrench = effector === "gripper_with_wrench";
     for (let i = 0; i < 6; i++) {
-      current = mat4Mul(current, mat4FromOriginRpy(JOINT_ORIGINS[i].xyz, JOINT_ORIGINS[i].rpy, q[i], 0));
+      const qEff = (i === 5 && isWrench) ? q[i] + Math.PI / 4 : q[i];
+      current = mat4Mul(current, mat4FromOriginRpy(JOINT_ORIGINS[i].xyz, JOINT_ORIGINS[i].rpy, qEff, 0));
       links.push({mesh: `link${i + 1}.STL`, matrix: current, color: LINK_COLORS[i + 1]});
+    }
+    if (isWrench) {
+      const mArmFlange = mat4Mul(current, mat4FromOriginRpy([0, 0, 0], [0, 0, -Math.PI / 2], 0, 0));
+      const mSensor = mat4Mul(mArmFlange, mat4FromOriginRpy([0, 0, 0.0075], [0, 0, -Math.PI / 4], 0, 0));
+      const mGripFlange = mat4Mul(mSensor, mat4FromOriginRpy([0, 0, 0.024], [0, 0, Math.PI / 2], 0, 0));
+      const mGripBase = mat4Mul(mGripFlange, mat4FromOriginRpy([0, 0, 0.0088], [0, 0, 0], 0, 0));
+      const m7 = mat4Mul(mGripBase, mat4FromOriginRpy([0, 0, 0.1253], [1.5708, 0, 0], 0, width / 2));
+      const m8 = mat4Mul(mGripBase, mat4FromOriginRpy([0, 0, 0.1253], [1.5708, 0, -3.1416], 0, width / 2));
+      links.push({mesh: "px6d75_arm_flange.stl", matrix: mArmFlange, color: [0.65, 0.72, 0.80]});
+      links.push({mesh: "px6d75.stl", matrix: mSensor, color: [0.72, 0.74, 0.77]});
+      links.push({mesh: "px6d75_gripper_flange.stl", matrix: mGripFlange, color: [0.86, 0.65, 0.33]});
+      links.push({mesh: "gripper_base_without_flange.STL", matrix: mGripBase, color: LINK_COLORS[7]});
+      links.push({mesh: "link7.STL", matrix: m7, color: LINK_COLORS[8]});
+      links.push({mesh: "link8.STL", matrix: m8, color: LINK_COLORS[9]});
+      return {links, flangeMatrix: current, gripperBaseMatrix: mGripBase, gripperTopZ: 0.0525};
     }
     const isTeach = effector === "teaching_handle";
     const baseMesh = isTeach ? "teach_base.STL" : "gripper_base.STL";
@@ -130,7 +147,7 @@ window.PiperMesh = (() => {
     const m8 = mat4Mul(current, mat4FromOriginRpy([0, 0, fingerZ], [1.5708, 0, -3.1416], 0, width / 2));
     links.push({mesh: fingerL, matrix: m7, color: LINK_COLORS[8]});
     links.push({mesh: fingerR, matrix: m8, color: LINK_COLORS[9]});
-    return {links, flangeMatrix: current};
+    return {links, flangeMatrix: current, gripperBaseMatrix: current, gripperTopZ: 0.063};
   }
 
   function parseBinaryStl(buffer) {
@@ -200,6 +217,70 @@ window.PiperMesh = (() => {
       ox, oy, oz, xx, xy, xz,
       ox, oy, oz, yx, yy, yz,
       ox, oy, oz, zx, zy, zz,
+    ]);
+  }
+
+  function buildStandardAxesLines(matrix, length = 0.055) {
+    const ox = matrix[12], oy = matrix[13], oz = matrix[14];
+    const xx = ox + matrix[0] * length, xy = oy + matrix[1] * length, xz = oz + matrix[2] * length;
+    const yx = ox + matrix[4] * length, yy = oy + matrix[5] * length, yz = oz + matrix[6] * length;
+    const zx = ox + matrix[8] * length, zy = oy + matrix[9] * length, zz = oz + matrix[10] * length;
+    return new Float32Array([
+      ox, oy, oz, xx, xy, xz,
+      ox, oy, oz, yx, yy, yz,
+      ox, oy, oz, zx, zy, zz,
+    ]);
+  }
+
+  function transformPoint(m, x, y, z) {
+    return [
+      m[0] * x + m[4] * y + m[8] * z + m[12],
+      m[1] * x + m[5] * y + m[9] * z + m[13],
+      m[2] * x + m[6] * y + m[10] * z + m[14],
+    ];
+  }
+
+  function resolveCameraPoses(fk, calib) {
+    if (!fk || !calib || !Array.isArray(calib.translation) || !Array.isArray(calib.rpy)) return null;
+    const baseMat = fk.gripperBaseMatrix || fk.flangeMatrix;
+    const topZ = fk.gripperTopZ ?? 0.063;
+    // Align driver link6 frame to visual STL gripper_base_top frame (-90 deg around Z)
+    const topMatrix = mat4Mul(baseMat, mat4FromOriginRpy([0, 0, topZ], [0, 0, -Math.PI / 2], 0, 0));
+    const extMat = mat4FromOriginRpy(calib.translation, calib.rpy, 0, 0);
+    const camMatrix = mat4Mul(topMatrix, extMat);
+    let boardMatrix = null;
+    if (calib.board_pose && Array.isArray(calib.board_pose.translation) && Array.isArray(calib.board_pose.rpy)) {
+      boardMatrix = mat4FromOriginRpy(calib.board_pose.translation, calib.board_pose.rpy, 0, 0);
+    }
+    const intr = Array.isArray(calib.intrinsics) && calib.intrinsics.length ? calib.intrinsics[0] : null;
+    const fovDeg = intr && Array.isArray(intr.fov_deg) && intr.fov_deg.length >= 2 ? intr.fov_deg : [50.0, 35.0];
+    return {topMatrix, camMatrix, boardMatrix, fovDeg, intr, calib};
+  }
+
+  function buildCameraFrustumLines(topMatrix, camMatrix, fovDeg = [50.0, 35.0], depth = 0.14) {
+    const o = [camMatrix[12], camMatrix[13], camMatrix[14]];
+    const top = [topMatrix[12], topMatrix[13], topMatrix[14]];
+    const hx = Math.tan((fovDeg[0] || 50) * Math.PI / 360) * depth;
+    const hy = Math.tan((fovDeg[1] || 35) * Math.PI / 360) * depth;
+    const c0 = transformPoint(camMatrix, -hx, -hy, depth);
+    const c1 = transformPoint(camMatrix,  hx, -hy, depth);
+    const c2 = transformPoint(camMatrix,  hx,  hy, depth);
+    const c3 = transformPoint(camMatrix, -hx,  hy, depth);
+    const up0 = transformPoint(camMatrix, -hx * 0.35, -hy * 1.05, depth);
+    const up1 = transformPoint(camMatrix,  hx * 0.35, -hy * 1.05, depth);
+    const upTip = transformPoint(camMatrix, 0, -hy * 1.32, depth);
+    return new Float32Array([
+      top[0], top[1], top[2], o[0], o[1], o[2],
+      o[0], o[1], o[2], c0[0], c0[1], c0[2],
+      o[0], o[1], o[2], c1[0], c1[1], c1[2],
+      o[0], o[1], o[2], c2[0], c2[1], c2[2],
+      o[0], o[1], o[2], c3[0], c3[1], c3[2],
+      c0[0], c0[1], c0[2], c1[0], c1[1], c1[2],
+      c1[0], c1[1], c1[2], c2[0], c2[1], c2[2],
+      c2[0], c2[1], c2[2], c3[0], c3[1], c3[2],
+      c3[0], c3[1], c3[2], c0[0], c0[1], c0[2],
+      up0[0], up0[1], up0[2], upTip[0], upTip[1], upTip[2],
+      upTip[0], upTip[1], upTip[2], up1[0], up1[1], up1[2],
     ]);
   }
 
@@ -326,8 +407,10 @@ window.PiperMesh = (() => {
       displayWrench: null,
       gripper: 0.02,
       effector: "gripper",
+      cameraCalib: null,
       wireframe: false,
       showGhost: true,
+      showCamera: true,
       _raf: 0,
       _signature: "",
       scheduleDraw() {
@@ -356,9 +439,11 @@ window.PiperMesh = (() => {
         if ("wrench" in state) this.wrench = state.wrench;
         if (Number.isFinite(state.gripper)) this.gripper = state.gripper;
         if (state.effector) this.effector = state.effector;
+        if ("cameraCalib" in state) this.cameraCalib = state.cameraCalib;
         const poseSig = this.targetPose ? this.targetPose.map(v => v.toFixed(3)).join(",") : "";
         const wrenchSig = Array.isArray(this.wrench) ? this.wrench.map(v => Number.isFinite(v) ? v.toFixed(2) : "0").join(",") : "";
-        const sig = `${this.effector}|${this.gripper.toFixed(4)}|${this.joints.map(v => v.toFixed(3)).join(",")}|${this.ghostJoints ? this.ghostJoints.map(v => v.toFixed(3)).join(",") : ""}|${poseSig}|${wrenchSig}`;
+        const camSig = this.cameraCalib ? (this.cameraCalib.stamp || "1") + ":" + (this.cameraCalib.translation || []).join(",") : "";
+        const sig = `${this.effector}|${this.gripper.toFixed(4)}|${this.joints.map(v => v.toFixed(3)).join(",")}|${this.ghostJoints ? this.ghostJoints.map(v => v.toFixed(3)).join(",") : ""}|${poseSig}|${wrenchSig}|${camSig}|${this.showCamera}`;
         if (sig !== this._signature) {
           this._signature = sig;
           this.scheduleDraw();
@@ -411,7 +496,8 @@ window.PiperMesh = (() => {
           this.displayWrench = null;
         }
         if (glState) {
-          drawSharedWebGL(glState, ctx2d, w, h, vp, fk, ghostFk, targetMat, wrenchToDraw, this.wireframe);
+          const camPose = this.showCamera ? resolveCameraPoses(fk, this.cameraCalib) : null;
+          drawSharedWebGL(glState, ctx2d, w, h, vp, fk, ghostFk, targetMat, wrenchToDraw, this.wireframe, camPose);
         } else {
           drawSkeletonFallback(ctx2d, w, h, vp, fk);
         }
@@ -461,7 +547,7 @@ window.PiperMesh = (() => {
     return viewer;
   }
 
-  function drawSharedWebGL(ctx, target2d, w, h, vp, fk, ghostFk, targetMat, wrench, wireframe) {
+  function drawSharedWebGL(ctx, target2d, w, h, vp, fk, ghostFk, targetMat, wrench, wireframe, camPose) {
     const {offscreen, gl, prog, aPos, aNorm, uMVP, uModel, uColor, uUnlit, gridBuf, dynBuf, gridVertexCount, buffers} = ctx;
     if (offscreen.width < w || offscreen.height < h) {
       offscreen.width = Math.max(offscreen.width, w);
@@ -554,6 +640,32 @@ window.PiperMesh = (() => {
       gl.drawArrays(gl.LINES, 4, 2);
     };
     drawTriad(fk.flangeMatrix, 0.065);
+    if (camPose) {
+      const frustumData = buildCameraFrustumLines(camPose.topMatrix, camPose.camMatrix, camPose.fovDeg, 0.14);
+      gl.bindBuffer(gl.ARRAY_BUFFER, dynBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, frustumData, gl.STREAM_DRAW);
+      gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 12, 0);
+      gl.disableVertexAttribArray(aNorm);
+      gl.uniformMatrix4fv(uMVP, false, vp);
+      gl.uniformMatrix4fv(uModel, false, ident);
+      gl.uniform1f(uUnlit, 1.0);
+      gl.uniform4f(uColor, 0.95, 0.55, 0.08, 1.0);
+      gl.drawArrays(gl.LINES, 0, 2);
+      gl.uniform4f(uColor, 0.05, 0.68, 0.78, 1.0);
+      gl.drawArrays(gl.LINES, 2, 20);
+      const camAxes = buildStandardAxesLines(camPose.camMatrix, 0.05);
+      gl.bufferData(gl.ARRAY_BUFFER, camAxes, gl.STREAM_DRAW);
+      gl.uniform4f(uColor, 0.92, 0.22, 0.26, 1.0);
+      gl.drawArrays(gl.LINES, 0, 2);
+      gl.uniform4f(uColor, 0.14, 0.72, 0.40, 1.0);
+      gl.drawArrays(gl.LINES, 2, 2);
+      gl.uniform4f(uColor, 0.18, 0.48, 0.92, 1.0);
+      gl.drawArrays(gl.LINES, 4, 2);
+      const topAxes = buildStandardAxesLines(camPose.topMatrix, 0.035);
+      gl.bufferData(gl.ARRAY_BUFFER, topAxes, gl.STREAM_DRAW);
+      gl.uniform4f(uColor, 0.95, 0.55, 0.08, 1.0);
+      gl.drawArrays(gl.LINES, 0, 6);
+    }
     if (targetMat) {
       gl.disable(gl.DEPTH_TEST);
       drawTriad(targetMat, 0.085);
@@ -562,9 +674,66 @@ window.PiperMesh = (() => {
     gl.disable(gl.SCISSOR_TEST);
     target2d.clearRect(0, 0, w, h);
     target2d.drawImage(offscreen, 0, offscreen.height - h, w, h, 0, 0, w, h);
+    if (camPose) {
+      drawCameraOverlay2D(target2d, vp, camPose, w, h);
+    }
     if (hasActiveForce) {
       drawForceOverlay2D(target2d, vp, fk.flangeMatrix, wrench, w, h);
     }
+  }
+
+  function drawCameraOverlay2D(ctx, vp, camPose, w, h) {
+    const top = camPose.topMatrix;
+    const cam = camPose.camMatrix;
+    const pTop = projectPoint(vp, top[12], top[13], top[14], w, h);
+    const pCam = projectPoint(vp, cam[12], cam[13], cam[14], w, h);
+    const lookEnd = transformPoint(cam, 0, 0, 0.14);
+    const pLook = projectPoint(vp, lookEnd[0], lookEnd[1], lookEnd[2], w, h);
+    ctx.save();
+    ctx.font = "600 11px ui-monospace, monospace";
+    if (pTop) {
+      ctx.beginPath();
+      ctx.arc(pTop[0], pTop[1], 4, 0, Math.PI * 2);
+      ctx.fillStyle = "#f28c18";
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "#ffffff";
+      ctx.stroke();
+      ctx.fillStyle = "#b85d00";
+      ctx.fillText("gripper_base_top", pTop[0] + 6, pTop[1] - 4);
+    }
+    if (pCam) {
+      if (pLook) {
+        ctx.beginPath();
+        ctx.setLineDash([4, 3]);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#0c9ab0";
+        ctx.moveTo(pCam[0], pCam[1]);
+        ctx.lineTo(pLook[0], pLook[1]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.beginPath();
+      ctx.arc(pCam[0], pCam[1], 5, 0, Math.PI * 2);
+      ctx.fillStyle = "#0c9ab0";
+      ctx.fill();
+      ctx.lineWidth = 1.8;
+      ctx.strokeStyle = "#ffffff";
+      ctx.stroke();
+      const name = camPose.calib?.camera || "camera";
+      const t = camPose.calib?.translation || [0, 0, 0];
+      const label = name + " [" + (t[0] * 1000).toFixed(1) + ", " + (t[1] * 1000).toFixed(1) + ", " + (t[2] * 1000).toFixed(1) + "]mm";
+      const tw = ctx.measureText(label).width;
+      const lx = pCam[0] + 8, ly = pCam[1] + 4;
+      ctx.fillStyle = "rgba(255, 255, 255, 0.88)";
+      ctx.fillRect(lx - 3, ly - 11, tw + 6, 15);
+      ctx.strokeStyle = "#0c9ab0";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(lx - 3, ly - 11, tw + 6, 15);
+      ctx.fillStyle = "#075e6d";
+      ctx.fillText(label, lx, ly);
+    }
+    ctx.restore();
   }
 
   function drawForceOverlay2D(ctx, vp, flangeMatrix, wrench, w, h) {

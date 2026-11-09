@@ -47,6 +47,79 @@ STREAM_TOPICS = {
 }
 STALE_SECONDS = 2.0
 LOGGER = logging.getLogger('state_dashboard.http')
+_CAMERA_CALIB_CACHE: dict[str, Any] = {'mtime': None, 'path': None, 'data': {}}
+
+
+def default_camera_calibration_path() -> Path | None:
+    local = Path(__file__).resolve().parents[2] / 'camera_calibration/config/calibration.yaml'
+    if local.is_file():
+        return local
+    try:
+        share = Path(get_package_share_directory('camera_calibration')) / 'config/calibration.yaml'
+        if share.is_file():
+            return share
+    except Exception:
+        pass
+    return local if local.parent.is_dir() else None
+
+
+def load_camera_calibrations(calib_path: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load per-arm camera intrinsic and extrinsic calibration from camera_calibration YAML."""
+    path = calib_path or default_camera_calibration_path()
+    if path is None or not path.is_file():
+        return {}
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    if _CAMERA_CALIB_CACHE['path'] == str(path) and _CAMERA_CALIB_CACHE['mtime'] == mtime:
+        return _CAMERA_CALIB_CACHE['data']
+    try:
+        raw = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+    except Exception:
+        return {}
+    intrinsics = raw.get('intrinsics') or {}
+    extrinsics = raw.get('extrinsics') or {}
+    by_arm: dict[str, dict[str, Any]] = {}
+    for cam_name, ext in extrinsics.items():
+        if not isinstance(ext, dict):
+            continue
+        arm_key = str(ext.get('arm') or '').strip().lstrip('/')
+        if not arm_key and cam_name.startswith('camera_arm_'):
+            arm_key = cam_name[len('camera_'):]
+        if not arm_key:
+            continue
+        intr_list = intrinsics.get(cam_name) or []
+        by_arm[f'/{arm_key}'] = {
+            'camera': cam_name,
+            'parent': ext.get('parent', 'gripper_base_top'),
+            'reference_point': ext.get('reference_point', 'gripper_base_top'),
+            'translation': [float(v) for v in (ext.get('translation') or [0.0, 0.0, 0.0])[:3]],
+            'rotation': [float(v) for v in (ext.get('rotation') or [0.0, 0.0, 0.0, 1.0])[:4]],
+            'rpy': [float(v) for v in (ext.get('rpy') or [0.0, 0.0, 0.0])[:3]],
+            'mesh_origins': ext.get('mesh_origins') or {},
+            'method': ext.get('method', ''),
+            'samples': ext.get('samples', 0),
+            'residual_mm': ext.get('residual_mm'),
+            'cross_check': ext.get('cross_check'),
+            'board_pose': ext.get('board_pose'),
+            'stamp': ext.get('stamp', ''),
+            'intrinsics': [
+                {
+                    'width': int(item['width']),
+                    'height': int(item['height']),
+                    'camera_matrix': [float(v) for v in item['camera_matrix']],
+                    'distortion_coefficients': [float(v) for v in item['distortion_coefficients']],
+                    'rms': item.get('rms'),
+                    'fov_deg': item.get('fov_deg'),
+                    'board': item.get('board'),
+                    'stamp': item.get('stamp', ''),
+                }
+                for item in intr_list if isinstance(item, dict) and 'camera_matrix' in item
+            ],
+        }
+    _CAMERA_CALIB_CACHE.update({'path': str(path), 'mtime': mtime, 'data': by_arm})
+    return by_arm
 
 
 def _reject_nonfinite(constant: str) -> Any:
@@ -315,6 +388,7 @@ class TelemetryStore:
                     connection = 'waiting'
                 control = self._controls[index]
                 control_at = control.received_at
+                cam_calibs = load_camera_calibrations()
                 arms.append({
                     'id': index + 1,
                     'namespace': self.namespaces[index],
@@ -323,6 +397,7 @@ class TelemetryStore:
                     **{name: state.payload for name, state in states.items()},
                     'control': control.payload,
                     'control_fresh': control_at is not None and 0 <= now - control_at <= 0.3,
+                    'camera_calibration': cam_calibs.get(self.namespaces[index]),
                 })
             teaching_at = self._teaching.received_at
             # JSON round-tripping also prevents callbacks from mutating a response.
@@ -706,7 +781,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             '/mesh.js': ('mesh.js', 'text/javascript; charset=utf-8'),
             '/styles.css': ('styles.css', 'text/css; charset=utf-8'),
         }
-        mesh_match = re.fullmatch(r'/meshes/([A-Za-z0-9_]+\.STL)', path)
+        mesh_match = re.fullmatch(r'/meshes/([A-Za-z0-9_]+\.(?:STL|stl))', path)
         if path == '/api/status':
             snapshot = self.server.store.snapshot()
             if (self.server.enable_controller is not None
@@ -780,7 +855,11 @@ def main(args: list[str] | None = None) -> None:
     rclpy.init(args=argv)
     node = DashboardNode(namespaces)
     try:
-        assets = Path(get_package_share_directory('state_dashboard')) / 'dashboard'
+        local_assets = Path(__file__).resolve().parent.parent / 'dashboard'
+        assets = (
+            local_assets if local_assets.is_dir()
+            else Path(get_package_share_directory('state_dashboard')) / 'dashboard'
+        )
         with DashboardServer(
             (options.host, options.port), node.store, assets, node.enable_controller,
             node.arm_controller, node.teaching_controller,
