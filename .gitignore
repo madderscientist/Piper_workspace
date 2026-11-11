@@ -10,3 +10,4 @@ src/piper_friction/config/*.csv
 src/piper_gravity/config/*.csv
 src/vendor/*
 !src/vendor/COLCON_IGNORE
+head_camera_data/

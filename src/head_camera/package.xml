@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>head_camera</name>
+  <version>0.1.0</version>
+  <description>Azure Kinect head camera depth snapshots, MKV recording and frame export.</description>
+  <maintainer email="maintainer@example.invalid">Workspace maintainer</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <!-- Microsoft's SDK packages are installed separately; see README.md. -->
+  <depend>libopencv-dev</depend>
+  <depend>yaml-cpp</depend>
+  <depend>boost</depend>
+  <depend>ament_index_cpp</depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

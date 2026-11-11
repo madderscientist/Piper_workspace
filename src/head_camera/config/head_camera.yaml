@@ -1,0 +1,18 @@
+# 头部相机可选配置文件（命令行参数优先级更高）。
+# cameras 通过每台相机出厂唯一的 12 位硬件序列号（serial）固定绑定别名，不受 USB 插口与 /dev/videoN 顺序影响。
+device: 0
+video_device: ""
+depth_mode: WFOV_2X2BINNED
+fps: 30
+color: "OFF"
+output: head_camera_data
+count: 1
+interval: 0.0
+duration: 0.0
+preview: false
+
+cameras:
+  head_1:
+    serial: "000314605112"
+  head_2:
+    serial: "000456614112"
