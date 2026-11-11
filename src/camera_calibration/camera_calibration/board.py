@@ -10,6 +10,7 @@ import numpy as np
 
 _MIN_POSE_CORNERS = 6
 _CAPACITIES = (50, 100, 250, 1000)
+_FAST_MARKER_MAX_WIDTH = 960
 
 
 def resolve_dictionary_name(name: str, needed_markers: int = 0) -> str:
@@ -183,6 +184,10 @@ class Board:
         height, width = gray.shape[:2]
         empty = Detection(np.zeros((0, 1, 2), np.float32), np.zeros((0, 1), np.int32),
                           (width, height))
+        if width > _FAST_MARKER_MAX_WIDTH:
+            fast_det = self._detect_coarse_to_fine(gray, width, height)
+            if fast_det is not None:
+                return fast_det
         if self._charuco_detector is not None:
             charuco_corners, charuco_ids, marker_corners, marker_ids = (
                 self._charuco_detector.detectBoard(gray)
@@ -219,6 +224,35 @@ class Board:
             np.asarray(charuco_ids, np.int32).reshape(-1, 1),
             (width, height), int(len(ids)), list(corners), ids)
 
+    def _detect_coarse_to_fine(self, gray: np.ndarray, width: int, height: int) -> Detection | None:
+        small_w = width // 2
+        small_h = height // 2
+        if small_w < 320 or small_h < 240:
+            return None
+        small = cv2.resize(gray, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+        scale = np.array([[[width / float(small_w), height / float(small_h)]]], dtype=np.float32)
+        corners, ids, rejected = cv2.aruco.detectMarkers(
+            small, self._dictionary, parameters=self._params)
+        if ids is None or len(ids) == 0:
+            return Detection(np.zeros((0, 1, 2), np.float32), np.zeros((0, 1), np.int32),
+                             (width, height))
+        corners, ids, _, _ = cv2.aruco.refineDetectedMarkers(
+            small, self._board, corners, ids, rejected)
+        if ids is None or len(ids) == 0:
+            return Detection(np.zeros((0, 1, 2), np.float32), np.zeros((0, 1), np.int32),
+                             (width, height))
+        full_markers = [np.asarray(c, np.float32) * scale for c in corners]
+        count, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
+            full_markers, ids, gray, self._board)
+        if not count or charuco_ids is None:
+            empty = Detection(np.zeros((0, 1, 2), np.float32), np.zeros((0, 1), np.int32),
+                              (width, height), int(len(ids)), full_markers, ids)
+            return empty
+        return Detection(
+            np.asarray(charuco_corners, np.float32).reshape(-1, 1, 2),
+            np.asarray(charuco_ids, np.int32).reshape(-1, 1),
+            (width, height), int(len(ids)), full_markers, ids)
+
     def estimate_pose(self, detection: Detection, camera_matrix, distortion):
         """板在相机系下的位姿 T_cam<-board，解不出返回 None。"""
         if detection.count < _MIN_POSE_CORNERS:
@@ -232,14 +266,27 @@ class Board:
             return None
         return transforms.rvec_tvec_to_matrix(rvec, tvec)
 
-    def overlay(self, image, detection: Detection):
-        canvas = image.copy()
+    def overlay(self, image, detection: Detection, *, inplace: bool = False):
+        canvas = image if inplace else image.copy()
+        scale_x = canvas.shape[1] / float(detection.size[0] or canvas.shape[1])
+        scale_y = canvas.shape[0] / float(detection.size[1] or canvas.shape[0])
         if detection.marker_ids is not None and len(detection.marker_corners):
-            cv2.aruco.drawDetectedMarkers(canvas, detection.marker_corners,
+            marker_corners = (
+                detection.marker_corners
+                if abs(scale_x - 1.0) < 1e-3 and abs(scale_y - 1.0) < 1e-3
+                else [np.asarray(c, np.float32) * np.array([[[scale_x, scale_y]]], np.float32)
+                      for c in detection.marker_corners]
+            )
+            cv2.aruco.drawDetectedMarkers(canvas, marker_corners,
                                           detection.marker_ids)
         if detection.count:
+            corners = (
+                detection.corners
+                if abs(scale_x - 1.0) < 1e-3 and abs(scale_y - 1.0) < 1e-3
+                else detection.corners * np.array([[[scale_x, scale_y]]], np.float32)
+            )
             cv2.aruco.drawDetectedCornersCharuco(
-                canvas, detection.corners, detection.ids, (0, 0, 255))
+                canvas, corners, detection.ids, (0, 0, 255))
         return canvas
 
     def draw(self, pixels_per_meter: float = 4000.0, margin_squares: float = 0.5):

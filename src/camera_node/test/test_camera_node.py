@@ -3,16 +3,20 @@
 import array
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 from builtin_interfaces.msg import Time
 from rclpy.parameter import Parameter
 
+from camera_node import WristCamera, grab_frame, resolve_stream_url
 from camera_node.camera_node import (
     ARM_CAMERA_PRESETS,
     CameraNode,
@@ -28,7 +32,7 @@ from camera_node.camera_node import (
 
 _BOUND = ('_step', '_open_reader', '_close_reader', '_fail', '_on_frame',
           '_setting', '_stream_settings', '_native_size', '_check_parameters',
-          '_load_camera_info', '_warn_once')
+          '_load_camera_info', '_warn_once', 'add_local_sink')
 _DEFAULTS = {'arm': 'arm_3', 'rtsp_url': 'rtsp://admin:123456@192.168.123.97/stream1', 'fps': 15,
              'image_width': 0, 'image_height': 0, 'jpeg_quality': 60,
              'calib_file': ''}
@@ -46,6 +50,8 @@ def _node(subscribers=0, viewers=0, reader=None, **overrides):
             publish=MagicMock()),
         _frames=threading.Condition(),
         _viewers=viewers,
+        _local_sinks=[],
+        _wake=threading.Event(),
         _publish_frames=False,
         _preview=None,
         _reader=reader,
@@ -154,6 +160,21 @@ class DemandGateAndReconfigureTest(unittest.TestCase):
             [Parameter('rtsp_url', Parameter.Type.STRING, '')]).successful)
         self.assertTrue(node._check_parameters(
             [Parameter('image_height', Parameter.Type.INTEGER, 240)]).successful)
+        self.assertTrue(node._wake.is_set())
+
+    def test_local_sink_keeps_stream_alive_and_forwards_frames(self) -> None:
+        node = _node(subscribers=0, viewers=0)
+        received = []
+        node.add_local_sink(lambda raw, w, h, info: received.append((raw, w, h, info)))
+        with patch('camera_node.camera_node.RtspReader') as reader_type:
+            _healthy(reader_type.return_value)
+            with patch('camera_node.camera_node.probe_size', return_value=(720, 480)):
+                node._step()
+        reader_type.assert_called_once()
+        self.assertFalse(node._publish_frames)
+        node._on_frame(bytes(12), 2, 2)
+        node._publisher.publish.assert_not_called()
+        self.assertEqual(received, [(bytes(12), 2, 2, None)])
 
 
 class RtspReaderAndPublishTest(unittest.TestCase):
@@ -211,6 +232,76 @@ class CameraInfoTest(unittest.TestCase):
         msg = camera_info_message(entry, 'camera_arm_3')
         self.assertEqual(msg.header.frame_id, 'camera_arm_3')
         self.assertEqual(len(msg.p), 12)
+
+
+class DirectRtspApiTest(unittest.TestCase):
+    def test_pure_python_import_without_rclpy_and_one_shot_ppm_decode(self) -> None:
+        pkg_root = str(Path(__file__).resolve().parent.parent)
+        env = {'PATH': os.environ.get('PATH', ''), 'PYTHONPATH': pkg_root}
+        check = subprocess.run(
+            [sys.executable, '-S', '-c',
+             f"import site, sys; site.addsitedir({pkg_root!r}); "
+             + ''.join(f'site.addsitedir({p!r}); ' for p in sys.path if 'site-packages' in p and '/opt/ros' not in p)
+             + "import camera_node; assert 'rclpy' not in sys.modules"],
+            env=env, capture_output=True, text=True, timeout=5.0,
+        )
+        self.assertEqual(check.returncode, 0, check.stderr)
+
+        self.assertEqual(
+            resolve_stream_url('arm_3', 'stream1'),
+            ('rtsp://admin:123456@192.168.123.97/stream1', (720, 480)),
+        )
+        self.assertEqual(
+            resolve_stream_url('cam4', 'stream0'),
+            ('rtsp://admin:123456@192.168.123.98/stream0', (1920, 1080)),
+        )
+
+        # PPM 为 RGB 排列，grab_frame 应解码并反转为 BGR uint8 (H, W, 3)
+        ppm = b'P6\n# comment\n2 1\n255\n' + bytes([10, 20, 30, 40, 50, 60])
+        completed = subprocess.CompletedProcess(args=['ffmpeg'], returncode=0, stdout=ppm, stderr=b'')
+        with patch('camera_node.rtsp.subprocess.run', return_value=completed) as run_mock:
+            bgr = grab_frame('arm_3', stream='stream0', width=640)
+        self.assertEqual(bgr.shape, (1, 2, 3))
+        self.assertEqual(bgr.dtype, np.uint8)
+        self.assertEqual(bgr[0, 0].tolist(), [30, 20, 10])
+        self.assertEqual(bgr[0, 1].tolist(), [60, 50, 40])
+        self.assertIn('scale=640:-2:flags=area', run_mock.call_args.args[0])
+
+    def test_wrist_camera_waits_for_post_call_frame(self) -> None:
+        holders = {}
+
+        class FakeReader:
+            def __init__(self, command, width, height, on_frame):
+                holders['on_frame'] = on_frame
+                self.stopped = False
+
+            def alive(self):
+                return not self.stopped
+
+            def stop(self):
+                self.stopped = True
+
+        with WristCamera('arm_4', stream='stream1', reader_cls=FakeReader) as cam:
+            self.assertIsNone(cam.latest())
+            # 先推一帧代表机械臂移动前的旧缓存
+            holders['on_frame'](bytes([1, 2, 3]) * (720 * 480), 720, 480)
+            self.assertEqual(cam.latest()[0, 0].tolist(), [1, 2, 3])
+            self.assertEqual(cam.grab(fresh=False)[0, 0].tolist(), [1, 2, 3])
+
+            # grab() 必须等待调用之后新到达的第二帧
+            threading.Timer(
+                0.03,
+                lambda: holders['on_frame'](bytes([9, 8, 7]) * (720 * 480), 720, 480),
+            ).start()
+            fresh = cam.grab(timeout=1.0)
+            self.assertEqual(fresh.shape, (480, 720, 3))
+            self.assertEqual(fresh[0, 0].tolist(), [9, 8, 7])
+
+            # 超时断流后不应把旧缓存当成新鲜画面返回
+            cam._frame_stamp -= 10.0
+            self.assertIsNone(cam.latest())
+        with self.assertRaises(RuntimeError):
+            cam.grab()
 
 
 if __name__ == '__main__':

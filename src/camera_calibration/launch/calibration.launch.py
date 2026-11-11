@@ -7,6 +7,7 @@
 
 from pathlib import Path
 import yaml
+import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
@@ -15,6 +16,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from camera_calibration.sources import select_arm_camera
+from camera_node.camera_node import CYCLONEDDS_DEFAULT_URI
 
 _DEFAULTS = {
     'arm': ('', str),
@@ -28,11 +30,12 @@ _DEFAULTS = {
     'base_frame': ('base_link', str),
     'preview_width': ('720', int),
     'jpeg_quality': ('75', int),
-    'detect_period_s': ('0.5', float),
+    'detect_period_s': ('0.15', float),
 }
 
 
 def _launch_nodes(context):
+    os.environ.setdefault('CYCLONEDDS_URI', CYCLONEDDS_DEFAULT_URI)
     share = Path(get_package_share_directory('camera_calibration')) / 'config'
     cameras_cfg_path = LaunchConfiguration('cameras_config').perform(context).strip()
     cfg_file = Path(cameras_cfg_path).expanduser() if cameras_cfg_path else (share / 'cameras.yaml')
@@ -43,36 +46,12 @@ def _launch_nodes(context):
     arm_id, camera_name, camera_cfg = select_arm_camera(cameras_config, arm_raw, cam_raw)
 
     calib_file = LaunchConfiguration('calib_file').perform(context).strip()
-    resolved_calib = calib_file or str(share / 'calibration.yaml')
-
-    nodes = []
     start_cam = LaunchConfiguration('start_camera').perform(context).strip().lower() in ('1', 'true', 'yes')
-    if start_cam:
-        profiles = camera_cfg.get('profiles') or []
-        default_profile = profiles[0] if profiles else {}
-        default_url = (default_profile.get('url') if default_profile
-                       else f"rtsp://admin:123456@{camera_cfg.get('ip', '192.168.123.97')}/stream1")
-        nodes.append(
-            Node(
-                package='camera_node',
-                executable='camera_node',
-                name=camera_name,
-                output='screen',
-                emulate_tty=True,
-                parameters=[{
-                    'arm': arm_id,
-                    'rtsp_url': default_url,
-                    'image_topic': camera_cfg.get('topic', f'/{camera_name}/image_raw'),
-                    'camera_info_topic': camera_cfg.get('info_topic', f'/{camera_name}/camera_info'),
-                    'calib_file': resolved_calib,
-                    'frame_id': camera_cfg.get('frame', camera_name),
-                }],
-            )
-        )
 
     params = {
         'arm': arm_id,
         'camera': camera_name,
+        'start_camera': start_cam,
         'dashboard_port': int(LaunchConfiguration('dashboard_port').perform(context)),
         'data_root': LaunchConfiguration('data_root').perform(context),
         'board_config': LaunchConfiguration('board_config').perform(context),
@@ -83,6 +62,7 @@ def _launch_nodes(context):
         'jpeg_quality': int(LaunchConfiguration('jpeg_quality').perform(context)),
         'detect_period_s': float(LaunchConfiguration('detect_period_s').perform(context)),
     }
+    nodes = []
     nodes.append(
         Node(
             package='camera_calibration',

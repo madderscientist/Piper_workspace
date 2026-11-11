@@ -170,7 +170,12 @@ function updateCamera(cam) {
 
   const img = card.querySelector('.preview');
   const overlay = $('chk-overlay').checked ? 1 : 0;
-  refreshPreview(img, `/api/preview?camera=${cam.name}&overlay=${overlay}&t=${Date.now()}`);
+  const activeTab = document.querySelector('.tab.active')?.dataset.tab || 'intrinsic';
+  bindStream(
+    img,
+    `/api/stream?camera=${cam.name}&overlay=${overlay}`,
+    cam.online && activeTab === 'intrinsic',
+  );
 
   const picked = wh(cam.name);
   const shot = (cam.shots || []).find(
@@ -311,8 +316,12 @@ function renderExtrinsicPreviews() {
     const card = host.querySelector(`[data-ext="${cam.name}"]`);
     if (!card) return;
     card.querySelector('.dot').classList.toggle('on', cam.online);
-    refreshPreview(card.querySelector('.preview'),
-                   `/api/preview?camera=${cam.name}&overlay=1&t=${Date.now()}`);
+    const activeTab = document.querySelector('.tab.active')?.dataset.tab || 'intrinsic';
+    bindStream(
+      card.querySelector('.preview'),
+      `/api/stream?camera=${cam.name}&overlay=1`,
+      cam.online && activeTab === 'extrinsic',
+    );
     const [label, cls] = INTRINSIC_LABEL[cam.intrinsic_source] || INTRINSIC_LABEL.none;
     const enough = cam.corners >= 6;
     card.querySelector('.stats').innerHTML = `
@@ -464,7 +473,7 @@ $('btn-clear-poses').onclick = (e) =>
   guard(e.target, () => post('/api/clear_poses', {}));
 
 refresh();
-setInterval(refresh, 1000);
+setInterval(refresh, 400);
 
 
 const POSE_COACH_TIPS = [

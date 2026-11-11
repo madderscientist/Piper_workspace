@@ -14,7 +14,7 @@ import rclpy
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.utilities import remove_ros_args
 
@@ -35,6 +35,7 @@ from camera_calibration.webui import Panel, make_handler
 _DEFAULTS = {
     'arm': '',
     'camera': '',
+    'start_camera': False,
     'dashboard_port': 8300,
     'data_root': '~/camera_calib_data',
     'board_config': '',
@@ -43,17 +44,19 @@ _DEFAULTS = {
     'base_frame': 'base_link',
     'preview_width': 720,
     'jpeg_quality': 75,
-    'detect_period_s': 0.5,
+    'detect_period_s': 0.15,
 }
 
 
 class CalibrationNode(Node):
 
     def __init__(self, *, arm: str = '', camera: str = '',
+                 start_camera: bool | None = None,
                  dashboard_port: int | None = None,
                  data_root: str | Path = '', board_config: str | Path = '',
                  calib_file: str | Path = '') -> None:
         super().__init__('camera_calibration')
+        cv2.setNumThreads(1)
         for name, default in _DEFAULTS.items():
             self.declare_parameter(name, default)
         share = Path(get_package_share_directory('camera_calibration')) / 'config'
@@ -77,10 +80,21 @@ class CalibrationNode(Node):
         self.store = Store(data_root or self._setting('data_root'),
                            calib_file or self._setting('calib_file') or (share / 'calibration.yaml'))
 
+        self.local_camera_node = None
+        should_start_camera = (
+            bool(start_camera)
+            if start_camera is not None
+            else str(self._setting('start_camera')).strip().lower() in ('1', 'true', 'yes')
+        )
         # 一次只加载所选的那一个机械臂与那一个腕部相机
         self.sources = {
-            self.camera_name: CameraSource(self, self.camera_name, self.camera_cfg),
+            self.camera_name: CameraSource(
+                self, self.camera_name, self.camera_cfg,
+                subscribe_ros=not should_start_camera,
+            ),
         }
+        if should_start_camera:
+            self._init_local_camera()
         gate_cfg = dict(self.cameras_config.get('motion_gate', {}))
         if self.camera_cfg.get('joint_states_topic'):
             gate_cfg['joint_states_topic'] = self.camera_cfg['joint_states_topic']
@@ -92,6 +106,8 @@ class CalibrationNode(Node):
 
         self._live: dict[str, dict] = {}
         self._live_lock = threading.Lock()
+        self._jpeg_cache: dict[tuple[str, bool], tuple[int, int, bytes]] = {}
+        self._jpeg_lock = threading.Lock()
         self._results: dict[str, dict] = {}
         self._stop = threading.Event()
         threading.Thread(target=self._detect_loop, daemon=True,
@@ -113,9 +129,46 @@ class CalibrationNode(Node):
     def active_source(self) -> CameraSource:
         return self.sources[self.camera_name]
 
+    def _init_local_camera(self) -> None:
+        from rclpy.parameter import Parameter as RclParameter
+        from camera_node.camera_node import CameraNode
+
+        profiles = self.camera_cfg.get('profiles') or []
+        default_profile = profiles[0] if profiles else {}
+        default_url = (
+            default_profile.get('url')
+            if default_profile
+            else f"rtsp://admin:123456@{self.camera_cfg.get('ip', '192.168.123.97')}/stream1"
+        )
+        overrides = [
+            RclParameter('arm', RclParameter.Type.STRING, self.arm_id),
+            RclParameter('rtsp_url', RclParameter.Type.STRING, default_url),
+            RclParameter('image_topic', RclParameter.Type.STRING,
+                         self.camera_cfg.get('topic', f'/{self.camera_name}/image_raw')),
+            RclParameter('camera_info_topic', RclParameter.Type.STRING,
+                         self.camera_cfg.get('info_topic', f'/{self.camera_name}/camera_info')),
+            RclParameter('calib_file', RclParameter.Type.STRING, str(self.store.calib_file)),
+            RclParameter('frame_id', RclParameter.Type.STRING,
+                         self.camera_cfg.get('frame', self.camera_name)),
+        ]
+        self.local_camera_node = CameraNode(
+            node_name=self.camera_name,
+            parameter_overrides=overrides,
+        )
+        for profile in profiles:
+            if profile.get('url') and profile.get('width') and profile.get('height'):
+                self.local_camera_node._probed[profile['url']] = (
+                    int(profile['width']),
+                    int(profile['height']),
+                )
+        self.active_source.bind_local_camera(self.local_camera_node)
+
     def destroy_node(self) -> bool:
         self._stop.set()
         self.panel.stop()
+        if self.local_camera_node is not None:
+            self.local_camera_node.destroy_node()
+            self.local_camera_node = None
         return super().destroy_node()
 
     # ---------- 后台检测 ----------
@@ -606,6 +659,8 @@ class CalibrationNode(Node):
             return handler.send_static(path.lstrip('/'))
         if path == '/api/state':
             return handler.send_json(self.state())
+        if path == '/api/stream':
+            return self._send_stream(handler, query)
         if path == '/api/preview':
             return self._send_preview(handler, query)
         if path == '/api/shot':
@@ -625,19 +680,72 @@ class CalibrationNode(Node):
 
     def _send_preview(self, handler, query) -> None:
         cam = _one(query, 'camera', self.camera_name)
+        source = self.sources.get(cam)
+        frame = source.latest() if source is not None else None
         live = self._live_of(cam)
-        if live is None:
+        if frame is None and live is None:
             return handler.send_json({'error': '还没收到图'}, 503)
+        overlay = _one(query, 'overlay', '1') != '0'
+        if frame is not None:
+            seq, image, _ = frame
+            return handler.send_bytes(
+                200, self._preview_jpeg(cam, seq, image, overlay=overlay), 'image/jpeg')
         image = live['image']
-        if _one(query, 'overlay', '1') != '0':
-            image = self.board.overlay(image, live['detection'])
-        return handler.send_bytes(200, self._jpeg(image), 'image/jpeg')
+        detection = live['detection'] if overlay else None
+        return handler.send_bytes(200, self._jpeg(image, detection=detection), 'image/jpeg')
 
-    def _jpeg(self, image) -> bytes:
+    def _send_stream(self, handler, query) -> None:
+        cam = _one(query, 'camera', self.camera_name)
+        source = self._source(cam)
+        overlay = _one(query, 'overlay', '1') != '0'
+        handler.send_response(200)
+        handler.send_header('Cache-Control', 'no-store')
+        handler.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+        handler.end_headers()
+        seq = 0
+        try:
+            while not self._stop.is_set():
+                frame = source.wait_frame(seq, timeout=1.0)
+                if frame is None:
+                    continue
+                seq, image, _ = frame
+                jpeg = self._preview_jpeg(cam, seq, image, overlay=overlay)
+                handler.wfile.write(
+                    b'--frame\r\nContent-Type: image/jpeg\r\n'
+                    + f'Content-Length: {len(jpeg)}\r\n\r\n'.encode('ascii')
+                    + jpeg + b'\r\n'
+                )
+                handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _preview_jpeg(self, cam: str, seq: int, image, *, overlay: bool) -> bytes:
+        live = self._live_of(cam) if overlay else None
+        det_seq = (
+            live['seq']
+            if live is not None and live['detection'].size == (image.shape[1], image.shape[0])
+            else 0
+        )
+        key = (cam, overlay)
+        with self._jpeg_lock:
+            cached = self._jpeg_cache.get(key)
+            if cached is not None and cached[0] == seq and cached[1] == det_seq:
+                return cached[2]
+        detection = live['detection'] if det_seq else None
+        jpeg = self._jpeg(image, detection=detection)
+        with self._jpeg_lock:
+            self._jpeg_cache[key] = (seq, det_seq, jpeg)
+        return jpeg
+
+    def _jpeg(self, image, detection=None) -> bytes:
+        resized = False
         if image.shape[1] > self.preview_width:
             scale = self.preview_width / image.shape[1]
             image = cv2.resize(image, None, fx=scale, fy=scale,
-                               interpolation=cv2.INTER_AREA)
+                               interpolation=cv2.INTER_LINEAR)
+            resized = True
+        if detection is not None:
+            image = self.board.overlay(image, detection, inplace=resized)
         ok, buffer = cv2.imencode('.jpg', image,
                                   [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
         if not ok:
@@ -703,6 +811,9 @@ def _one(query: dict, key: str, default=None) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
+    import os
+    from camera_node.camera_node import CYCLONEDDS_DEFAULT_URI
+    os.environ.setdefault('CYCLONEDDS_URI', CYCLONEDDS_DEFAULT_URI)
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--arm', default='')
     parser.add_argument('--camera', default='')
@@ -711,8 +822,10 @@ def main(argv: list[str] | None = None) -> None:
     clean_args = remove_ros_args(args=argv)[1:] if argv is not None else remove_ros_args()[1:]
     parsed, _ = parser.parse_known_args(clean_args)
     node = CalibrationNode(arm=parsed.arm, camera=parsed.camera, dashboard_port=parsed.port)
-    executor = MultiThreadedExecutor()
+    executor = SingleThreadedExecutor() if node.local_camera_node is not None else MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
+    if node.local_camera_node is not None:
+        executor.add_node(node.local_camera_node)
     try:
         executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):

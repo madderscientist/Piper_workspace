@@ -29,6 +29,7 @@ _ARM_ALIASES = {
     'arm_3': 'arm_3', 'arm3': 'arm_3', '/arm_3': 'arm_3', '3': 'arm_3',
     'arm_4': 'arm_4', 'arm4': 'arm_4', '/arm_4': 'arm_4', '4': 'arm_4',
 }
+_JOINT_NAMES_6 = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
 
 IMAGE_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.VOLATILE,
@@ -197,7 +198,7 @@ def image_to_bgr(message: Image) -> np.ndarray:
 class CameraSource:
     """一路相机：缓存最新一帧，并负责把它切到指定档位。"""
 
-    def __init__(self, node, name: str, config: dict) -> None:
+    def __init__(self, node, name: str, config: dict, *, subscribe_ros: bool = True) -> None:
         self.node = node
         self.name = name
         self.config = config
@@ -209,16 +210,19 @@ class CameraSource:
         self.arm = config.get('arm', '')
         self.profiles = config.get('profiles', [])
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self._frame = None                   # (seq, bgr, stamp)
         self._seq = 0
         self._info = None
         self._client = None
+        self._local_camera = None
 
-        node.create_subscription(Image, config['topic'], self._on_image, IMAGE_QOS)
-        if config.get('info_topic'):
-            node.create_subscription(CameraInfo, config['info_topic'], self._on_info, 10)
+        if subscribe_ros:
+            node.create_subscription(Image, config['topic'], self._on_image, IMAGE_QOS)
+            if config.get('info_topic'):
+                node.create_subscription(CameraInfo, config['info_topic'], self._on_info, 10)
         switch = config.get('switch', {})
-        if switch.get('kind') in ('camera_node', 'realsense'):
+        if subscribe_ros and switch.get('kind') in ('camera_node', 'realsense'):
             self._client = node.create_client(
                 SetParameters, f"{switch['node'].rstrip('/')}/set_parameters",
                 callback_group=node.callbacks)
@@ -229,9 +233,36 @@ class CameraSource:
         except ValueError as error:
             self.node.get_logger().warn(f'{self.name}: {error}', once=True)
             return
-        with self._lock:
+        self.push_bgr(image, copy=True)
+
+    def push_bgr(self, image: np.ndarray, *, copy: bool = False) -> None:
+        with self._cond:
             self._seq += 1
-            self._frame = (self._seq, image.copy(), time.monotonic())
+            self._frame = (self._seq, image.copy() if copy else image, time.monotonic())
+            self._cond.notify_all()
+
+    def wait_frame(self, after_seq: int, timeout: float = 1.0):
+        with self._cond:
+            if self._frame is None or self._frame[0] <= after_seq:
+                self._cond.wait(timeout)
+            frame = self._frame
+        if frame is None or frame[0] <= after_seq:
+            return None
+        return frame
+
+    def bind_local_camera(self, camera_node) -> None:
+        self._local_camera = camera_node
+
+        def _on_local_frame(raw, width, height, camera_info=None):
+            try:
+                image = np.frombuffer(raw, np.uint8).reshape(height, width, 3)
+                self.push_bgr(image)
+            except ValueError:
+                return
+            if camera_info is not None:
+                self._on_info(camera_info)
+
+        camera_node.add_local_sink(_on_local_frame)
 
     def _on_info(self, message: CameraInfo) -> None:
         self._info = {
@@ -282,13 +313,25 @@ class CameraSource:
         profile = self.find_profile(width, height)
         if profile is None:
             raise ValueError(f'{self.label} 没有 {width}x{height} 这个档位')
-        if self._client is None:
+        if self._client is None and self._local_camera is None:
             raise RuntimeError(f'{self.label} 不支持在线切档位，请改 launch 参数后重启')
 
         if self.config['switch']['kind'] == 'camera_node':
-            self._call([_param('rtsp_url', profile['url']),
-                        _param('image_width', 0), _param('image_height', 0)],
-                       timeout=10.0)
+            if self._local_camera is not None:
+                from rclpy.parameter import Parameter as RclParameter
+                results = self._local_camera.set_parameters([
+                    RclParameter('rtsp_url', RclParameter.Type.STRING, profile['url']),
+                    RclParameter('image_width', RclParameter.Type.INTEGER, 0),
+                    RclParameter('image_height', RclParameter.Type.INTEGER, 0),
+                ])
+                for result in results:
+                    if not result.successful:
+                        raise RuntimeError(f'设置参数被拒绝：{result.reason}')
+            else:
+                self._call([_param('rtsp_url', profile['url']),
+                            _param('image_width', 0),
+                            _param('image_height', 0)],
+                           timeout=10.0)
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -334,6 +377,14 @@ class MotionGate:
         names = list(message.name)
         pos = message.position
         vel = message.velocity
+        if names[:6] == _JOINT_NAMES_6 and len(pos) >= 6:
+            positions = np.array([float(pos[i]) for i in range(6)], dtype=float)
+            velocities = (
+                np.array([float(vel[i]) for i in range(6)], dtype=float)
+                if len(vel) >= 6
+                else None
+            )
+            return positions, velocities
         if names and all(f'joint{i}' in names for i in range(1, 7)):
             order = [names.index(f'joint{i}') for i in range(1, 7)]
             positions = np.array([float(pos[i]) for i in order], dtype=float)
@@ -400,13 +451,14 @@ class Frames:
     """机械臂末端位姿查询：计算 base_link -> gripper_base_top（夹爪底座 Mesh 最高点中心）。"""
 
     def __init__(self, node, arm_id: str = 'arm_3',
-                 link6_to_top_z_m: float = GRIPPER_WITH_WRENCH_TOP_Z_M) -> None:
+                 link6_to_top_z_m: float = GRIPPER_WITH_WRENCH_TOP_Z_M,
+                 *, enable_tf_listener: bool = False) -> None:
         self.node = node
         self.arm_id = arm_id
         self.link6_to_top_z_m = float(link6_to_top_z_m)
         self.angle_offsets = load_arm_angle_offsets(arm_id)
         self.buffer = Buffer()
-        self._listener = TransformListener(self.buffer, node)
+        self._listener = TransformListener(self.buffer, node) if enable_tf_listener else None
 
     def _offset_for_child(self, child: str) -> float:
         return self.link6_to_top_z_m if child == 'gripper_base_top' else 0.0

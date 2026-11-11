@@ -4,12 +4,17 @@
 - 传入 arm:=arm_3 或 camera:=arm4_camera（支持别名与 IP）：只启动所选的那一台腕部相机。
 """
 
+import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-from camera_node.camera_node import default_cameras_config_path, resolve_camera_selection
+from camera_node.camera_node import (
+    CYCLONEDDS_DEFAULT_URI,
+    default_cameras_config_path,
+    resolve_camera_selection,
+)
 
 _ARGS = {
     'config_file': (str(default_cameras_config_path()), str),
@@ -30,6 +35,7 @@ _ARGS = {
 
 
 def _launch_camera(context):
+    os.environ.setdefault('CYCLONEDDS_URI', CYCLONEDDS_DEFAULT_URI)
     config_file = LaunchConfiguration('config_file').perform(context).strip()
     arm_raw = LaunchConfiguration('arm').perform(context).strip()
     cam_raw = LaunchConfiguration('camera').perform(context).strip()

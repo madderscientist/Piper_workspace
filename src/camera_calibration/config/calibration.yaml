@@ -1,6 +1,45 @@
 version: 1
 intrinsics:
   camera_arm_4:
+  - width: 1920
+    height: 1080
+    camera_matrix:
+    - 2055.127265398864
+    - 0.0
+    - 931.9359401376155
+    - 0.0
+    - 2053.600764920058
+    - 541.5564582206699
+    - 0.0
+    - 0.0
+    - 1.0
+    distortion_model: plumb_bob
+    distortion_coefficients:
+    - -0.3557393486175423
+    - -0.5897821981934221
+    - 0.0001858383024987868
+    - -0.00033334801381675576
+    - 2.120416503238759
+    rms: 0.9301
+    images: 6
+    coverage: 0.5824
+    fov_deg:
+    - 50.08
+    - 29.47
+    stamp: '2026-11-10T12:10:49'
+    board:
+      squares_x: 12
+      squares_y: 9
+      square_size: 0.015
+      marker_size: 0.01125
+      square_size_mm: 15.0
+      marker_size_mm: 11.25
+      dictionary: DICT_5X5_100
+      corner_count: 88
+      marker_total: 54
+      width_m: 0.18
+      height_m: 0.135
+    source: camera_calibration
   - width: 720
     height: 480
     camera_matrix:
@@ -41,6 +80,45 @@ intrinsics:
       height_m: 0.135
     source: camera_calibration
   camera_arm_3:
+  - width: 1920
+    height: 1080
+    camera_matrix:
+    - 2063.0395856274026
+    - 0.0
+    - 922.4468829317599
+    - 0.0
+    - 2063.092212183821
+    - 548.4011038244845
+    - 0.0
+    - 0.0
+    - 1.0
+    distortion_model: plumb_bob
+    distortion_coefficients:
+    - -0.42620487434282633
+    - 0.1745573618998733
+    - 0.0008063680199612116
+    - 0.002220678416081395
+    - -0.132238688298834
+    rms: 0.4118
+    images: 6
+    coverage: 0.5577
+    fov_deg:
+    - 49.91
+    - 29.34
+    stamp: '2026-11-10T11:53:26'
+    board:
+      squares_x: 12
+      squares_y: 9
+      square_size: 0.015
+      marker_size: 0.01125
+      square_size_mm: 15.0
+      marker_size_mm: 11.25
+      dictionary: DICT_5X5_100
+      corner_count: 88
+      marker_total: 54
+      width_m: 0.18
+      height_m: 0.135
+    source: camera_calibration
   - width: 720
     height: 480
     camera_matrix:

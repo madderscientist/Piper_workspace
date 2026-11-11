@@ -72,14 +72,18 @@ function stale(host, sig) {
   return true;
 }
 
-// 上一张还在路上就改 src，浏览器会把它 abort 掉：白发一次请求，而且帧大一点
-// 每次都来不及加完，画面就一直空着
-function refreshPreview(img, url) {
-  if (img.dataset.busy === '1') return;
-  img.dataset.busy = '1';
-  const done = () => { img.dataset.busy = '0'; };
-  img.onload = done;
-  img.onerror = done;
+// MJPEG 长连接流：URL 没变时保持同一条流实时推帧，隐藏或离线时断开避免占连接
+function bindStream(img, url, active = true) {
+  if (!active) {
+    if (img.dataset.streamUrl) {
+      img.dataset.streamUrl = '';
+      img.removeAttribute('src');
+    }
+    return;
+  }
+  if (img.dataset.streamUrl === url) return;
+  img.dataset.streamUrl = url;
+  img.onerror = () => { img.dataset.streamUrl = ''; };
   img.src = url;
 }
 

@@ -102,6 +102,7 @@ def test_camera_source_apply_profile_switches_native_stream(cameras_cfg):
     src.config = cfg
     src.profiles = cfg['profiles']
     src._client = object()
+    src._local_camera = None
     src._call = lambda params, timeout=10.0: sent.extend(params)
     src.grab = lambda timeout=1.0: np.zeros((1080, 1920, 3), dtype=np.uint8)
 
@@ -112,6 +113,36 @@ def test_camera_source_apply_profile_switches_native_stream(cameras_cfg):
         for p in sent
     }
     assert by_name == {
+        'rtsp_url': 'rtsp://admin:123456@192.168.123.98/stream0',
+        'image_width': 0,
+        'image_height': 0,
+    }
+
+    local_params = []
+    src_local = CameraSource.__new__(CameraSource)
+    src_local.label = cfg['label']
+    src_local.config = cfg
+    src_local.profiles = cfg['profiles']
+    src_local._client = None
+    src_local._lock = time
+    frames = []
+    src_local.push_bgr = lambda img: frames.append(img.shape)
+    src_local.grab = lambda timeout=1.0: np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    class _DummyLocalCam:
+        def add_local_sink(self, cb):
+            self.sink = cb
+
+        def set_parameters(self, params):
+            local_params.extend(params)
+            return [type('R', (), {'successful': True, 'reason': ''})() for _ in params]
+
+    dummy_cam = _DummyLocalCam()
+    src_local.bind_local_camera(dummy_cam)
+    dummy_cam.sink(bytes(1920 * 1080 * 3), 1920, 1080, None)
+    assert frames == [(1080, 1920, 3)]
+    assert src_local.apply_profile(1920, 1080, timeout=1.0) == {'width': 1920, 'height': 1080}
+    assert {p.name: p.value for p in local_params} == {
         'rtsp_url': 'rtsp://admin:123456@192.168.123.98/stream0',
         'image_width': 0,
         'image_height': 0,
@@ -153,6 +184,14 @@ def test_dashboard_single_arm_board_intrinsic_and_extrinsic_workflow(tmp_path, b
         assert state['camera_ip'] == '192.168.123.97'
         assert [c['name'] for c in state['cameras']] == ['camera_arm_3']
         assert (state['board']['squares_x'], state['board']['squares_y']) in {(9, 12), (12, 9)}
+
+        # 验证缩放到 preview_width 后再画叠加图的返回尺寸与速度
+        dummy_1080 = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        node.active_source.push_bgr(dummy_1080)
+        with urlopen(f'http://127.0.0.1:{port}/api/preview?camera=camera_arm_3&overlay=1', timeout=3.0) as resp:
+            preview_bytes = resp.read()
+        preview_img = cv2.imdecode(np.frombuffer(preview_bytes, np.uint8), cv2.IMREAD_COLOR)
+        assert preview_img is not None and preview_img.shape[1] == node.preview_width
 
         # 1. 页面修改标定板规格再切回默认 9x12 / 30mm / 22.5mm / DICT_5X5
         updated = _post(port, '/api/board', {
