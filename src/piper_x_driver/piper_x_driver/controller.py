@@ -826,6 +826,7 @@ class Controller:
                 static_frictions=static_frictions,
                 error_epsilon=self.friction_error_epsilon,
                 velocity_epsilon=self.friction_velocity_epsilon,
+                active_impedances=active_impedance,
             ))
         )
         friction = (

@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
+from piper_x_driver.configuration import FleetConfig, default_config_path
+from piper_x_interfaces.srv import ConfigureArm
 import rclpy
 
 from .collector import (
@@ -13,9 +15,14 @@ from .collector import (
     DEFAULT_SWEEP_SPEEDS,
     SweepCollectorNode,
     SweepConfig,
+    V0CollectorNode,
+    V0ProbeConfig,
 )
 from .identification import (
+    DEFAULT_JOINT_V0,
     IdentificationReport,
+    V0CalibrationReport,
+    identify_arm_v0,
     identify_joint_friction,
     load_samples_csv,
     save_samples_csv,
@@ -122,6 +129,10 @@ def sweep_main(argv: Sequence[str] | None = None) -> int:
         '--fit-output', type=Path, default=None,
         help='Optional YAML path to immediately fit and update/save identified friction parameters',
     )
+    parser.add_argument(
+        '--skip-v0', action='store_true',
+        help='Skip automatic closed-loop critical v0 search after fitting joint 1..6',
+    )
     args = parser.parse_args(argv)
 
     config = SweepConfig(
@@ -165,6 +176,19 @@ def sweep_main(argv: Sequence[str] | None = None) -> int:
         )
         arm_model = arm_model.with_joint(args.joint, report.model)
         save_friction_model(arm_model, args.fit_output)
+        if (
+            1 <= args.joint <= 6
+            and not args.skip_v0
+            and max(report.model.fs, report.model.fc) > 0.02
+        ):
+            v0_rc = v0_main([
+                '--namespace', args.namespace,
+                '--arm-id', args.arm_id,
+                '--yaml', str(args.fit_output),
+                '--joints', str(args.joint),
+            ])
+            if v0_rc != 0:
+                return v0_rc
         print(f'Updated friction model saved to {args.fit_output}')
     return 0
 
@@ -197,12 +221,18 @@ def fit_main(argv: Sequence[str] | None = None) -> int:
     )
 
     for joint_idx in sorted(by_joint):
+        preserved_v0 = None
+        if 1 <= joint_idx <= 6 and joint_idx in arm_model.joints:
+            cur_v0 = arm_model.joint(joint_idx).v0
+            if abs(cur_v0 - DEFAULT_JOINT_V0[joint_idx - 1]) > 1e-6:
+                preserved_v0 = cur_v0
         report = identify_joint_friction(
             by_joint[joint_idx],
             grid_step=args.grid_step,
             trim_ratio=args.trim_ratio,
             max_harmonics=args.max_harmonics,
             candidate_omegas=args.omegas,
+            v0=preserved_v0,
         )
         print(format_report(report))
         arm_model = arm_model.with_joint(joint_idx, report.model)
@@ -231,4 +261,89 @@ def evaluate_main(argv: Sequence[str] | None = None) -> int:
         friction_scale=args.friction_scale,
     )
     print(' '.join(f'{t:.6f}' for t in torques))
+    return 0
+
+
+def format_v0_reports(reports: dict[int, V0CalibrationReport]) -> str:
+    lines = ['=== Zero-Speed Smoothing v0 Calibration Report ===']
+    for j, r in sorted(reports.items()):
+        crit_str = f'{r.v0_critical:.4f}' if r.v0_critical > 0 else '<0.0050 (all stable)'
+        lines.append(
+            f'  J{j}: v0={r.v0:.5f} rad/s '
+            f'(v0_crit={crit_str}, last_stable={r.v0_last_stable:.4f}, '
+            f'noise_bound={r.v0_noise:.5f} | '
+            f'v_noise={r.v_noise_peak:.4f} rad/s, flips={r.crit_reversals}, '
+            f'vmax={r.crit_vel_peak:.4f} rad/s, ping={r.excitation_nm:.3f} Nm, '
+            f'disp={r.max_disp_mrad:.3f} mrad)'
+        )
+    return '\n'.join(lines)
+
+
+def v0_main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description='Measure and update per-joint zero-speed v0 in place (~2.4 s) without re-running sweeps.'
+    )
+    parser.add_argument('--namespace', default='/arm_1', help='Target arm ROS namespace (default: /arm_1)')
+    parser.add_argument('--arm-id', default='', help='Arm identifier (inferred from namespace if omitted)')
+    parser.add_argument('--config-file', type=Path, default=default_config_path())
+    parser.add_argument('--yaml', type=Path, default=None, help='Friction YAML file to update in place')
+    parser.add_argument(
+        '--joints', type=int, nargs='+', default=[1, 2, 3, 4, 5, 6], choices=range(1, 7),
+        help='Joints 1..6 to calibrate v0 for (default: all 1..6)',
+    )
+    args = parser.parse_args(argv)
+
+    fleet = FleetConfig(args.config_file)
+    arm_cfg = (
+        fleet.arm(args.arm_id)
+        if args.arm_id
+        else next((a for a in fleet.arms if a.namespace == args.namespace.rstrip('/')), fleet.arms[0])
+    )
+    yaml_path = Path(args.yaml) if args.yaml is not None else Path(arm_cfg.friction_config)
+    if not yaml_path.is_file():
+        print(f'Friction YAML not found: {yaml_path}', file=sys.stderr)
+        return 1
+    arm_model = load_friction_model(yaml_path)
+    grav_model = fleet.gravity_model(arm_cfg)
+    static_frictions = (
+        tuple(grav_model.joint(i).static_friction for i in range(1, 7))
+        if grav_model is not None else (0.0,) * 6
+    )
+
+    probe_cfg = V0ProbeConfig(namespace=arm_cfg.namespace, joints=tuple(sorted(set(args.joints))))
+    rclpy.init()
+    node = V0CollectorNode(
+        probe_cfg, arm_model,
+        static_frictions=static_frictions,
+        friction_scale=arm_cfg.friction_scale,
+    )
+    try:
+        while rclpy.ok() and not node.completed and not node.error:
+            rclpy.spin_once(node, timeout_sec=0.02)
+        if node.error:
+            print(f'v0 calibration aborted: {node.error}', file=sys.stderr)
+            return 1
+        updated_model, reports = identify_arm_v0(
+            arm_model,
+            node.noise_samples,
+            node.search_records,
+            joints=probe_cfg.joints,
+            friction_scale=arm_cfg.friction_scale,
+            amplitudes=node.amplitudes,
+        )
+        save_friction_model(updated_model, yaml_path)
+        print(format_v0_reports(reports))
+        print(f'Updated v0 in {yaml_path}')
+        if node.config_client.service_is_ready():
+            fut = node.config_client.call_async(ConfigureArm.Request(
+                end_effector=arm_cfg.end_effector,
+                gravity_scale=arm_cfg.gravity_scale,
+                friction_scale=-4.0 - arm_cfg.friction_scale,
+            ))
+            rclpy.spin_until_future_complete(node, fut, timeout_sec=1.5)
+    except KeyboardInterrupt:
+        return 1
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
     return 0

@@ -11,6 +11,7 @@ from piper_friction.cli import evaluate_main, fit_main
 from piper_friction.collector import SweepCollectorNode, SweepConfig, sample_velocity_confidence
 from piper_friction.identification import (
     SweepSample,
+    identify_arm_v0,
     identify_joint_friction,
     load_samples_csv,
     save_samples_csv,
@@ -326,6 +327,55 @@ def test_web_workbench_demo_all_and_sequential_queue(tmp_path):
         assert zeroed_during_web_sweep
         assert FleetConfig(cfg_path).arm('arm_1').friction_scale == FleetConfig(default_config_path()).arm('arm_1').friction_scale
         assert 1 in web_node.joint_samples['arm_1'] and 2 in web_node.joint_samples['arm_1']
+
+        # Standalone in-place v0 calibration updates only v0 without re-running sweeps
+        v0_yaml = tmp_path / 'arm1_v0.yaml'
+        save_friction_model(web_node.arm_models['arm_1'], v0_yaml)
+        fc_before = web_node.arm_models['arm_1'].joint(3).fc
+        base_snap = driver.arm.snapshot
+
+        # Simulate a rotor-flexspline mode on J3 that self-excites once v0 drops <= 0.030 rad/s
+        def v0_sim_snapshot():
+            runner = web_node.runners['/arm_1']
+            cand = (0.12, 0.085, 0.060, 0.042, 0.030, 0.021, 0.015, 0.010, 0.007, 0.005)[
+                min(runner.v0_cand_index, 9)
+            ]
+            osc = (
+                0.025 * np.sin(2.0 * np.pi * 12.0 * time.monotonic())
+                if runner.phase == 'v0_burst' and cand <= 0.030
+                else 0.0
+            )
+            return Feedback(
+                driver.arm.position,
+                driver.arm.status.copy(),
+                driver.arm.enabled,
+                (0.0,) * 11,
+                (0.2, 0.0, 0.2, 0.0, 0.0, 0.0),
+                (0.0, 0.0, float(osc), 0.0, 0.0, 0.0),
+                (0.0,) * 6,
+            )
+
+        driver.arm.snapshot = v0_sim_snapshot
+        v0_req = Request(
+            f'{base_url}/api/v0/start',
+            data=json.dumps({
+                'namespace': '/arm_1',
+                'joints': [3],
+                'fit_output': str(v0_yaml),
+            }).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        assert json.loads(urlopen(v0_req, timeout=3).read().decode('utf-8'))['ok'] is True
+        v0_deadline = time.monotonic() + 10.0
+        while web_node.sweep_phase != 'completed' and time.monotonic() < v0_deadline:
+            executor.spin_once(timeout_sec=0.005)
+        assert web_node.sweep_phase == 'completed', web_node.sweep_error
+        driver.arm.snapshot = base_snap
+        reloaded_v0 = load_friction_model(v0_yaml)
+        assert reloaded_v0.joint(3).fc == pytest.approx(fc_before)
+        assert web_node.v0_reports['arm_1'][3]['v0_critical'] == pytest.approx(0.030)
+        assert reloaded_v0.joint(3).v0 == pytest.approx(1.4 * 0.042, abs=1e-4)
     finally:
         server.shutdown()
         server.server_close()

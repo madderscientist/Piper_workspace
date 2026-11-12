@@ -15,7 +15,19 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 
-from .identification import SweepSample
+from .identification import (
+    SweepSample,
+    V0_BURST_GROUPS,
+    V0_CANDIDATES,
+    V0_NOISE_DURATION_S,
+    V0_OBS_START_S,
+    V0_STEP_DURATION_S,
+    compute_resting_v_noise,
+    is_v0_step_oscillating,
+    v0_closed_loop_step_torque,
+    v0_excitation_amplitude,
+)
+from .model import ArmFrictionModel
 
 JOINT_NAMES = tuple(f'joint{i}' for i in range(1, 7)) + ('gripper',)
 DEFAULT_SWEEP_SPEEDS = (0.03, 0.06, 0.12, 0.25, 0.5, 1.0, 1.5)
@@ -599,3 +611,369 @@ class SweepCollectorNode(Node):
         self.segment_started = self.sweep_started
         self._segment_velocities = []
         self.phase = 'running'
+
+
+@dataclass(frozen=True)
+class V0ProbeConfig:
+    """Configuration for closed-loop breakaway ping + critical v0 search."""
+
+    namespace: str = '/arm_1'
+    joints: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
+    noise_duration: float = V0_NOISE_DURATION_S
+    step_duration: float = V0_STEP_DURATION_S
+    candidates: tuple[float, ...] = V0_CANDIDATES
+    max_drift_rad: float = 0.045
+    rate_hz: float = 200.0
+
+    def __post_init__(self) -> None:
+        if not self.joints or any(j not in range(1, 7) for j in self.joints):
+            raise ValueError(f'joints must be a non-empty subset of 1..6, got {self.joints}')
+
+
+class V0CollectorNode(Node):
+    """ROS 2 client node that finds each joint's critical v0 via closed-loop ping + ringdown descent."""
+
+    def __init__(
+        self,
+        config: V0ProbeConfig,
+        arm_model: ArmFrictionModel,
+        static_frictions: Sequence[float] = (0.0,) * 6,
+        friction_scale: float = 0.88,
+        **kwargs,
+    ):
+        super().__init__('piper_friction_v0_collector', **kwargs)
+        self.config = config
+        self.arm_model = arm_model
+        self.target_friction_scale = float(friction_scale)
+        self.amplitudes = {
+            j: v0_excitation_amplitude(
+                arm_model.joint(j),
+                static_frictions[j - 1] if j - 1 < len(static_frictions) else 0.0,
+            )
+            for j in config.joints
+            if j in arm_model.joints
+        }
+        self.burst_groups = tuple(
+            tuple(j for j in grp if j in self.amplitudes)
+            for grp in V0_BURST_GROUPS
+        )
+        self.burst_groups = tuple(grp for grp in self.burst_groups if grp)
+
+        prefix = config.namespace.rstrip('/')
+        self.phase = 'waiting_feedback'
+        self.error = ''
+        self.completed = False
+        self.latest_position: tuple[float, ...] | None = None
+        self.latest_velocity: tuple[float, ...] = (0.0,) * 6
+        self.latest_status: ArmStatus | None = None
+        self.arm_end_effector = 'teaching_handle'
+        self.arm_gravity_scale = 1.0
+        self.arm_friction_scale = float(friction_scale)
+        self._saved_friction_scale: float | None = None
+        self.q0: tuple[float, ...] | None = None
+        self._pending_future = None
+        self.phase_started = 0.0
+        self.burst_index = 0
+        self.cand_index = 0
+        self.current_torques: tuple[float, ...] = (0.0,) * 6
+        self.noise_samples: list[tuple[float, tuple[float, ...]]] = []
+        self.v_noise_by_joint: dict[int, float] = {j: 0.001 for j in self.amplitudes}
+        self.triggered_joints: set[int] = set()
+        self._step_qs: dict[int, list[float]] = {j: [] for j in self.amplitudes}
+        self._step_obs_vels: dict[int, list[float]] = {j: [] for j in self.amplitudes}
+        self.search_records: dict[int, list[tuple[float, list[float], list[float]]]] = {
+            j: [] for j in self.amplitudes
+        }
+
+        realtime_sub_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.create_subscription(
+            JointState, f'{prefix}/joint_states_feedback', self._on_joints, realtime_sub_qos,
+        )
+        self.create_subscription(
+            ArmStatus, f'{prefix}/arm_status', self._on_status, realtime_sub_qos,
+        )
+        self.create_subscription(
+            String, f'{prefix}/control_state', self._on_control_state, realtime_sub_qos,
+        )
+        self.mit_pub = self.create_publisher(MitCommand, f'{prefix}/command/mit', 10)
+        self.config_client = self.create_client(ConfigureArm, f'{prefix}/configure_arm')
+        self.enable_client = self.create_client(Enable, f'{prefix}/enable_srv')
+        self.mode_client = self.create_client(SetMode, f'{prefix}/set_mode')
+        self.create_timer(1.0 / config.rate_hz, self._tick)
+
+    def _on_joints(self, message: JointState) -> None:
+        names = tuple(message.name)
+        if len(message.position) != 7:
+            return
+        if names == JOINT_NAMES:
+            order = range(7)
+        else:
+            if len(names) != 7 or set(names) != set(JOINT_NAMES):
+                return
+            order = [names.index(name) for name in JOINT_NAMES]
+        now = time.monotonic()
+        self.latest_position = tuple(float(message.position[i]) for i in order)
+        if len(message.velocity) >= 6:
+            self.latest_velocity = tuple(float(message.velocity[i]) for i in order[:6])
+
+        if self.phase == 'measuring_noise':
+            elapsed = now - self.phase_started
+            if elapsed >= 0.10:
+                self.noise_samples.append((elapsed - 0.10, self.latest_velocity))
+        elif self.phase == 'running_burst' and self.burst_index < len(self.burst_groups):
+            elapsed = now - self.phase_started
+            if elapsed <= self.config.step_duration and self.cand_index < len(self.config.candidates):
+                cand = self.config.candidates[self.cand_index]
+                tau = [0.0] * 6
+                for j in self.burst_groups[self.burst_index]:
+                    if j in self.triggered_joints:
+                        continue
+                    idx = j - 1
+                    q_j = self.latest_position[idx]
+                    dq_j = self.latest_velocity[idx]
+                    self._step_qs[j].append(q_j)
+                    if elapsed >= V0_OBS_START_S:
+                        self._step_obs_vels[j].append(dq_j)
+                    tau[idx] = v0_closed_loop_step_torque(
+                        elapsed, q_j, dq_j, self.arm_model.joint(j),
+                        cand, self.amplitudes[j], self.target_friction_scale,
+                    )
+                self._publish_zero_gain_mit(tau)
+
+    def _on_status(self, message: ArmStatus) -> None:
+        self.latest_status = message
+
+    def _on_control_state(self, message: String) -> None:
+        try:
+            state = json.loads(message.data)
+            cfg = state.get('configuration', {})
+            if isinstance(cfg.get('end_effector'), str) and cfg['end_effector']:
+                self.arm_end_effector = cfg['end_effector']
+            if isinstance(cfg.get('gravity_scale'), (int, float)):
+                self.arm_gravity_scale = float(cfg['gravity_scale'])
+            if isinstance(cfg.get('friction_scale'), (int, float)):
+                self.arm_friction_scale = float(cfg['friction_scale'])
+        except (ValueError, TypeError, KeyError):
+            pass
+
+    def _publish_zero_gain_mit(self, torques: Sequence[float]) -> None:
+        assert self.q0 is not None
+        cur = self.latest_position[:6] if self.latest_position is not None else self.q0
+        kp = [0.0] * 6
+        kd = [0.0] * 6
+        tau = [float(t) for t in torques[:6]]
+        for i in range(6):
+            if abs(cur[i] - self.q0[i]) > self.config.max_drift_rad:
+                tau[i] = 0.0
+                kp[i] = 8.0
+                kd[i] = 1.0
+        msg = MitCommand()
+        msg.position = list(self.q0)
+        msg.velocity = [0.0] * 6
+        msg.kp = kp
+        msg.kd = kd
+        msg.torque = tau
+        self.current_torques = tuple(tau)
+        self.mit_pub.publish(msg)
+
+    def _restore_scale(self):
+        if self._saved_friction_scale is not None and self.config_client.service_is_ready():
+            fut = self.config_client.call_async(
+                ConfigureArm.Request(
+                    end_effector=self.arm_end_effector,
+                    gravity_scale=1.0,
+                    friction_scale=-4.0 - self._saved_friction_scale,
+                )
+            )
+            self._saved_friction_scale = None
+            return fut
+        return None
+
+    def _fail(self, reason: str) -> None:
+        self._restore_scale()
+        self.error = reason
+        self.phase = 'failed'
+        self.get_logger().error(reason)
+
+    def _enter_mit_or_noise(self) -> None:
+        assert self.latest_status is not None
+        self._publish_zero_gain_mit((0.0,) * 6)
+        if self.latest_status.ctrl_mode == 1 and self.latest_status.mode_feedback == 6:
+            self.phase = 'measuring_noise'
+            self.phase_started = time.monotonic()
+            return
+        if not self.mode_client.service_is_ready():
+            return
+        self._pending_future = self.mode_client.call_async(SetMode.Request(mode='mit'))
+        self.phase = 'setting_mode'
+
+    def _tick(self) -> None:
+        if self.phase in ('completed', 'failed'):
+            return
+        if self.latest_position is None or self.latest_status is None:
+            return
+        if self.latest_status.err_code or self.latest_status.arm_status not in (0, 11, 12, 13):
+            self._fail(
+                f'Arm fault reported: arm_status={self.latest_status.arm_status}, '
+                f'err_code={self.latest_status.err_code}'
+            )
+            return
+
+        if self.phase == 'waiting_feedback':
+            self.q0 = self.latest_position[:6]
+            if self.config_client.service_is_ready():
+                self._saved_friction_scale = self.arm_friction_scale
+                self._pending_future = self.config_client.call_async(
+                    ConfigureArm.Request(
+                        end_effector=self.arm_end_effector,
+                        gravity_scale=1.0,
+                        friction_scale=-2.0,
+                    )
+                )
+                self.phase = 'zeroing_friction'
+                return
+            if not all(self.latest_status.motor_enabled):
+                if self.enable_client.service_is_ready():
+                    self._pending_future = self.enable_client.call_async(
+                        Enable.Request(enable_request=True),
+                    )
+                    self.phase = 'enabling'
+                return
+            self._enter_mit_or_noise()
+            return
+
+        if self.phase == 'zeroing_friction':
+            assert self._pending_future is not None
+            if not self._pending_future.done():
+                return
+            res = self._pending_future.result()
+            if res is None or not res.success:
+                self._fail(f'Failed to zero friction_scale: {getattr(res, "message", "no response")}')
+                return
+            if not all(self.latest_status.motor_enabled):
+                if not self.enable_client.service_is_ready():
+                    return
+                self._pending_future = self.enable_client.call_async(
+                    Enable.Request(enable_request=True),
+                )
+                self.phase = 'enabling'
+                return
+            self._enter_mit_or_noise()
+            return
+
+        if self.phase == 'enabling':
+            assert self._pending_future is not None
+            if not self._pending_future.done():
+                return
+            res = self._pending_future.result()
+            if res is None or not res.enable_response:
+                self._fail(f'Failed to enable arm: {getattr(res, "message", "no response")}')
+                return
+            self._enter_mit_or_noise()
+            return
+
+        if self.phase == 'setting_mode':
+            self._publish_zero_gain_mit((0.0,) * 6)
+            assert self._pending_future is not None
+            if not self._pending_future.done():
+                return
+            res = self._pending_future.result()
+            if res is None or not res.success:
+                self._fail(f'Failed to enter MIT mode: {getattr(res, "message", "no response")}')
+                return
+            self.phase = 'measuring_noise'
+            self.phase_started = time.monotonic()
+            return
+
+        if self.phase == 'measuring_noise':
+            self._publish_zero_gain_mit((0.0,) * 6)
+            if time.monotonic() - self.phase_started >= (0.10 + self.config.noise_duration):
+                for j in self.amplitudes:
+                    self.v_noise_by_joint[j] = compute_resting_v_noise(
+                        [vel[j - 1] for _, vel in self.noise_samples if len(vel) >= j],
+                    )
+                self.burst_index = 0
+                self.cand_index = 0
+                self._reset_step_buffers()
+                if self.burst_groups:
+                    self.phase = 'running_burst'
+                    self.phase_started = time.monotonic()
+                else:
+                    fut = self._restore_scale()
+                    if fut is not None:
+                        self._pending_future = fut
+                        self.phase = 'restoring_friction'
+                    else:
+                        self.phase = 'completed'
+                        self.completed = True
+            return
+
+        if self.phase == 'running_burst':
+            now = time.monotonic()
+            elapsed = now - self.phase_started
+            active_group = [
+                j for j in self.burst_groups[self.burst_index] if j not in self.triggered_joints
+            ]
+            if active_group and elapsed <= self.config.step_duration:
+                cand = self.config.candidates[self.cand_index]
+                tau = [0.0] * 6
+                for j in active_group:
+                    idx = j - 1
+                    tau[idx] = v0_closed_loop_step_torque(
+                        elapsed,
+                        self.latest_position[idx],
+                        self.latest_velocity[idx],
+                        self.arm_model.joint(j),
+                        cand,
+                        self.amplitudes[j],
+                        self.target_friction_scale,
+                    )
+                self._publish_zero_gain_mit(tau)
+                return
+            self._publish_zero_gain_mit((0.0,) * 6)
+            if active_group:
+                cand = self.config.candidates[self.cand_index]
+                for j in active_group:
+                    qs_j = list(self._step_qs[j])
+                    obs_j = list(self._step_obs_vels[j])
+                    self.search_records[j].append((cand, qs_j, obs_j))
+                    unstable, _, _ = is_v0_step_oscillating(obs_j, self.v_noise_by_joint[j])
+                    if unstable:
+                        self.triggered_joints.add(j)
+            self._reset_step_buffers()
+            remaining_in_group = [
+                j for j in self.burst_groups[self.burst_index] if j not in self.triggered_joints
+            ]
+            if remaining_in_group and self.cand_index + 1 < len(self.config.candidates):
+                self.cand_index += 1
+                self.phase_started = now
+                return
+            if self.burst_index + 1 < len(self.burst_groups):
+                self.burst_index += 1
+                self.cand_index = 0
+                self.phase_started = now
+                return
+            fut = self._restore_scale()
+            if fut is not None:
+                self._pending_future = fut
+                self.phase = 'restoring_friction'
+                return
+            self.phase = 'completed'
+            self.completed = True
+            return
+
+        if self.phase == 'restoring_friction':
+            self._publish_zero_gain_mit((0.0,) * 6)
+            if self._pending_future is not None and not self._pending_future.done():
+                return
+            self.phase = 'completed'
+            self.completed = True
+
+    def _reset_step_buffers(self) -> None:
+        for j in self.amplitudes:
+            self._step_qs[j] = []
+            self._step_obs_vels[j] = []

@@ -405,9 +405,14 @@
   function renderSweepProgress() {
     const sw = state.sweep;
     const pill = $('sweep-phase-pill');
-    const busy = ['waiting_feedback', 'zeroing_friction', 'enabling', 'setting_mode', 'running'].includes(sw.phase);
+    const busy = [
+      'waiting_feedback', 'zeroing_friction', 'enabling', 'setting_mode', 'running', 'restoring_friction',
+      'v0_pending_fit', 'v0_waiting', 'v0_zeroing', 'v0_enabling',
+      'v0_setting_mode', 'v0_noise', 'v0_burst', 'v0_restoring',
+    ].includes(sw.phase);
     $('btn-start-queue').disabled = busy;
     $('btn-start-single').disabled = busy;
+    if ($('btn-start-v0')) $('btn-start-v0').disabled = busy;
     $('btn-stop-sweep').disabled = !busy;
 
     pill.textContent = `${sw.phase}${sw.error ? ' · ' + sw.error : ''}`;
@@ -670,6 +675,10 @@
       $('val-fs').textContent = '—';
       $('val-vs').textContent = '—';
       $('val-fv').textContent = '—';
+      if ($('val-v0')) {
+        const v0Rep = ((state.v0Reports || {})[arm.id] || {})[state.activeJoint];
+        $('val-v0').textContent = v0Rep ? Number(v0Rep.v0).toFixed(4) : '—';
+      }
       $('val-vr').textContent = '—';
       $('val-rmse').textContent = '—';
       $('harmonics-tbody').innerHTML = '<tr><td colspan="9" class="empty-cell">当前关节尚未拟合，请点击右上角“⚡ 加载整臂 J1~J6 示例数据”或启动该轴扫描</td></tr>';
@@ -687,6 +696,7 @@
     $('val-fs').textContent = m.fs.toFixed(4);
     $('val-vs').textContent = m.vs.toFixed(4);
     $('val-fv').textContent = m.fv.toFixed(4);
+    if ($('val-v0')) $('val-v0').textContent = Number(m.v0).toFixed(4);
     $('val-vr').textContent = m.vr.toFixed(4);
     $('val-rmse').textContent = fit.metrics.rmse_total.toFixed(4);
 
@@ -917,6 +927,14 @@
           }
         }
       }
+      if (data.v0_reports) {
+        const prevV0 = JSON.stringify(state.v0Reports || {});
+        const nextV0 = JSON.stringify(data.v0_reports);
+        if (prevV0 !== nextV0) {
+          state.v0Reports = data.v0_reports;
+          fitsChanged = true;
+        }
+      }
       renderArmSelector();
       renderLiveTelemetry();
       renderSweepProgress();
@@ -994,6 +1012,28 @@
     $('btn-start-single').addEventListener('click', () => {
       startOnlineSweep([state.activeJoint]);
     });
+
+    if ($('btn-start-v0')) {
+      $('btn-start-v0').addEventListener('click', async () => {
+        const arm = selectedArm();
+        const chosen = [1, 2, 3, 4, 5, 6].filter((j) => state.jointPlan[j].checked);
+        const joints = chosen.length > 0 ? chosen : [1, 2, 3, 4, 5, 6];
+        const fit_output = $('input-fit-output').value.trim();
+        try {
+          const res = await fetch('/api/v0/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ namespace: arm.namespace, joints, fit_output }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || '启动 v0 测算失败');
+          showNotice(`已启动 ${arm.namespace} 闭环破拆脉冲 + 递减搜寻临界 v0 (~5s)，找到起振临界点后自动收敛`, 'ok');
+          await pollStatus();
+        } catch (err) {
+          showNotice(`无法启动 v0 测算：${err.message}`, 'error');
+        }
+      });
+    }
 
     $('btn-stop-sweep').addEventListener('click', async () => {
       try {

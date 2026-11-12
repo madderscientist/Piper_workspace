@@ -27,6 +27,10 @@ def _interp_1d(x: float, xs: tuple[float, ...], ys: tuple[float, ...]) -> float:
     return float(y0 + alpha * (y1 - y0))
 
 
+UNDAMPED_MAX_ZERO_SLOPE = 10.0
+UNDAMPED_MIN_V0 = 0.03
+
+
 @dataclass(frozen=True)
 class SpatialHarmonic:
     """One spatial harmonic component at angular frequency omega (cycles per 2*pi rad).
@@ -207,6 +211,7 @@ class JointFrictionModel:
         static_friction: float = 0.0,
         error_epsilon: float | None = None,
         velocity_epsilon: float | None = None,
+        active_impedance: bool = True,
         cogging_scale: float = 1.0,
         friction_scale: float = 1.0,
     ) -> float:
@@ -236,7 +241,12 @@ class JointFrictionModel:
         # 1. 高速衰减包络 w(dq) = exp(-(dq / vr)^2)：低速接近 1（完整补偿齿轮感），高速趋近 0（平滑退火）
         env = self.envelope(velocity)
         # 2. 零速平滑门控 tanh(|dq| / v0)：静止时为 0 防止齿槽补偿在零速自激，一旦运动迅速升至 1
-        tanh_v = math.tanh(velocity / self.v0)
+        v0_eff = (
+            self.v0
+            if active_impedance or self.v0 > 0.005
+            else max(self.v0, UNDAMPED_MIN_V0, (max(self.fs, self.fc) + abs(mod_raw)) / UNDAMPED_MAX_ZERO_SLOPE)
+        )
+        tanh_v = math.tanh(velocity / v0_eff)
         motion_gate = abs(tanh_v)
         # 3. 与运动方向相关的摩擦项：随 |dq| 从静摩擦平滑过渡到 Stribeck + 周期啮合调制 + 粘滞摩擦
         dry = (
@@ -542,6 +552,7 @@ class ArmFrictionModel:
         static_frictions: tuple[float, ...] | list[float] = (0.0,) * 6,
         error_epsilon: float | None = None,
         velocity_epsilon: float | None = None,
+        active_impedances: tuple[bool, ...] | list[bool] | None = None,
         cogging_scale: float = 1.0,
         friction_scale: float = 1.0,
     ) -> tuple[float, ...]:
@@ -565,6 +576,11 @@ class ArmFrictionModel:
                 ),
                 error_epsilon=error_epsilon,
                 velocity_epsilon=velocity_epsilon,
+                active_impedance=(
+                    True
+                    if active_impedances is None or index - 1 >= len(active_impedances)
+                    else bool(active_impedances[index - 1])
+                ),
                 cogging_scale=cogging_scale,
                 friction_scale=friction_scale,
             )

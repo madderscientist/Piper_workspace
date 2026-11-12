@@ -196,6 +196,7 @@
           <div class="action-bar">
             <button type="button" id="btn-start-queue" class="btn-primary">▶ 一键按序标定勾选关节 (队列执行)</button>
             <button type="button" id="btn-start-single" class="btn-secondary">▶ 仅扫描当前查看关节 (<span id="lbl-active-joint">J1</span>)</button>
+            <button type="button" id="btn-start-v0" class="btn-secondary" title="基于已有 Fc/Fs 注入破拆脉冲并闭环递减搜索临界起振点 v0_crit（约 5s，不重跑扫描）">⚡ 闭环搜寻临界 v0 (~5s)</button>
             <button type="button" id="btn-stop-sweep" class="btn-danger" disabled>⏹ 紧急停止扫描</button>
           </div>
 
@@ -255,6 +256,7 @@
             <div class="param-box"><span>静摩擦峰值 Fs</span><strong id="val-fs">—</strong><small>Nm (慢速启动阻力)</small></div>
             <div class="param-box"><span>Stribeck 速度 vs</span><strong id="val-vs">—</strong><small>rad/s (静→动拐点)</small></div>
             <div class="param-box"><span>粘滞阻尼 fv</span><strong id="val-fv">—</strong><small>Nm/(rad/s)</small></div>
+            <div class="param-box"><span>零速门控 v0</span><strong id="val-v0">—</strong><small>rad/s (防零力自激)</small></div>
             <div class="param-box highlight"><span>齿轮感消失速度 vr</span><strong id="val-vr">—</strong><small>rad/s (包络 w=e^-(v/vr)²)</small></div>
             <div class="param-box"><span>总稳态拟合 RMSE</span><strong id="val-rmse">—</strong><small>Nm (越小越准)</small></div>
           </div>

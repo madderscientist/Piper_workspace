@@ -18,6 +18,7 @@ setup(
             'sweep = piper_friction.cli:sweep_main',
             'fit = piper_friction.cli:fit_main',
             'evaluate = piper_friction.cli:evaluate_main',
+            'calibrate_v0 = piper_friction.cli:v0_main',
             'web = piper_friction.web:web_main',
         ],
     },

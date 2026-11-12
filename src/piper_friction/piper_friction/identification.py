@@ -2,6 +2,7 @@
 
 import csv
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import math
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -11,9 +12,17 @@ from piper_x_driver.gravity import joint_inertias
 from scipy.optimize import least_squares, minimize_scalar
 from scipy.signal import detrend
 
-from .model import GripperFrictionModel, JointFrictionModel, SpatialHarmonic
+from .model import ArmFrictionModel, GripperFrictionModel, JointFrictionModel, SpatialHarmonic
 
 _ANCHOR_INERTIAS = joint_inertias((0.0, 0.90, -1.50, 0.0, 0.0, 0.0))
+V0_CANDIDATES: tuple[float, ...] = (
+    0.12, 0.085, 0.060, 0.042, 0.030, 0.021, 0.015, 0.010, 0.007, 0.005,
+)
+V0_PING_HALF_S = 0.020
+V0_OBS_START_S = 0.120
+V0_STEP_DURATION_S = 0.340
+V0_NOISE_DURATION_S = 0.40
+V0_BURST_GROUPS: tuple[tuple[int, ...], ...] = ((1, 4, 6), (2, 3, 5))
 
 
 @dataclass(frozen=True)
@@ -1030,3 +1039,191 @@ def identify_joint_friction(
         rmse_cogging=rmse_cogging,
         rmse_modulation=rmse_modulation,
     )
+
+
+@dataclass(frozen=True)
+class V0CalibrationReport:
+    """Measured zero-speed smoothing velocity v0 from closed-loop ping + critical descent."""
+
+    joint: int
+    v0: float
+    v0_critical: float
+    v0_last_stable: float
+    v0_noise: float
+    v0_stability: float
+    v_noise_peak: float
+    crit_reversals: int
+    crit_vel_peak: float
+    excitation_nm: float
+    max_disp_mrad: float
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            'joint': int(self.joint),
+            'v0': float(self.v0),
+            'v0_critical': float(self.v0_critical),
+            'v0_last_stable': float(self.v0_last_stable),
+            'v0_noise': float(self.v0_noise),
+            'v0_stability': float(self.v0_stability),
+            'v_noise_peak': float(self.v_noise_peak),
+            'crit_reversals': int(self.crit_reversals),
+            'crit_vel_peak': float(self.crit_vel_peak),
+            'excitation_nm': float(self.excitation_nm),
+            'max_disp_mrad': float(self.max_disp_mrad),
+        }
+
+
+def v0_excitation_amplitude(
+    joint_model: JointFrictionModel,
+    static_friction: float = 0.0,
+) -> float:
+    """Zero-impulse breakaway doublet amplitude (Nm) to unstick motor rotor before ringdown check."""
+    fs_ref = max(float(joint_model.fs), float(joint_model.fc), float(static_friction), 0.07)
+    return float(np.clip(0.80 * fs_ref, 0.055, 0.60))
+
+
+def compute_resting_v_noise(noise_velocities: Sequence[float]) -> float:
+    if not noise_velocities:
+        return 0.001
+    nv = np.asarray(noise_velocities, dtype=float)
+    abs_noise = np.abs(nv - float(np.median(nv)))
+    return max(float(np.percentile(abs_noise, 99)), 0.001)
+
+
+def is_v0_step_oscillating(
+    obs_velocities: Sequence[float],
+    v_noise: float,
+) -> tuple[bool, int, float]:
+    """Detect sustained rotor limit-cycle oscillation or non-decaying motion after a breakaway ping."""
+    if len(obs_velocities) < 4:
+        return False, 0, 0.0
+    arr = np.asarray(obs_velocities, dtype=float)
+    abs_v = np.abs(arr)
+    v_max = float(np.max(abs_v))
+    v_p85 = float(np.percentile(abs_v, 85))
+    deadband = max(2.5 * float(v_noise), 0.004)
+    signs = [1 if v > 0.0 else -1 for v in arr if abs(v) >= deadband]
+    reversals = sum(1 for a, b in zip(signs, signs[1:]) if a != b)
+    unstable = (
+        (reversals >= 2 and v_max >= max(3.0 * float(v_noise), 0.005))
+        or v_p85 >= max(4.0 * float(v_noise), 0.010)
+    )
+    return bool(unstable), int(reversals), float(v_max)
+
+
+def v0_closed_loop_step_torque(
+    elapsed_s: float,
+    theta: float,
+    velocity: float,
+    joint_model: JointFrictionModel,
+    v0_candidate: float,
+    ping_amplitude_nm: float,
+    friction_scale: float,
+) -> float:
+    """Return symmetric +-20 ms breakaway ping followed by closed-loop friction compensation at v0_candidate."""
+    if elapsed_s < V0_PING_HALF_S:
+        return float(ping_amplitude_nm)
+    if elapsed_s < 2.0 * V0_PING_HALF_S:
+        return float(-ping_amplitude_nm)
+    probe_model = replace(joint_model, v0=float(v0_candidate))
+    return float(
+        probe_model.torque(
+            float(theta),
+            float(velocity),
+            active_impedance=True,
+            friction_scale=float(friction_scale),
+            cogging_scale=float(friction_scale),
+        )
+    )
+
+
+def identify_joint_v0(
+    joint: int,
+    joint_model: JointFrictionModel,
+    noise_velocities: Sequence[float],
+    step_records: Sequence[tuple[float, Sequence[float], Sequence[float]]],
+    *,
+    friction_scale: float = 0.88,
+    ping_amplitude_nm: float = 0.0,
+    torque_ripple_tol_nm: float = 0.010,
+    safety_margin: float = 1.4,
+) -> V0CalibrationReport:
+    """Determine v0 from closed-loop critical descent steps [(v0_cand, qs_step, obs_vels_step), ...]."""
+    if not 1 <= joint <= 6:
+        raise ValueError(f'joint must be in 1..6, got {joint}')
+    alpha_f = max(0.0, float(friction_scale))
+    mod_amp = sum(h.modulation_amplitude for h in joint_model.harmonics)
+    f_max = max(float(joint_model.fs), float(joint_model.fc), 0.02) + mod_amp
+    tol = max(1e-4, float(torque_ripple_tol_nm))
+
+    v_noise = compute_resting_v_noise(noise_velocities)
+    v0_noise = float(v_noise * math.sqrt(max(1e-4, alpha_f * f_max) / tol))
+
+    v0_crit = 0.0
+    v0_last_stable = V0_CANDIDATES[0]
+    crit_revs = 0
+    crit_vmax = 0.0
+    all_q: list[float] = []
+    tested_any = False
+
+    for idx, (cand, qs_step, obs_vels) in enumerate(step_records):
+        tested_any = True
+        all_q.extend(float(q) for q in qs_step)
+        unstable, revs, vmax = is_v0_step_oscillating(obs_vels, v_noise)
+        if unstable:
+            v0_crit = float(cand)
+            v0_last_stable = float(cand if idx == 0 else step_records[idx - 1][0])
+            crit_revs = revs
+            crit_vmax = vmax
+            break
+        v0_last_stable = float(cand)
+
+    max_disp_mrad = float((max(all_q) - min(all_q)) * 1000.0) if len(all_q) >= 2 else 0.0
+    if not tested_any:
+        v0_stab = float(joint_model.v0)
+    elif v0_crit > 0.0:
+        v0_stab = float(safety_margin) * v0_last_stable
+    else:
+        v0_stab = 1.6 * float(v0_last_stable)
+    v0_final = round(float(np.clip(max(v0_noise, v0_stab), 0.008, 0.25)), 6)
+
+    return V0CalibrationReport(
+        joint=joint,
+        v0=v0_final,
+        v0_critical=round(v0_crit, 6),
+        v0_last_stable=round(v0_last_stable, 6),
+        v0_noise=round(v0_noise, 6),
+        v0_stability=round(v0_stab, 6),
+        v_noise_peak=round(v_noise, 6),
+        crit_reversals=crit_revs,
+        crit_vel_peak=round(crit_vmax, 6),
+        excitation_nm=round(float(ping_amplitude_nm), 5),
+        max_disp_mrad=round(max_disp_mrad, 4),
+    )
+
+
+def identify_arm_v0(
+    arm_model: ArmFrictionModel,
+    noise_samples: Sequence[tuple[float, Sequence[float]]],
+    search_records: dict[int, Sequence[tuple[float, Sequence[float], Sequence[float]]]],
+    *,
+    joints: Sequence[int] = (1, 2, 3, 4, 5, 6),
+    friction_scale: float = 0.88,
+    amplitudes: dict[int, float] | None = None,
+) -> tuple[ArmFrictionModel, dict[int, V0CalibrationReport]]:
+    """Identify v0 from closed-loop critical search records and update only v0 in arm_model."""
+    updated = arm_model
+    reports: dict[int, V0CalibrationReport] = {}
+    for j in joints:
+        if j not in updated.joints:
+            continue
+        jm = updated.joint(j)
+        j_noise = [float(vel[j - 1]) for _, vel in noise_samples if len(vel) >= j]
+        amp = (amplitudes or {}).get(j, v0_excitation_amplitude(jm))
+        rep = identify_joint_v0(
+            j, jm, j_noise, search_records.get(j, ()),
+            friction_scale=friction_scale, ping_amplitude_nm=amp,
+        )
+        updated = updated.with_joint(j, replace(jm, v0=rep.v0))
+        reports[j] = rep
+    return updated, reports

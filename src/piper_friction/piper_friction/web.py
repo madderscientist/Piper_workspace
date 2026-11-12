@@ -41,11 +41,22 @@ from .collector import (
 )
 from .identification import (
     CSV_COLUMNS,
+    DEFAULT_JOINT_V0,
     IdentificationReport,
     SweepSample,
+    V0_BURST_GROUPS,
+    V0_CANDIDATES,
+    V0_NOISE_DURATION_S,
+    V0_OBS_START_S,
+    V0_STEP_DURATION_S,
+    compute_resting_v_noise,
+    identify_arm_v0,
     identify_joint_friction,
+    is_v0_step_oscillating,
     load_samples_csv,
     save_samples_csv,
+    v0_closed_loop_step_torque,
+    v0_excitation_amplitude,
 )
 from .model import (
     ArmFrictionModel,
@@ -383,6 +394,19 @@ class _ArmSweepRunner:
     fit_output: str = ''
     saved_friction_scale: float | None = None
     samples: list[SweepSample] = field(default_factory=list)
+    v0_joints: tuple[int, ...] = ()
+    v0_amplitudes: dict[int, float] = field(default_factory=dict)
+    v0_burst_groups: tuple[tuple[int, ...], ...] = ()
+    v0_burst_index: int = 0
+    v0_cand_index: int = 0
+    v0_phase_started: float = 0.0
+    v0_target_scale: float = 0.88
+    v0_noise_samples: list[tuple[float, tuple[float, ...]]] = field(default_factory=list)
+    v0_noise_by_joint: dict[int, float] = field(default_factory=dict)
+    v0_triggered: set[int] = field(default_factory=set)
+    v0_step_qs: dict[int, list[float]] = field(default_factory=dict)
+    v0_step_obs_vels: dict[int, list[float]] = field(default_factory=dict)
+    v0_search_records: dict[int, list[tuple[float, list[float], list[float]]]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         total_segs = len(self.schedule)
@@ -473,6 +497,9 @@ class FrictionWorkbenchNode(Node):
             arm.id: {} for arm in self.fleet.arms
         }
         self.joint_fits: dict[str, dict[int, dict[str, Any]]] = {
+            arm.id: {} for arm in self.fleet.arms
+        }
+        self.v0_reports: dict[str, dict[int, dict[str, Any]]] = {
             arm.id: {} for arm in self.fleet.arms
         }
         self.latest_fit: dict[str, Any] | None = None
@@ -576,6 +603,32 @@ class FrictionWorkbenchNode(Node):
                     runner.samples.append(sample)
                     if ns == self.active_namespace:
                         self.samples = runner.samples
+            elif runner is not None and runner.phase == 'v0_noise':
+                elapsed = now - runner.v0_phase_started
+                if elapsed >= 0.10:
+                    runner.v0_noise_samples.append((elapsed - 0.10, vel))
+            elif (runner is not None
+                    and runner.phase == 'v0_burst'
+                    and runner.v0_burst_index < len(runner.v0_burst_groups)):
+                elapsed = now - runner.v0_phase_started
+                if elapsed <= V0_STEP_DURATION_S and runner.v0_cand_index < len(V0_CANDIDATES):
+                    cand = V0_CANDIDATES[runner.v0_cand_index]
+                    arm_obj = self.arms_by_ns[ns]
+                    arm_m = self.arm_models.get(arm_obj.id, ArmFrictionModel(arm_id=arm_obj.id))
+                    tau_cmd = [0.0] * 6
+                    for j in runner.v0_burst_groups[runner.v0_burst_index]:
+                        if j in runner.v0_triggered:
+                            continue
+                        idx = j - 1
+                        runner.v0_step_qs.setdefault(j, []).append(pos[idx])
+                        if elapsed >= V0_OBS_START_S:
+                            runner.v0_step_obs_vels.setdefault(j, []).append(vel[idx])
+                        tau_cmd[idx] = v0_closed_loop_step_torque(
+                            elapsed, pos[idx], vel[idx], arm_m.joint(j),
+                            cand, runner.v0_amplitudes[j], runner.v0_target_scale,
+                        )
+                    q0 = runner.anchor[:6] if runner.anchor is not None else pos[:6]
+                    self._publish_v0_mit_locked(ns, q0, pos[:6], tau_cmd)
 
     def _on_status(self, ns: str, message: ArmStatus) -> None:
         with self.lock:
@@ -635,6 +688,25 @@ class FrictionWorkbenchNode(Node):
         msg.torque = [0.0] * 6
         self.mit_pubs[cfg.namespace].publish(msg)
 
+    def _publish_v0_mit_locked(
+        self, ns: str, q0: Sequence[float], cur_pos: Sequence[float], torques: Sequence[float],
+    ) -> None:
+        kp = [0.0] * 6
+        kd = [0.0] * 6
+        tau = [float(t) for t in torques[:6]]
+        for i in range(6):
+            if abs(cur_pos[i] - q0[i]) > 0.045:
+                tau[i] = 0.0
+                kp[i] = 8.0
+                kd[i] = 1.0
+        msg = MitCommand()
+        msg.position = list(q0[:6])
+        msg.velocity = [0.0] * 6
+        msg.kp = kp
+        msg.kd = kd
+        msg.torque = tau
+        self.mit_pubs[ns].publish(msg)
+
     def start_sweep(
         self,
         configs: SweepConfig | Sequence[SweepConfig],
@@ -655,6 +727,8 @@ class FrictionWorkbenchNode(Node):
             if runner.phase in (
                 'waiting_feedback', 'zeroing_friction', 'enabling',
                 'setting_mode', 'running', 'restoring_friction',
+                'v0_pending_fit', 'v0_waiting', 'v0_zeroing', 'v0_enabling',
+                'v0_setting_mode', 'v0_noise', 'v0_burst', 'v0_restoring',
             ):
                 raise ValueError(f'{ns} already has an active sweep; stop it first')
             runner.queue = queue
@@ -672,6 +746,84 @@ class FrictionWorkbenchNode(Node):
             runner.fit_output = fit_output.strip()
             self.active_namespace = ns
             self.samples = runner.samples
+        return self.status_payload()
+
+    def start_v0_calibration(
+        self,
+        namespace: str,
+        joints: Sequence[int] = (1, 2, 3, 4, 5, 6),
+        fit_output: str = '',
+    ) -> dict[str, Any]:
+        ns = namespace.strip() or '/arm_1'
+        j_tuple = tuple(sorted({int(j) for j in joints if 1 <= int(j) <= 6}))
+        if not j_tuple:
+            raise ValueError('At least one joint in 1..6 is required for v0 calibration')
+        with self.lock:
+            if ns not in self.arms_by_ns:
+                raise ValueError(f'Unknown namespace {ns}')
+            runner = self.runners[ns]
+            if runner.phase in (
+                'waiting_feedback', 'zeroing_friction', 'enabling',
+                'setting_mode', 'running', 'restoring_friction',
+                'v0_pending_fit', 'v0_waiting', 'v0_zeroing', 'v0_enabling',
+                'v0_setting_mode', 'v0_noise', 'v0_burst', 'v0_restoring',
+            ):
+                raise ValueError(f'{ns} already has an active calibration; stop it first')
+            arm = self.arms_by_ns[ns]
+            out_path = fit_output.strip() or arm.friction_config
+            model = self.arm_models.get(arm.id, ArmFrictionModel(arm_id=arm.id))
+            if out_path and Path(out_path).is_file():
+                try:
+                    loaded = load_friction_model(out_path)
+                    for j_i, j_m in model.joints.items():
+                        loaded = loaded.with_joint(j_i, j_m)
+                    if model.gripper is not None:
+                        loaded = loaded.with_gripper(model.gripper)
+                    model = loaded
+                    self.arm_models[arm.id] = model
+                except Exception:
+                    pass
+            grav = self.fleet.gravity_model(arm)
+            fs_static = (
+                tuple(grav.joint(i).static_friction for i in range(1, 7))
+                if grav is not None else (0.0,) * 6
+            )
+            amps = {
+                j: v0_excitation_amplitude(model.joint(j), fs_static[j - 1])
+                for j in j_tuple
+                if j in model.joints
+            }
+            if not amps:
+                raise ValueError(f'No calibrated joint friction model found for {arm.id}; fit Fc/Fs first')
+            groups = tuple(
+                grp_sub
+                for grp in V0_BURST_GROUPS
+                if (grp_sub := tuple(j for j in grp if j in amps))
+            )
+            runner.v0_joints = tuple(amps.keys())
+            runner.v0_amplitudes = amps
+            runner.v0_burst_groups = groups
+            runner.v0_burst_index = 0
+            runner.v0_cand_index = 0
+            runner.v0_phase_started = 0.0
+            ctrl_cfg = self.control_states.get(ns, {}).get('configuration', {})
+            runner.v0_target_scale = float(ctrl_cfg.get('friction_scale', arm.friction_scale))
+            if runner.v0_target_scale <= 0.0:
+                runner.v0_target_scale = float(arm.friction_scale) or 0.88
+            runner.v0_noise_samples = []
+            runner.v0_noise_by_joint = {j: 0.001 for j in amps}
+            runner.v0_triggered = set()
+            runner.v0_step_qs = {j: [] for j in amps}
+            runner.v0_step_obs_vels = {j: [] for j in amps}
+            runner.v0_search_records = {j: [] for j in amps}
+            runner.fit_output = out_path
+            runner.error = ''
+            runner.initial = None
+            runner.anchor = None
+            runner.queue = []
+            runner.schedule = []
+            runner.phase = 'v0_waiting'
+            self.active_namespace = ns
         return self.status_payload()
 
     def stop_sweep(self, namespace: str | None = None) -> dict[str, Any]:
@@ -694,6 +846,9 @@ class FrictionWorkbenchNode(Node):
                         self.gripper_pubs[ns].publish(GripperCommand(
                             width=float(cur_pos[6]), effort=0.0,
                         ))
+                elif runner.phase.startswith('v0_') and ns in self.positions:
+                    cur6 = self.positions[ns][:6]
+                    self._publish_v0_mit_locked(ns, cur6, cur6, (0.0,) * 6)
                 runner.phase = 'stopped'
                 runner.queue = []
                 runner.pending_future = None
@@ -766,6 +921,8 @@ class FrictionWorkbenchNode(Node):
             runner = self.runners[arm.namespace]
             if runner.phase in (
                 'waiting_feedback', 'zeroing_friction', 'enabling', 'setting_mode', 'running',
+                'v0_pending_fit', 'v0_waiting', 'v0_zeroing',
+                'v0_enabling', 'v0_setting_mode', 'v0_noise', 'v0_burst',
             ):
                 return False
             ctrl = self.control_states.get(arm.namespace, {})
@@ -788,14 +945,182 @@ class FrictionWorkbenchNode(Node):
 
     def _tick_sweep(self) -> None:
         completed_jobs: list[tuple[list[SweepSample], SweepConfig, str, str, bool]] = []
+        completed_v0_jobs: list[tuple[str, tuple[int, ...], list, dict, dict[int, float], str, float]] = []
 
         with self.lock:
             for ns, runner in self.runners.items():
                 if runner.phase not in (
                     'waiting_feedback', 'zeroing_friction', 'enabling',
                     'setting_mode', 'running', 'restoring_friction',
+                    'v0_pending_fit', 'v0_waiting', 'v0_zeroing', 'v0_enabling',
+                    'v0_setting_mode', 'v0_noise', 'v0_burst', 'v0_restoring',
                 ):
                     continue
+                if runner.phase.startswith('v0_'):
+                    pos = self.positions.get(ns)
+                    vel = self.velocities.get(ns, (0.0,) * 6)
+                    status = self.statuses.get(ns)
+                    if pos is None or status is None:
+                        continue
+                    if status.err_code or status.arm_status not in (0, 11, 12, 13):
+                        self._fail_sweep_locked(
+                            runner,
+                            f'Arm fault: arm_status={status.arm_status}, err_code={status.err_code}',
+                            ns,
+                        )
+                        continue
+                    if runner.phase == 'v0_pending_fit':
+                        assert runner.anchor is not None
+                        self._publish_v0_mit_locked(ns, runner.anchor[:6], pos[:6], (0.0,) * 6)
+                        continue
+                    if runner.phase == 'v0_waiting':
+                        runner.anchor = pos[:6]
+                        cfg_client = self.config_clients[ns]
+                        arm = self.arms_by_ns[ns]
+                        ctrl = self.control_states.get(ns, {})
+                        cfg_dict = ctrl.get('configuration', {})
+                        end_eff = str(cfg_dict.get('end_effector') or arm.end_effector)
+                        runner.saved_friction_scale = float(
+                            cfg_dict.get('friction_scale', arm.friction_scale)
+                        )
+                        if cfg_client.service_is_ready():
+                            runner.pending_future = cfg_client.call_async(ConfigureArm.Request(
+                                end_effector=end_eff,
+                                gravity_scale=1.0,
+                                friction_scale=-2.0,
+                            ))
+                            runner.phase = 'v0_zeroing'
+                            continue
+                        self._v0_check_enable_or_mit_locked(ns, runner, pos[:6], status)
+                        continue
+                    if runner.phase == 'v0_zeroing':
+                        if runner.pending_future is None or not runner.pending_future.done():
+                            continue
+                        res = runner.pending_future.result()
+                        if res is None or not res.success:
+                            self._fail_sweep_locked(
+                                runner,
+                                f'Zeroing friction_scale failed: {getattr(res, "message", "no response")}',
+                                ns,
+                            )
+                            continue
+                        self._v0_check_enable_or_mit_locked(ns, runner, pos[:6], status)
+                        continue
+                    if runner.phase == 'v0_enabling':
+                        if runner.pending_future is None or not runner.pending_future.done():
+                            continue
+                        res = runner.pending_future.result()
+                        if res is None or not res.enable_response:
+                            self._fail_sweep_locked(
+                                runner,
+                                f'Enable failed: {getattr(res, "message", "no response")}',
+                                ns,
+                            )
+                            continue
+                        self._v0_enter_mit_locked(ns, runner, pos[:6], status)
+                        continue
+                    if runner.phase == 'v0_setting_mode':
+                        assert runner.anchor is not None
+                        self._publish_v0_mit_locked(ns, runner.anchor, pos[:6], (0.0,) * 6)
+                        if runner.pending_future is None or not runner.pending_future.done():
+                            continue
+                        res = runner.pending_future.result()
+                        if res is None or not res.success:
+                            self._fail_sweep_locked(
+                                runner,
+                                f'SetMode(mit) failed: {getattr(res, "message", "no response")}',
+                                ns,
+                            )
+                            continue
+                        runner.phase = 'v0_noise'
+                        runner.v0_phase_started = time.monotonic()
+                        continue
+                    if runner.phase == 'v0_noise':
+                        assert runner.anchor is not None
+                        self._publish_v0_mit_locked(ns, runner.anchor, pos[:6], (0.0,) * 6)
+                        if time.monotonic() - runner.v0_phase_started >= (0.10 + V0_NOISE_DURATION_S):
+                            for j in runner.v0_amplitudes:
+                                runner.v0_noise_by_joint[j] = compute_resting_v_noise(
+                                    [v[j - 1] for _, v in runner.v0_noise_samples if len(v) >= j],
+                                )
+                            runner.v0_burst_index = 0
+                            runner.v0_cand_index = 0
+                            runner.v0_step_qs = {j: [] for j in runner.v0_amplitudes}
+                            runner.v0_step_obs_vels = {j: [] for j in runner.v0_amplitudes}
+                            runner.phase = 'v0_burst'
+                            runner.v0_phase_started = time.monotonic()
+                        continue
+                    if runner.phase == 'v0_burst':
+                        assert runner.anchor is not None
+                        now = time.monotonic()
+                        elapsed = now - runner.v0_phase_started
+                        active_grp = [
+                            j for j in runner.v0_burst_groups[runner.v0_burst_index]
+                            if j not in runner.v0_triggered
+                        ]
+                        if active_grp and elapsed <= V0_STEP_DURATION_S:
+                            cand = V0_CANDIDATES[runner.v0_cand_index]
+                            arm_obj = self.arms_by_ns[ns]
+                            arm_m = self.arm_models.get(arm_obj.id, ArmFrictionModel(arm_id=arm_obj.id))
+                            tau = [0.0] * 6
+                            for j in active_grp:
+                                idx = j - 1
+                                tau[idx] = v0_closed_loop_step_torque(
+                                    elapsed, pos[idx], vel[idx], arm_m.joint(j),
+                                    cand, runner.v0_amplitudes[j], runner.v0_target_scale,
+                                )
+                            self._publish_v0_mit_locked(ns, runner.anchor, pos[:6], tau)
+                            continue
+                        self._publish_v0_mit_locked(ns, runner.anchor, pos[:6], (0.0,) * 6)
+                        if active_grp:
+                            cand = V0_CANDIDATES[runner.v0_cand_index]
+                            for j in active_grp:
+                                qs_j = list(runner.v0_step_qs.get(j, ()))
+                                obs_j = list(runner.v0_step_obs_vels.get(j, ()))
+                                runner.v0_search_records.setdefault(j, []).append((cand, qs_j, obs_j))
+                                unstable, _, _ = is_v0_step_oscillating(
+                                    obs_j, runner.v0_noise_by_joint.get(j, 0.001),
+                                )
+                                if unstable:
+                                    runner.v0_triggered.add(j)
+                        runner.v0_step_qs = {j: [] for j in runner.v0_amplitudes}
+                        runner.v0_step_obs_vels = {j: [] for j in runner.v0_amplitudes}
+                        rem_grp = [
+                            j for j in runner.v0_burst_groups[runner.v0_burst_index]
+                            if j not in runner.v0_triggered
+                        ]
+                        if rem_grp and runner.v0_cand_index + 1 < len(V0_CANDIDATES):
+                            runner.v0_cand_index += 1
+                            runner.v0_phase_started = now
+                            continue
+                        if runner.v0_burst_index + 1 < len(runner.v0_burst_groups):
+                            runner.v0_burst_index += 1
+                            runner.v0_cand_index = 0
+                            runner.v0_phase_started = now
+                            continue
+                        completed_v0_jobs.append((
+                            self.arms_by_ns[ns].id,
+                            runner.v0_joints,
+                            list(runner.v0_noise_samples),
+                            {j: list(rows) for j, rows in runner.v0_search_records.items()},
+                            dict(runner.v0_amplitudes),
+                            runner.fit_output,
+                            float(runner.v0_target_scale),
+                        ))
+                        restore_fut = self._restore_friction_scale_locked(ns, runner)
+                        if restore_fut is not None:
+                            runner.pending_future = restore_fut
+                            runner.phase = 'v0_restoring'
+                        else:
+                            runner.phase = 'completed'
+                        continue
+                    if runner.phase == 'v0_restoring':
+                        assert runner.anchor is not None
+                        self._publish_v0_mit_locked(ns, runner.anchor, pos[:6], (0.0,) * 6)
+                        if runner.pending_future is not None and not runner.pending_future.done():
+                            continue
+                        runner.phase = 'completed'
+                        continue
                 cfg = runner.config
                 assert cfg is not None
                 pos = self.positions.get(ns)
@@ -954,12 +1279,20 @@ class FrictionWorkbenchNode(Node):
                         has_next_joint = True
                     else:
                         has_next_joint = False
-                        restore_fut = self._restore_friction_scale_locked(ns, runner)
-                        if restore_fut is not None:
-                            runner.pending_future = restore_fut
-                            runner.phase = 'restoring_friction'
+                        swept_arm_joints = tuple(
+                            sorted({c.joint for c in runner.queue if 1 <= c.joint <= 6})
+                        )
+                        if swept_arm_joints:
+                            runner.v0_joints = swept_arm_joints
+                            runner.anchor = pos[:6]
+                            runner.phase = 'v0_pending_fit'
                         else:
-                            runner.phase = 'completed'
+                            restore_fut = self._restore_friction_scale_locked(ns, runner)
+                            if restore_fut is not None:
+                                runner.pending_future = restore_fut
+                                runner.phase = 'restoring_friction'
+                            else:
+                                runner.phase = 'completed'
 
                     completed_jobs.append((finished_samples, finished_cfg, out_csv, out_fit, has_next_joint))
 
@@ -983,11 +1316,155 @@ class FrictionWorkbenchNode(Node):
                 if out_fit and has_next_joint:
                     with self.lock:
                         save_friction_model(self.arm_models[arm_id], out_fit)
+                if not has_next_joint:
+                    self._maybe_chain_v0_after_sweep(finished_cfg.namespace)
             except Exception as error:
                 with self.lock:
-                    self.runners[finished_cfg.namespace].error = (
-                        f'J{finished_cfg.joint} auto-fit warning: {error}'
-                    )
+                    r_err = self.runners[finished_cfg.namespace]
+                    r_err.error = f'J{finished_cfg.joint} auto-fit warning: {error}'
+                    if r_err.phase == 'v0_pending_fit':
+                        restore_fut = self._restore_friction_scale_locked(finished_cfg.namespace, r_err)
+                        if restore_fut is not None:
+                            r_err.pending_future = restore_fut
+                            r_err.phase = 'restoring_friction'
+                        else:
+                            r_err.phase = 'completed'
+
+        for arm_id, j_tuple, noise_rows, search_map, amps_map, out_fit, f_scale_ref in completed_v0_jobs:
+            try:
+                self.apply_v0_fit(
+                    arm_id,
+                    noise_rows,
+                    search_map,
+                    joints=j_tuple,
+                    friction_scale=f_scale_ref,
+                    amplitudes=amps_map,
+                    output_yaml=out_fit or None,
+                )
+            except Exception as error:
+                arm_obj = self.fleet.arm(arm_id)
+                with self.lock:
+                    self.runners[arm_obj.namespace].error = f'v0 auto-fit warning: {error}'
+
+    def _maybe_chain_v0_after_sweep(self, ns: str) -> None:
+        with self.lock:
+            runner = self.runners.get(ns)
+            if runner is None or runner.phase != 'v0_pending_fit':
+                return
+            arm = self.arms_by_ns[ns]
+            model = self.arm_models.get(arm.id, ArmFrictionModel(arm_id=arm.id))
+            grav = self.fleet.gravity_model(arm)
+            fs_static = (
+                tuple(grav.joint(i).static_friction for i in range(1, 7))
+                if grav is not None else (0.0,) * 6
+            )
+            amps = {
+                j: v0_excitation_amplitude(model.joint(j), fs_static[j - 1])
+                for j in runner.v0_joints
+                if j in model.joints and max(model.joint(j).fs, model.joint(j).fc) > 0.02
+            }
+            if not amps:
+                restore_fut = self._restore_friction_scale_locked(ns, runner)
+                if restore_fut is not None:
+                    runner.pending_future = restore_fut
+                    runner.phase = 'restoring_friction'
+                else:
+                    runner.phase = 'completed'
+                return
+            groups = tuple(
+                grp_sub
+                for grp in V0_BURST_GROUPS
+                if (grp_sub := tuple(j for j in grp if j in amps))
+            )
+            runner.v0_joints = tuple(amps.keys())
+            runner.v0_amplitudes = amps
+            runner.v0_burst_groups = groups
+            runner.v0_burst_index = 0
+            runner.v0_cand_index = 0
+            runner.v0_target_scale = float(
+                runner.saved_friction_scale
+                if runner.saved_friction_scale is not None and runner.saved_friction_scale > 0.0
+                else (arm.friction_scale or 0.88)
+            )
+            runner.v0_noise_samples = []
+            runner.v0_noise_by_joint = {j: 0.001 for j in amps}
+            runner.v0_triggered = set()
+            runner.v0_step_qs = {j: [] for j in amps}
+            runner.v0_step_obs_vels = {j: [] for j in amps}
+            runner.v0_search_records = {j: [] for j in amps}
+            runner.phase = 'v0_noise'
+            runner.v0_phase_started = time.monotonic()
+
+    def _v0_check_enable_or_mit_locked(
+        self, ns: str, runner: _ArmSweepRunner, cur_pos: Sequence[float], status: ArmStatus,
+    ) -> None:
+        if not all(status.motor_enabled):
+            client = self.enable_clients[ns]
+            if not client.service_is_ready():
+                return
+            runner.pending_future = client.call_async(Enable.Request(enable_request=True))
+            runner.phase = 'v0_enabling'
+            return
+        self._v0_enter_mit_locked(ns, runner, cur_pos, status)
+
+    def _v0_enter_mit_locked(
+        self, ns: str, runner: _ArmSweepRunner, cur_pos: Sequence[float], status: ArmStatus,
+    ) -> None:
+        assert runner.anchor is not None
+        self._publish_v0_mit_locked(ns, runner.anchor, cur_pos, (0.0,) * 6)
+        if status.ctrl_mode == 1 and status.mode_feedback == 6:
+            runner.phase = 'v0_noise'
+            runner.v0_phase_started = time.monotonic()
+            return
+        client = self.mode_clients[ns]
+        if not client.service_is_ready():
+            return
+        runner.pending_future = client.call_async(SetMode.Request(mode='mit'))
+        runner.phase = 'v0_setting_mode'
+
+    def apply_v0_fit(
+        self,
+        arm_id: str,
+        noise_rows: Sequence[tuple[float, Sequence[float]]],
+        search_map: dict[int, Sequence[tuple[float, Sequence[float], Sequence[float]]]],
+        *,
+        joints: Sequence[int] = (1, 2, 3, 4, 5, 6),
+        friction_scale: float = 0.88,
+        amplitudes: dict[int, float] | None = None,
+        output_yaml: str | Path | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            current_arm = self.arm_models.get(arm_id, ArmFrictionModel(arm_id=arm_id))
+            if output_yaml and Path(output_yaml).is_file():
+                try:
+                    loaded = load_friction_model(output_yaml)
+                    for j_i, j_m in current_arm.joints.items():
+                        loaded = loaded.with_joint(j_i, j_m)
+                    if current_arm.gripper is not None:
+                        loaded = loaded.with_gripper(current_arm.gripper)
+                    current_arm = loaded
+                except Exception:
+                    pass
+        updated_arm, reports = identify_arm_v0(
+            current_arm, noise_rows, search_map,
+            joints=joints, friction_scale=friction_scale, amplitudes=amplitudes,
+        )
+        yaml_text = yaml.safe_dump(updated_arm.to_dict(), allow_unicode=True, sort_keys=False)
+        with self.lock:
+            self.arm_models[arm_id] = updated_arm
+            if output_yaml:
+                save_friction_model(updated_arm, output_yaml)
+            rep_dicts = {j: rep.to_dict() for j, rep in reports.items()}
+            self.v0_reports.setdefault(arm_id, {}).update(rep_dicts)
+            fits = self.joint_fits.setdefault(arm_id, {})
+            for j, rep in reports.items():
+                if j in fits and isinstance(fits[j].get('model'), dict):
+                    fits[j]['model']['v0'] = rep.v0
+            for j_payload in fits.values():
+                j_payload['yaml_text'] = yaml_text
+        if output_yaml:
+            self.reload_saved_model(arm_id, output_yaml)
+        return {'arm_id': arm_id, 'v0_reports': {str(j): d for j, d in rep_dicts.items()}, 'yaml_text': yaml_text}
 
     def _check_enable_or_mit_locked(
         self, runner: _ArmSweepRunner, cfg: SweepConfig, status: ArmStatus,
@@ -1057,11 +1534,19 @@ class FrictionWorkbenchNode(Node):
         output_yaml: str | Path | None = None,
     ) -> dict[str, Any]:
         inertia_scale = 1.0
+        preserved_v0: float | None = None
         if samples:
             j_idx = samples[0].joint
             g_mod = self.fleet.gravity_model(arm_id)
             if g_mod is not None and 1 <= j_idx <= 6:
                 inertia_scale = float(g_mod.joint(j_idx).scale)
+            if 1 <= j_idx <= 6:
+                with self.lock:
+                    existing_arm = self.arm_models.get(arm_id)
+                    if existing_arm is not None and j_idx in existing_arm.joints:
+                        cur_v0 = existing_arm.joint(j_idx).v0
+                        if abs(cur_v0 - DEFAULT_JOINT_V0[j_idx - 1]) > 1e-6:
+                            preserved_v0 = cur_v0
         report = identify_joint_friction(
             samples,
             grid_step=grid_step,
@@ -1069,6 +1554,7 @@ class FrictionWorkbenchNode(Node):
             max_harmonics=max_harmonics,
             candidate_omegas=candidate_omegas,
             inertia_scale=inertia_scale,
+            v0=preserved_v0,
         )
         with self.lock:
             current_arm = self.arm_models.get(arm_id, ArmFrictionModel(arm_id=arm_id))
@@ -1161,6 +1647,10 @@ class FrictionWorkbenchNode(Node):
                 'joint_fits': {
                     arm_id: {str(j): fit for j, fit in fits.items()}
                     for arm_id, fits in self.joint_fits.items()
+                },
+                'v0_reports': {
+                    arm_id: {str(j): rep for j, rep in reps.items()}
+                    for arm_id, reps in self.v0_reports.items()
                 },
             }
 
@@ -1286,6 +1776,17 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
             if path == '/api/sweep/stop':
                 ns = str(body.get('namespace', '')).strip() or None
                 status = self.node.stop_sweep(namespace=ns)
+                self._send_json(200, {'ok': True, 'status': status})
+                return
+
+            if path == '/api/v0/start':
+                ns = str(body.get('namespace', '/arm_1'))
+                joints_raw = body.get('joints', [1, 2, 3, 4, 5, 6])
+                status = self.node.start_v0_calibration(
+                    ns,
+                    joints=[int(j) for j in joints_raw],
+                    fit_output=str(body.get('fit_output', '')),
+                )
                 self._send_json(200, {'ok': True, 'status': status})
                 return
 

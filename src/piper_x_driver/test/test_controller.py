@@ -517,6 +517,14 @@ def test_controller_applies_configured_friction_compensation_in_mit(fake_arm):
     assert control.friction == (0.0,) * 6
     assert arm.calls[-1][1].torque[0] == pytest.approx(0.0)
 
+    # Zero-gain drag (kp=0, kd=0) bounds zero-speed negative damping so motor velocity noise cannot self-excite
+    control.friction_scale = 1.0
+    control.friction_scale_applied = 1.0
+    arm.snapshot = lambda: replace(base_snapshot(), velocity=(0.005, 0.0, 0.0, 0.0, 0.0, 0.0))
+    control.mit(target(kp=[0.0] * 6, kd=[0.0] * 6))
+    control.watchdog()
+    assert 0.0 < control.friction[0] < 0.05
+
 
 def test_stiction_breakaway_and_adaptive_stiffness_match_g1_laws(fake_arm):
     from piper_x_driver.controller import adaptive_stiffness_scale
