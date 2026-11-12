@@ -332,10 +332,15 @@ class GravityWorkbenchNode(Node):
         return self.runners[self.active_namespace].error
 
     def _on_joints(self, ns: str, message: JointState) -> None:
-        names = list(message.name)
-        if len(names) != 7 or set(names) != set(JOINT_NAMES) or len(message.position) != 7:
+        names = tuple(message.name)
+        if len(message.position) != 7:
             return
-        order = [names.index(name) for name in JOINT_NAMES]
+        if names == JOINT_NAMES:
+            order = range(7)
+        else:
+            if len(names) != 7 or set(names) != set(JOINT_NAMES):
+                return
+            order = [names.index(name) for name in JOINT_NAMES]
         pos = tuple(float(message.position[i]) for i in order)
         vel = (
             tuple(float(message.velocity[i]) for i in order[:6])
@@ -363,15 +368,25 @@ class GravityWorkbenchNode(Node):
                 dq_val = vel[j_idx]
                 if elapsed >= 0.4 * seg.duration and abs(dq_val) <= 0.03:
                     assert runner.config.kd is not None
+                    ctrl_state = self.control_states.get(ns, {})
+                    kp_vec = ctrl_state.get('applied_kp')
+                    kd_vec = ctrl_state.get('applied_kd')
+                    kp_cmd = (
+                        float(kp_vec[j_idx])
+                        if isinstance(kp_vec, list) and len(kp_vec) >= 6 and float(kp_vec[j_idx]) > 0.0
+                        else runner.config.kp[j_idx]
+                    )
+                    kd_cmd = (
+                        float(kd_vec[j_idx])
+                        if isinstance(kd_vec, list) and len(kd_vec) >= 6 and float(kd_vec[j_idx]) >= 0.0
+                        else runner.config.kd[j_idx]
+                    )
                     kp_real, kd_real = realized_gains(
-                        runner.config.joint,
-                        runner.config.kp[j_idx],
-                        runner.config.kd[j_idx],
+                        runner.config.joint, kp_cmd, kd_cmd,
                     )
                     q_val = pos[j_idx]
                     eff_kw = self.effector_kwargs.get(ns, {})
                     g_torques = gravity_torques(pos[:6], **eff_kw)
-                    ctrl_state = self.control_states.get(ns, {})
                     g_vec = ctrl_state.get('gravity_torque')
                     if isinstance(g_vec, list) and len(g_vec) >= 6:
                         g_applied = float(g_vec[j_idx])
@@ -515,10 +530,27 @@ class GravityWorkbenchNode(Node):
                 runner.queue = []
                 runner.pending_future = None
         for ns, g_s, f_s in to_restore:
-            self.request_compensation_scales(ns, g_s, f_s)
+            self._restore_probe_scales(ns, g_s, f_s)
         return self.status_payload()
 
-    def _fail_probe_locked(self, runner: _ArmProbeRunner, reason: str) -> None:
+    def _fail_probe_locked(self, runner: _ArmProbeRunner, reason: str, ns: str = '') -> None:
+        if ns and runner.phase not in ('idle', 'waiting_feedback', 'completed', 'failed', 'stopped'):
+            client = self.config_clients.get(ns)
+            if client is not None and client.service_is_ready():
+                arm = self.arms_by_ns[ns]
+                ctrl = self.control_states.get(ns, {})
+                cfg_dict = ctrl.get('configuration', {})
+                end_eff = str(cfg_dict.get('end_effector') or arm.end_effector)
+                restore_f = (
+                    -4.0 - runner.saved_friction_scale
+                    if abs(runner.saved_gravity_scale - 1.0) <= 1e-9
+                    else runner.saved_friction_scale
+                )
+                client.call_async(ConfigureArm.Request(
+                    end_effector=end_eff,
+                    gravity_scale=runner.saved_gravity_scale,
+                    friction_scale=restore_f,
+                ))
         runner.error = reason
         runner.phase = 'failed'
         runner.queue = []
@@ -560,6 +592,28 @@ class GravityWorkbenchNode(Node):
             ))
             return True
 
+    def _restore_probe_scales(self, namespace: str, gravity_scale: float, friction_scale: float) -> bool:
+        g_scale = bounded(gravity_scale, 'gravity_scale', 0, 1)
+        f_scale = bounded(friction_scale, 'friction_scale', 0, 1)
+        if abs(g_scale - 1.0) > 1e-9:
+            return self.request_compensation_scales(namespace, g_scale, f_scale)
+        with self.lock:
+            if namespace not in self.arms_by_ns:
+                raise ValueError(f'Unknown namespace {namespace}')
+            arm = self.arms_by_ns[namespace]
+            ctrl = self.control_states.get(namespace, {})
+            cfg_dict = ctrl.get('configuration', {})
+            end_eff = str(cfg_dict.get('end_effector') or arm.end_effector)
+            client = self.config_clients[namespace]
+            if not client.service_is_ready():
+                return False
+            client.call_async(ConfigureArm.Request(
+                end_effector=end_eff,
+                gravity_scale=1.0,
+                friction_scale=-4.0 - f_scale,
+            ))
+            return True
+
     def reload_saved_model(self, arm_id: str, output_yaml: str | Path) -> bool:
         """Reapply the current driver configuration after its active model file is saved."""
         with self.lock:
@@ -595,6 +649,7 @@ class GravityWorkbenchNode(Node):
                     self._fail_probe_locked(
                         runner,
                         f'Arm fault: arm_status={status.arm_status}, err_code={status.err_code}',
+                        ns,
                     )
                     continue
 
@@ -614,10 +669,14 @@ class GravityWorkbenchNode(Node):
                         ctrl = self.control_states.get(ns, {})
                         cfg_dict = ctrl.get('configuration', {})
                         end_eff = str(cfg_dict.get('end_effector') or arm.end_effector)
+                        if abs(runner.saved_gravity_scale - 1.0) > 1e-9:
+                            cfg_client.call_async(ConfigureArm.Request(
+                                end_effector=end_eff, gravity_scale=1.0, friction_scale=-1.0,
+                            ))
                         runner.pending_future = cfg_client.call_async(ConfigureArm.Request(
                             end_effector=end_eff,
                             gravity_scale=1.0,
-                            friction_scale=0.0,
+                            friction_scale=-2.0,
                         ))
                         runner.phase = 'zeroing_compensation'
                         continue
@@ -632,6 +691,7 @@ class GravityWorkbenchNode(Node):
                         self._fail_probe_locked(
                             runner,
                             f'Zeroing compensation failed: {getattr(res, "message", "no response")}',
+                            ns,
                         )
                         continue
                     self._check_enable_or_mit_locked(runner, cfg, status)
@@ -645,6 +705,7 @@ class GravityWorkbenchNode(Node):
                         self._fail_probe_locked(
                             runner,
                             f'Enable failed: {getattr(res, "message", "no response")}',
+                            ns,
                         )
                         continue
                     self._enter_mit_locked(runner, cfg, status)
@@ -663,6 +724,7 @@ class GravityWorkbenchNode(Node):
                         self._fail_probe_locked(
                             runner,
                             f'SetMode(mit) failed: {getattr(res, "message", "no response")}',
+                            ns,
                         )
                         continue
                     self._start_schedule_locked(runner, cfg)
@@ -733,10 +795,15 @@ class GravityWorkbenchNode(Node):
                             ctrl = self.control_states.get(ns, {})
                             cfg_dict = ctrl.get('configuration', {})
                             end_eff = str(cfg_dict.get('end_effector') or arm.end_effector)
+                            restore_f = (
+                                -4.0 - runner.saved_friction_scale
+                                if abs(runner.saved_gravity_scale - 1.0) <= 1e-9
+                                else runner.saved_friction_scale
+                            )
                             runner.pending_future = cfg_client.call_async(ConfigureArm.Request(
                                 end_effector=end_eff,
                                 gravity_scale=runner.saved_gravity_scale,
-                                friction_scale=runner.saved_friction_scale,
+                                friction_scale=restore_f,
                             ))
                             runner.phase = 'restoring_compensation'
                         else:

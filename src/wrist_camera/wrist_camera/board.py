@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
+from typing import Any
 
 import cv2
 import numpy as np
@@ -42,26 +43,29 @@ def dictionary_id(name: str, needed_markers: int = 0) -> int:
 
 
 def _get_dictionary(dict_id: int):
+    aruco: Any = cv2.aruco
     if hasattr(cv2.aruco, 'getPredefinedDictionary'):
-        return cv2.aruco.getPredefinedDictionary(dict_id)
-    return cv2.aruco.Dictionary_get(dict_id)
+        return aruco.getPredefinedDictionary(dict_id)
+    return aruco.Dictionary_get(dict_id)
 
 
 def _create_charuco_board(squares_x: int, squares_y: int, square_size: float,
                           marker_size: float, dictionary):
+    aruco: Any = cv2.aruco
     if hasattr(cv2.aruco, 'CharucoBoard_create'):
-        return cv2.aruco.CharucoBoard_create(
+        return aruco.CharucoBoard_create(
             squares_x, squares_y, square_size, marker_size, dictionary)
-    return cv2.aruco.CharucoBoard(
+    return aruco.CharucoBoard(
         (squares_x, squares_y), square_size, marker_size, dictionary)
 
 
 def _create_detector_params():
+    aruco: Any = cv2.aruco
     if hasattr(cv2.aruco, 'DetectorParameters_create'):
-        params = cv2.aruco.DetectorParameters_create()
+        params = aruco.DetectorParameters_create()
     else:
-        params = cv2.aruco.DetectorParameters()
-    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        params = aruco.DetectorParameters()
+    params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
     return params
 
 
@@ -154,9 +158,10 @@ class Board:
 
     @property
     def object_points_all(self) -> np.ndarray:
+        board: Any = self._board
         if hasattr(self._board, 'getChessboardCorners'):
-            return np.asarray(self._board.getChessboardCorners(), np.float32)
-        return np.asarray(self._board.chessboardCorners, np.float32)
+            return np.asarray(board.getChessboardCorners(), np.float32)
+        return np.asarray(board.chessboardCorners, np.float32)
 
     def object_points(self, ids) -> np.ndarray:
         index = np.asarray(ids, np.int32).reshape(-1)
@@ -257,7 +262,7 @@ class Board:
         ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
             detection.corners, detection.ids, self._board,
             np.asarray(camera_matrix, float).reshape(3, 3),
-            np.asarray(distortion, float).reshape(-1, 1), None, None)
+            np.asarray(distortion, float).reshape(-1, 1), np.empty((0, 0)), np.empty((0, 0)))
         if not ok:
             return None
         return transforms.rvec_tvec_to_matrix(rvec, tvec)
@@ -289,9 +294,10 @@ class Board:
         height = int(round(self.squares_y * self.square_size * pixels_per_meter))
         margin = int(round(margin_squares * self.square_size * pixels_per_meter))
         out_size = (width + 2 * margin, height + 2 * margin)
+        board: Any = self._board
         if hasattr(self._board, 'generateImage'):
-            return self._board.generateImage(out_size, marginSize=margin, borderBits=1)
-        return self._board.draw(out_size, None, margin, 1)
+            return board.generateImage(out_size, marginSize=margin, borderBits=1)
+        return board.draw(out_size, None, margin, 1)
 
 
 def _gray(image) -> np.ndarray:

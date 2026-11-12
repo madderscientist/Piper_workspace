@@ -1,5 +1,6 @@
 """ROS adapter; all actuator access stays in this one SDK-owning process."""
 
+import array
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import json
@@ -27,6 +28,7 @@ from rclpy.parameter import Parameter
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
+from rclpy.timer import Timer
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
 from std_srvs.srv import SetBool, Trigger
@@ -53,11 +55,14 @@ class DriverNode(Node):
         self.declare_parameter('rate_hz', 200.0)
         self.declare_parameter('telemetry_hz', 200.0)
         self.declare_parameter('wrench_estimation_enabled', False)
+        def _float_param(key: str, default: float) -> float:
+            raw = self.get_parameter(key).value
+            return float(default if raw is None else raw)
         self.rate_hz = bounded(
-            float(self.get_parameter('rate_hz').value), 'rate_hz', 10.0, 1000.0,
+            _float_param('rate_hz', 200.0), 'rate_hz', 10.0, 1000.0,
         )
         self.telemetry_hz = bounded(
-            float(self.get_parameter('telemetry_hz').value),
+            _float_param('telemetry_hz', 200.0),
             'telemetry_hz',
             10.0,
             self.rate_hz,
@@ -100,13 +105,13 @@ class DriverNode(Node):
             gravity_model=self.fleet.gravity_model(self.arm_config),
             friction_scale=self.arm_config.friction_scale,
             friction_model=self.fleet.friction_model(self.arm_config),
-            friction_error_epsilon=float(self.get_parameter('friction_error_epsilon').value),
-            friction_velocity_epsilon=float(self.get_parameter('friction_velocity_epsilon').value),
-            target_velocity_cutoff_hz=float(self.get_parameter('target_velocity_cutoff_hz').value),
-            s_a=float(self.get_parameter('s_a').value),
-            adaptive_stiffness_b=float(self.get_parameter('adaptive_stiffness_b').value),
-            adaptive_stiffness_power=float(self.get_parameter('adaptive_stiffness_power').value),
-            offset_ramp_s=float(self.get_parameter('offset_ramp_s').value),
+            friction_error_epsilon=_float_param('friction_error_epsilon', self.arm_config.friction_error_epsilon),
+            friction_velocity_epsilon=_float_param('friction_velocity_epsilon', self.arm_config.friction_velocity_epsilon),
+            target_velocity_cutoff_hz=_float_param('target_velocity_cutoff_hz', self.arm_config.target_velocity_cutoff_hz),
+            s_a=_float_param('s_a', self.arm_config.s_a),
+            adaptive_stiffness_b=_float_param('adaptive_stiffness_b', self.arm_config.adaptive_stiffness_b),
+            adaptive_stiffness_power=_float_param('adaptive_stiffness_power', self.arm_config.adaptive_stiffness_power),
+            offset_ramp_s=_float_param('offset_ramp_s', self.arm_config.offset_ramp_s),
             kp=self.arm_config.kp, kd=self.arm_config.kd)
         self.add_on_set_parameters_callback(self._on_parameters_set)
         self.last_error = ''
@@ -172,7 +177,7 @@ class DriverNode(Node):
             self.control.start_mit()
         except (ValueError, RuntimeError, CanError) as error:
             self._error(error)
-        self._main_timer = self.create_timer(1.0 / self.telemetry_hz, self._publish)
+        self._main_timer: Timer | None = self.create_timer(1.0 / self.telemetry_hz, self._publish)
         self.get_logger().info(
             f'REAL HARDWARE: started in MIT mode with gravity compensation '
             f'(inner={self.rate_hz:g} Hz, telemetry={self.telemetry_hz:g} Hz)'
@@ -278,8 +283,28 @@ class DriverNode(Node):
             raw_friction_scale = getattr(request, 'friction_scale', -1.0)
             if raw_friction_scale < -1.0:
                 # 标定过程临时覆盖运行时 friction_scale（如 -2.0 表示临时置 0，或 -(2.0 + s)），不写盘修改 arms.yaml
-                temp_scale = bounded(-raw_friction_scale - 2.0, 'friction_scale', 0, 1)
-                self.control.reconfigure(friction_scale=temp_scale)
+                is_restore = raw_friction_scale <= -3.5
+                offset = 4.0 if is_restore else 2.0
+                temp_scale = bounded(round(-raw_friction_scale - offset, 12), 'friction_scale', 0, 1)
+                calibrating_zero = (not is_restore) and temp_scale == 0.0
+                if calibrating_zero:
+                    self.control.reconfigure(friction_scale=0.0, s_a=0.0)
+                else:
+                    latest = FleetConfig(self.fleet.path)
+                    self.fleet = latest
+                    self.arm_config = latest.arm(self.arm_config.id)
+                    self._public_config = latest.public(self.arm_config)
+                    self._public_config_prefix = (
+                        '{"configuration": ' + json.dumps(self._public_config, allow_nan=False) + ', '
+                    )
+                    self.control.reconfigure(
+                        effector=latest.effectors[self.arm_config.end_effector],
+                        gravity_model=latest.gravity_model(self.arm_config),
+                        friction_scale=temp_scale,
+                        friction_model=latest.friction_model(self.arm_config),
+                        s_a=self.arm_config.s_a,
+                        update_models=True,
+                    )
                 self.last_error = ''
                 response.success = True
                 response.message = 'Temporary runtime friction_scale applied without modifying arms.yaml'
@@ -514,6 +539,7 @@ class DriverNode(Node):
         if request.enable_request and self.control.debug_session:
             response.message = 'MIT debugger is active; use stop/disable first'
             return response
+        serial: int | None = None
         try:
             started = time.monotonic()
             self.power_serial += 1
@@ -535,7 +561,7 @@ class DriverNode(Node):
             self._error(error)
             response.message = str(error)
         finally:
-            if self.power_serial == serial:
+            if serial is not None and self.power_serial == serial:
                 self.power_request = None
         return response
 
@@ -667,8 +693,9 @@ class DriverNode(Node):
         if sample.position is not None and fresh(sample.age[:4]):
             j_msg = self._joint_msg
             j_msg.header.stamp = stamp
-            j_msg.position = list(sample.position)
-            j_msg.velocity, j_msg.effort = list(sample.velocity), list(sample.torque)
+            j_msg._position = array.array('d', sample.position)
+            j_msg._velocity = array.array('d', sample.velocity)
+            j_msg._effort = array.array('d', sample.torque)
             self.joints_pub.publish(j_msg)
             self._joints_pub_rate.mark(now)
         if publish_slow and sample.pose is not None:
@@ -729,8 +756,9 @@ def main(args=None):
     executor = None
     try:
         node = DriverNode()
-        if getattr(node, '_main_timer', None) is not None:
-            node.destroy_timer(node._main_timer)
+        main_timer = getattr(node, '_main_timer', None)
+        if main_timer is not None:
+            node.destroy_timer(main_timer)
             node._main_timer = None
         executor = SingleThreadedExecutor()
         executor.add_node(node)

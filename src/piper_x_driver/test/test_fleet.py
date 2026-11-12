@@ -44,7 +44,8 @@ def test_hardware_mapping_and_defaults(fleet_path):
         body = terminal_body(key)
         assert profile.mass_kg == pytest.approx(body.mass_kg)
         assert profile.com_m == pytest.approx(body.com_m)
-        assert terminal_for_model(profile.model).model == profile.model
+        term = terminal_for_model(profile.model)
+        assert term is not None and term.model == profile.model
 
 
 @pytest.mark.parametrize('field,value', [
@@ -152,6 +153,7 @@ def test_wrench_gripper_profile_matches_uniform_mesh_terminal():
     for key, value in generated.items():
         assert value == profile.get(key, data.get(key)), key
     terminal = terminal_for_model('gripper_with_wrench')
+    assert terminal is not None
     assert len(terminal.components) == 6
     assert terminal.payload_link == 'gripper_base'
 
@@ -188,7 +190,7 @@ def test_configured_gravity_matches_potential_energy_gradient(effector):
         for delta in (1e-6, -1e-6):
             q = (*position[:joint], position[joint] + delta, *position[joint + 1:])
             _, _, centers = _kinematics(q, profile.com_m)
-            energies.append(-np.sum(masses * (centers @ _GRAVITY)))
+            energies.append(-float(np.sum(masses * (centers @ _GRAVITY))))
         numerical.append((energies[0] - energies[1]) / 2e-6)
     assert gravity_torques(position, profile.mass_kg, profile.com_m) == pytest.approx(
         numerical, abs=1e-7)

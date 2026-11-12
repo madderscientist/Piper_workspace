@@ -4,7 +4,7 @@ import csv
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 from piper_x_driver.gravity import joint_inertias
@@ -135,7 +135,12 @@ def _filter_velocity_stabilized(
         return [replace(s, weight=1.0) for s, keep in zip(seg, pos_mask) if keep]
 
     ts = np.array([s.t for s in seg], dtype=float)
-    w = min(5, len(v_dir))
+    if len(ts) >= 3:
+        med_dt = float(np.median(np.diff(ts)))
+        target_w = max(5, int(round(0.08 / med_dt)) | 1) if med_dt > 1e-5 else 5
+    else:
+        target_w = 5
+    w = min(target_w, len(v_dir))
     pad_l = w // 2
     pad_r = w - 1 - pad_l
     v_padded = np.pad(v_dir, (pad_l, pad_r), mode='edge')
@@ -501,7 +506,7 @@ def fit_spatial_harmonics(
                 fit_d = basis @ c_diff
                 return -float(np.dot(fit_s, fit_s) + np.dot(fit_d, fit_d))
 
-            opt = minimize_scalar(neg_energy, bounds=(lo, hi), method='bounded')
+            opt: Any = minimize_scalar(neg_energy, bounds=(lo, hi), method='bounded')
             w_best = float(opt.x)
             nearest_int = round(w_best)
             if nearest_int >= 1 and abs(w_best - nearest_int) <= snap_integer_tolerance:

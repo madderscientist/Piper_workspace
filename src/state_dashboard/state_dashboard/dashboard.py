@@ -41,6 +41,8 @@ from .control import ArmController, drain_client, TeachingController
 
 
 DEFAULT_NAMESPACES = tuple(f'/arm_{i}' for i in range(1, 5))
+_STD_JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'gripper']
+_JOINT_RE = re.compile(r'joint_?([1-6])')
 STREAM_TOPICS = {
     'joints': 'joint_states_feedback',
     'status': 'arm_status',
@@ -141,6 +143,24 @@ def finite(value: float) -> float:
 def joint_payload(message: JointState) -> dict[str, Any]:
     """Extract joint feedback by name, including optional trailing gripper data."""
     names = list(message.name)
+    if names == _STD_JOINT_NAMES:
+        pos, vel, eff = message.position, message.velocity, message.effort
+        if len(pos) <= 7 and len(vel) <= 7 and len(eff) <= 7:
+            return {
+                'position_deg': [
+                    math.degrees(finite(pos[i])) if i < len(pos) else None
+                    for i in range(6)
+                ],
+                'velocity_rad_s': [
+                    finite(vel[i]) if i < len(vel) else None
+                    for i in range(6)
+                ],
+                'effort_nm': [
+                    finite(eff[i]) if i < len(eff) else None
+                    for i in range(6)
+                ],
+                'gripper_m': finite(pos[6]) if len(pos) >= 7 else None,
+            }
     if len(set(names)) != len(names):
         raise ValueError('JointState contains duplicate joint names.')
     arrays = (message.position, message.velocity, message.effort)
@@ -153,7 +173,7 @@ def joint_payload(message: JointState) -> dict[str, Any]:
     gripper_index = None
     for index, name in enumerate(names):
         short_name = name.rsplit('/', 1)[-1]
-        match = re.fullmatch(r'joint_?([1-6])', short_name)
+        match = _JOINT_RE.fullmatch(short_name)
         if match:
             joint = int(match.group(1)) - 1
             if joint in indices:
@@ -297,10 +317,8 @@ class TelemetryStore:
 
     def update_control(self, index: int, payload: dict[str, Any]) -> None:
         with self._lock:
-            prev_err = (
-                self._controls[index].payload.get('last_error')
-                if self._controls[index].payload else None
-            )
+            prev_payload = self._controls[index].payload
+            prev_err = prev_payload.get('last_error') if prev_payload else None
             new_err = payload.get('last_error')
             self._controls[index].payload = payload
             self._controls[index].received_at = self._clock()
@@ -350,6 +368,7 @@ class TelemetryStore:
         return None
 
     def snapshot(self) -> dict[str, Any]:
+        cam_calibs = load_camera_calibrations()
         with self._lock:
             now = self._clock()
             arms = []
@@ -381,7 +400,6 @@ class TelemetryStore:
                     connection = 'waiting'
                 control = self._controls[index]
                 control_at = control.received_at
-                cam_calibs = load_camera_calibrations()
                 arms.append({
                     'id': index + 1,
                     'namespace': self.namespaces[index],
@@ -673,7 +691,10 @@ class DashboardServer(ThreadingHTTPServer):
 class DashboardHandler(BaseHTTPRequestHandler):
     """Constrain writes to explicit, same-origin per-arm control requests."""
 
-    server: DashboardServer
+    @property
+    def _server(self) -> DashboardServer:
+        assert isinstance(self.server, DashboardServer)
+        return self.server
 
     def do_GET(self) -> None:
         self._respond(head=False)
@@ -691,16 +712,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response(404, {'message': '未知操作。'})
             return
         if teaching_match is not None:
-            if self.server.teaching_controller is None:
+            if self._server.teaching_controller is None:
                 self._json_response(403, {'message': '当前服务不支持示教控制。'})
                 return
+            action = ''
             power = False
         else:
             assert arm_match is not None
             action = arm_match.group(2)
             power = action in ('enable', 'disable')
-            if ((power and self.server.enable_controller is None)
-                    or (not power and self.server.arm_controller is None)):
+            if ((power and self._server.enable_controller is None)
+                    or (not power and self._server.arm_controller is None)):
                 self._json_response(403, {'message': '当前服务仅支持监控。'})
                 return
         token = self.headers.get('X-Piper-Control-Token', '')
@@ -711,7 +733,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response(403, {'message': '无效的请求来源。'})
             return
         if (
-            not secrets.compare_digest(token.encode('utf-8'), self.server.control_token.encode())
+            not secrets.compare_digest(token.encode('utf-8'), self._server.control_token.encode())
             or self.headers.get('Sec-Fetch-Site') == 'cross-site'
             or (parsed_origin is not None and (
                 parsed_origin.scheme not in ('http', 'https')
@@ -745,18 +767,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response(400, {'message': '使能/失能请求不接受额外参数。'})
             return
         if teaching_match is not None:
-            assert self.server.teaching_controller is not None
-            status, result = self.server.teaching_controller.request(
+            assert self._server.teaching_controller is not None
+            status, result = self._server.teaching_controller.request(
                 teaching_match.group(1), body)
         elif power:
             assert arm_match is not None
-            controller = self.server.enable_controller
+            controller = self._server.enable_controller
             assert controller is not None
             operation = controller.enable if action == 'enable' else controller.disable
             status, result = operation(int(arm_match.group(1)) - 1)
         else:
-            assert arm_match is not None and self.server.arm_controller is not None
-            status, result = self.server.arm_controller.request(
+            assert arm_match is not None and self._server.arm_controller is not None
+            status, result = self._server.arm_controller.request(
                 int(arm_match.group(1)) - 1, action, body)
         self._json_response(status, result)
 
@@ -776,27 +798,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }
         mesh_match = re.fullmatch(r'/meshes/([A-Za-z0-9_]+\.(?:STL|stl))', path)
         if path == '/api/status':
-            snapshot = self.server.store.snapshot()
-            if (self.server.enable_controller is not None
-                    or self.server.arm_controller is not None
-                    or self.server.teaching_controller is not None):
+            snapshot = self._server.store.snapshot()
+            if (self._server.enable_controller is not None
+                    or self._server.arm_controller is not None
+                    or self._server.teaching_controller is not None):
                 snapshot['read_only'] = False
-                snapshot['control_token'] = self.server.control_token
-            if self.server.enable_controller is not None:
+                snapshot['control_token'] = self._server.control_token
+            if self._server.enable_controller is not None:
                 for arm, enable, disable in zip(
-                    snapshot['arms'], self.server.enable_controller.snapshot(),
-                    self.server.enable_controller.snapshot(enable=False),
+                    snapshot['arms'], self._server.enable_controller.snapshot(),
+                    self._server.enable_controller.snapshot(enable=False),
                 ):
                     arm['enable'] = enable
                     arm['disable'] = disable
             body = json.dumps(snapshot, allow_nan=False).encode('utf-8')
             content_type = 'application/json; charset=utf-8'
-        elif path in assets and (self.server.assets / assets[path][0]).is_file():
+        elif path in assets and (self._server.assets / assets[path][0]).is_file():
             filename, content_type = assets[path]
-            body = (self.server.assets / filename).read_bytes()
-        elif (mesh_match is not None and self.server.meshes is not None
-              and (self.server.meshes / mesh_match.group(1)).is_file()):
-            body = (self.server.meshes / mesh_match.group(1)).read_bytes()
+            body = (self._server.assets / filename).read_bytes()
+        elif (mesh_match is not None and self._server.meshes is not None
+              and (self._server.meshes / mesh_match.group(1)).is_file()):
+            body = (self._server.meshes / mesh_match.group(1)).read_bytes()
             content_type = 'application/octet-stream'
         else:
             self.send_error(404, 'Not found')

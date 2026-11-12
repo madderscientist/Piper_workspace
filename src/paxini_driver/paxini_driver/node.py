@@ -14,7 +14,7 @@ from typing import Any, Deque, List, Optional, Tuple
 import rclpy
 from geometry_msgs.msg import WrenchStamped
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.logging import get_logger
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -116,7 +116,10 @@ class PaxiniDriverNode(Node):
         for name, default in defaults.items():
             self.declare_parameter(name, default)
 
-        val = lambda k: self.get_parameter(k).value
+        def val(k: str) -> Any:
+            v = self.get_parameter(k).value
+            return defaults[k] if v is None else v
+
         self.arm_id = str(val("arm_id")).strip()
         cfg_param = str(val("config_file")).strip()
         self.config_file: Optional[Path] = Path(cfg_param) if cfg_param else None
@@ -369,6 +372,7 @@ class PaxiniDriverNode(Node):
             self.get_logger().warning(message)
 
     def _check_stream_timeout(self, now: float) -> None:
+        message = ""
         with self._lock:
             last = max(self._last_wrench_time, self._stream_started_time)
             report = (
@@ -417,6 +421,8 @@ class PaxiniDriverNode(Node):
                         self._last_poll_sent = now
                     else:
                         self._last_poll_sent += period
+                # Sleep until data arrives or the next request is due.
+                timeout = min(timeout, max(0.0, self._last_poll_sent + period - time.monotonic()))
             events = self.transport.poll_events(timeout=timeout)
         except Exception as exc:  # noqa: BLE001
             self._handle_disconnect(exc)
@@ -491,7 +497,7 @@ class PaxiniDriverNode(Node):
                 self.firmware_version = ""
             self._try_connect(now=time.monotonic(), force=True)
             return
-        if raw_to_pub is not None:
+        if raw_to_pub is not None and self.raw_wrench_pub.get_subscription_count() > 0:
             self._publish_wrench(raw_to_pub, raw=True)
         if wrench_to_pub is not None:
             self._publish_wrench(wrench_to_pub)
@@ -522,6 +528,8 @@ class PaxiniDriverNode(Node):
                 "model": self.model,
                 "frame_id": self.frame_id,
                 "acquisition_mode": self.acquisition_mode,
+                "frequency_hz": self.frequency_hz,
+                "poll_rate_hz": self.poll_rate_hz,
                 "streaming": self.streaming,
                 "firmware_version": self.firmware_version,
                 "rx_hz": round(self._rate_tracker.hz(now), 2),
@@ -606,7 +614,10 @@ class PaxiniDriverNode(Node):
             with self._lock:
                 self.streaming = True
                 self._stream_started_time = time.monotonic()
-            return True, f"Polling started at {self.poll_rate_hz:.1f} Hz (0x05)"
+            return True, (
+                f"Polling requested at {self.poll_rate_hz:.1f} Hz (0x05); "
+                "actual reception rate is sensor_status.rx_hz"
+            )
         try:
             self._send_stream_start()
             rate_info = (
@@ -614,7 +625,10 @@ class PaxiniDriverNode(Node):
                 if 0 < self.frequency_hz != 1000
                 else "1000 Hz (0x03)"
             )
-            return True, f"Automatic transmission started at {rate_info}"
+            return True, (
+                f"Automatic transmission requested at {rate_info}; "
+                "actual reception rate is sensor_status.rx_hz"
+            )
         except Exception as exc:  # noqa: BLE001
             self._handle_disconnect(exc)
             return False, str(exc)
@@ -684,7 +698,7 @@ class PaxiniDriverNode(Node):
         if not ok:
             self.get_logger().warning(f"Command '{raw}' failed: {info}")
 
-    def destroy_node(self) -> bool:
+    def destroy_node(self) -> None:
         self._stop_event.set()
         if self._worker_thread is not None and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=1.0)
@@ -699,7 +713,7 @@ class PaxiniDriverNode(Node):
                 self.transport.close()
             except Exception:  # noqa: BLE001
                 pass
-        return super().destroy_node()
+        super().destroy_node()
 
 
 def main(args: Optional[List[str]] = None) -> None:
@@ -713,7 +727,7 @@ def main(args: Optional[List[str]] = None) -> None:
             rclpy.shutdown()
         return
 
-    executor = MultiThreadedExecutor()
+    executor = SingleThreadedExecutor()
     executor.add_node(node)
     stopped = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stopped.set())

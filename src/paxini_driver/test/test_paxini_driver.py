@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import threading
 import time
@@ -45,7 +46,7 @@ from paxini_driver.protocol import (
     build_serial_frame,
     freq_to_code,
 )
-from paxini_driver.transport import SensorTransport
+from paxini_driver.transport import SensorTransport, SerialSensorTransport
 from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
@@ -85,6 +86,52 @@ def test_serial_protocol_matches_manual_examples():
     assert events[1].wrench.fy == pytest.approx(-0.04503475, abs=1e-6)
     assert events[1].wrench.fz == pytest.approx(0.01980113, abs=1e-6)
     assert events[2].ack_cmd == CMD_CALIBRATE
+
+
+def test_serial_wait_receives_delayed_frame():
+    read_fd, write_fd = os.pipe()
+    ready = threading.Event()
+    frame = bytes.fromhex(
+        "AA 55 7F 03 31 0C 0B BD 5C 76 38 BD FC 35 A2 3C "
+        "6E E8 B7 BA E6 9C 24 39 36 C8 9F B9 43"
+    )
+
+    class PipeSerial:
+        is_open = True
+
+        def fileno(self):
+            return read_fd
+
+        @property
+        def in_waiting(self):
+            return len(frame) if ready.is_set() else 0
+
+        def read(self, count):
+            ready.clear()
+            return os.read(read_fd, count)
+
+        def close(self):
+            self.is_open = False
+            os.close(read_fd)
+
+    transport = SerialSensorTransport(serial_factory=lambda *_: PipeSerial())
+
+    def delayed_frame():
+        time.sleep(0.01)
+        ready.set()
+        os.write(write_fd, frame)
+
+    writer = threading.Thread(target=delayed_frame)
+    transport.open()
+    writer.start()
+    try:
+        events = transport.poll_events(timeout=0.25)
+        assert len(events) == 1 and events[0].wrench is not None
+        assert events[0].wrench.as_tuple() == WrenchSample.from_bytes(frame[4:-1]).as_tuple()
+    finally:
+        writer.join()
+        transport.close()
+        os.close(write_fd)
 
 
 def test_can_and_canfd_protocol_matches_manual():
@@ -256,6 +303,8 @@ def test_ros_driver_raw_compensation_and_reload(tmp_path, monkeypatch):
         malformed_joints.position = [0.0] * 6
         node._on_joints(malformed_joints)
         assert node.latest_joint_positions is None
+        assert node.status_dict()["frequency_hz"] == 200
+        assert node.status_dict()["poll_rate_hz"] == 1000.0
         assert not node.status_dict()["connected"]
         assert node.calibrate_hardware()[0] is False
         transport.available = True
@@ -291,6 +340,7 @@ def test_ros_driver_raw_compensation_and_reload(tmp_path, monkeypatch):
             )
         ]
         node.step()
+        assert node.latest_raw is not None and node.latest_wrench is not None
         assert node.latest_raw.as_tuple() == (12, -5, 25, 0.1, -0.2, 0.3)
         assert node.latest_wrench.as_tuple() == pytest.approx((2, 0, 5, 0, 0, 0))
         assert not hasattr(node, "mit_pub")

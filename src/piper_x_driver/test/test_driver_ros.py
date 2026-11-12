@@ -25,7 +25,7 @@ def spin_until(executor, predicate, timeout=4):
 
 def test_feedback_outage_logs_once_and_keeps_latest_diagnostic():
     logs = []
-    node = SimpleNamespace(
+    node: Any = SimpleNamespace(
         last_error='', _error_key=DriverNode._error_key,
         get_logger=lambda: SimpleNamespace(error=logs.append),
     )
@@ -53,7 +53,7 @@ def test_driver_real_ros_services_commands_and_telemetry():
     subscription = client.create_subscription(ArmStatus, 'arm_status', states.append, 10)
     wrench_sub = client.create_subscription(WrenchStamped, 'end_wrench_stamped', wrenches.append, 10)
     ctrl_sub = client.create_subscription(
-        String, 'control_state', lambda msg: ctrl_states.append(json.loads(msg.data)), 10,
+        String, 'control_state', lambda msg: ctrl_states.append(json.loads(getattr(msg, 'data'))), 10,
     )
     power = client.create_client(Enable, 'enable_srv')
     estimation = client.create_client(SetBool, 'set_wrench_estimation')
@@ -69,7 +69,8 @@ def test_driver_real_ros_services_commands_and_telemetry():
             assert estimate.call_count == 0
         future = estimation.call_async(SetBool.Request(data=True))
         spin_until(executor, future.done)
-        assert future.result().success
+        est_res = future.result()
+        assert est_res is not None and est_res.success
         spin_until(executor, lambda: bool(wrenches) and any(s['wrench_estimate_available'] for s in ctrl_states))
         future = power.call_async(Enable.Request(enable_request=True))
         spin_until(executor, future.done)
@@ -108,7 +109,8 @@ def test_driver_real_ros_services_commands_and_telemetry():
         before = len(driver.arm.calls)
         future = estimation.call_async(SetBool.Request(data=False))
         spin_until(executor, future.done)
-        assert future.result().success
+        est_off_res = future.result()
+        assert est_off_res is not None and est_off_res.success
         assert driver.wrench_estimation_enabled is False
         spin_until(executor, lambda: ctrl_states[-1]['wrench_estimation_enabled'] is False)
         assert ctrl_states[-1]['end_wrench'] is None

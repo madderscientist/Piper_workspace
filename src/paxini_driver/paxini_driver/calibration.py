@@ -47,7 +47,7 @@ class WrenchStabilityWindow:
 
 # Real five-pose arm3 gravity data matches the SDK link6 axes on this assembly.
 # The display URDF joint chain is different and must not be used with SDK joint feedback.
-def sensor_rotation_in_base(q: Sequence[float]) -> np.ndarray:
+def sensor_rotation_in_base(q: Sequence[float] | np.ndarray) -> np.ndarray:
     """Return the sensor channel rotation using the shared SDK-compatible kinematics."""
     return link6_rotation_in_base(q)
 
@@ -57,7 +57,7 @@ def _gravity_direction(q: tuple[float, ...]) -> tuple[float, ...]:
     return tuple(float(v) for v in -sensor_rotation_in_base(q)[2, :])
 
 
-def gravity_unit_in_sensor(q: Sequence[float]) -> np.ndarray:
+def gravity_unit_in_sensor(q: Sequence[float] | np.ndarray) -> np.ndarray:
     """Return unit downward gravity direction g_hat_S = R_BS(q)^T [0, 0, -1]^T in wrench_sensor frame."""
     # Key on all measured angles and return independent storage to callers.
     return np.asarray(_gravity_direction(tuple(float(v) for v in q[:6])))
@@ -84,17 +84,17 @@ def tool_gravity_wrench(
     mass = float(tool_mass_kg)
     if mass <= 0.0 or len(q) < 6:
         return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    g_hat = gravity_unit_in_sensor(q)
-    f_grav = (mass * GRAVITY_ACCEL) * g_hat
-    com = np.asarray(tool_com_m[:3], dtype=float)
-    m_grav = np.cross(com, f_grav)
+    gx, gy, gz = _gravity_direction(tuple(float(v) for v in q[:6]))
+    scale = mass * GRAVITY_ACCEL
+    fx, fy, fz = scale * gx, scale * gy, scale * gz
+    cx, cy, cz = float(tool_com_m[0]), float(tool_com_m[1]), float(tool_com_m[2])
     return (
-        float(f_grav[0]),
-        float(f_grav[1]),
-        float(f_grav[2]),
-        float(m_grav[0]),
-        float(m_grav[1]),
-        float(m_grav[2]),
+        fx,
+        fy,
+        fz,
+        cy * fz - cz * fy,
+        cz * fx - cx * fz,
+        cx * fy - cy * fx,
     )
 
 
@@ -108,8 +108,14 @@ def compensate_wrench(
     """Subtract calibrated zero-bias and (when joint angles q are available) tool gravity wrench."""
     if q is not None and len(q) >= 6 and tool_mass_kg > 0.0:
         gw = tool_gravity_wrench(q, tool_mass_kg, tool_com_m)
-        total_offset = [float(tare_offset[i]) + gw[i] for i in range(6)]
-        return raw.minus(total_offset)
+        return WrenchSample(
+            raw.fx - (tare_offset[0] + gw[0]),
+            raw.fy - (tare_offset[1] + gw[1]),
+            raw.fz - (tare_offset[2] + gw[2]),
+            raw.mx - (tare_offset[3] + gw[3]),
+            raw.my - (tare_offset[4] + gw[4]),
+            raw.mz - (tare_offset[5] + gw[5]),
+        )
     return raw.minus(tare_offset)
 
 
@@ -142,10 +148,10 @@ class CalibrationResult:
 
 
 def solve_wrench_calibration(
-    poses: Sequence[Sequence[float]],
-    wrenches: Sequence[Sequence[float]],
+    poses: Sequence[Sequence[float] | np.ndarray] | np.ndarray,
+    wrenches: Sequence[Sequence[float] | np.ndarray] | np.ndarray,
     *,
-    gravity_directions: Optional[Sequence[Sequence[float]]] = None,
+    gravity_directions: Optional[Sequence[Sequence[float] | np.ndarray] | np.ndarray] = None,
 ) -> CalibrationResult:
     """Fit f=b_f+W*g and t=b_t-[g]_x*p, with W=m*9.81 and p=W*CoM.
 
@@ -193,10 +199,19 @@ def solve_wrench_calibration(
         com = np.zeros(3)
     force_error = force - (f_bias + weight * g)
     torque_error = torque - (t_bias + np.cross(com, weight * g))
+    tare_6 = (
+        float(f_bias[0]),
+        float(f_bias[1]),
+        float(f_bias[2]),
+        float(t_bias[0]),
+        float(t_bias[1]),
+        float(t_bias[2]),
+    )
+    com_3 = (float(com[0]), float(com[1]), float(com[2]))
     return CalibrationResult(
-        tare_offset=tuple(float(v) for v in np.r_[f_bias, t_bias]),
+        tare_offset=tare_6,
         tool_mass_kg=weight / GRAVITY_ACCEL,
-        tool_com_m=tuple(float(v) for v in com),
+        tool_com_m=com_3,
         num_poses=n,
         force_rms_n=float(np.sqrt(np.mean(force_error**2))),
         torque_rms_nm=float(np.sqrt(np.mean(torque_error**2))),

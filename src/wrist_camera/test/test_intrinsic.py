@@ -1,14 +1,9 @@
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 import cv2
 import numpy as np
 
 from wrist_camera import intrinsic
 from wrist_camera.board import Detection
-from conftest import front_pose
+from .conftest import front_pose
 
 K = np.array([[820.0, 0, 636.0], [0, 818.0, 358.0], [0, 0, 1.0]])
 D = np.array([-0.152, 0.041, 0.0011, -0.0007, 0.0])

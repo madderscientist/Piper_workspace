@@ -133,6 +133,19 @@ class JointFrictionModel:
         """Direction-dependent spatial meshing modulation tau_mod(theta)."""
         return sum(h.modulation(theta) for h in self.harmonics)
 
+    def _mod_and_cogging(self, theta: float) -> tuple[float, float]:
+        if not self.harmonics:
+            return 0.0, 0.0
+        mod = 0.0
+        cog = 0.0
+        for h in self.harmonics:
+            phase = h.omega * theta
+            c = math.cos(phase)
+            s = math.sin(phase)
+            cog += h.a * c + h.b * s
+            mod += h.c * c + h.d * s
+        return mod, cog
+
     def envelope(self, velocity: float) -> float:
         """Speed decay envelope w(dq) = exp(-(dq / vr)^2), ~1 at low speed and ->0 at high speed."""
         ratio = velocity / self.vr
@@ -202,33 +215,40 @@ class JointFrictionModel:
         Combines Stribeck + periodic ripple when moving with error/target-velocity
         breakaway stiction at rest so static friction deadband is overcome smoothly.
         """
+        theta_f = float(theta)
+        mod_raw, cog_raw = self._mod_and_cogging(theta_f)
+        eps_e = self.error_epsilon if error_epsilon is None else float(error_epsilon)
+        eps_v = self.velocity_epsilon if velocity_epsilon is None else float(velocity_epsilon)
+        drive = 0.0
+        if eps_e > 0.0:
+            drive += float(position_error) / eps_e
+        if eps_v > 0.0:
+            drive += float(target_velocity) / eps_v
+        if drive == 0.0:
+            stiction = 0.0
+        else:
+            floor = float(static_friction) if float(static_friction) > 0.0 else max(self.fs, self.fc)
+            magnitude = max(0.0, self.load_ratio * abs(float(gravity_torque)) + floor + mod_raw)
+            stiction = float(magnitude * math.tanh(drive))
         s = abs(velocity)
-        stiction = self.stiction_torque(
-            theta,
-            position_error,
-            target_velocity,
-            gravity_torque=gravity_torque,
-            static_friction=static_friction,
-            error_epsilon=error_epsilon,
-            velocity_epsilon=velocity_epsilon,
-        )
         if s == 0.0:
             return float(friction_scale * stiction)
         # 1. 高速衰减包络 w(dq) = exp(-(dq / vr)^2)：低速接近 1（完整补偿齿轮感），高速趋近 0（平滑退火）
         env = self.envelope(velocity)
         # 2. 零速平滑门控 tanh(|dq| / v0)：静止时为 0 防止齿槽补偿在零速自激，一旦运动迅速升至 1
-        motion_gate = math.tanh(s / self.v0)
+        tanh_v = math.tanh(velocity / self.v0)
+        motion_gate = abs(tanh_v)
         # 3. 与运动方向相关的摩擦项：随 |dq| 从静摩擦平滑过渡到 Stribeck + 周期啮合调制 + 粘滞摩擦
         dry = (
             self.load_ratio * abs(float(gravity_torque))
             + self.fc
             + (self.fs - self.fc) * math.exp(-((s / self.vs) ** self.delta))
         )
-        mod = env * self.modulation_torque(theta)
-        kinetic = max(0.0, dry + mod) * math.tanh(velocity / self.v0) + self.fv * velocity
+        mod = env * mod_raw
+        kinetic = max(0.0, dry + mod) * tanh_v + self.fv * velocity
         directional = (1.0 - motion_gate) * stiction + motion_gate * kinetic
         # 4. 与运动方向无关的齿槽转矩项：w(dq) * tanh(|dq| / v0) * tau_cog(theta)
-        cog = env * motion_gate * self.cogging_torque(theta)
+        cog = env * motion_gate * cog_raw
         return float(friction_scale * directional + cogging_scale * cog)
 
     def to_dict(self) -> dict:

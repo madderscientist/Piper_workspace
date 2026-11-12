@@ -100,9 +100,10 @@ class PoseCalibrator(Node):
         self.reload_client = self.create_client(Trigger, "reload_config")
 
     def _on_joints(self, msg: JointState):
-        if not all(name in msg.name for name in JOINT_NAMES):
+        names = list(msg.name)
+        if not all(name in names for name in JOINT_NAMES):
             return
-        order = [msg.name.index(name) for name in JOINT_NAMES]
+        order = [names.index(name) for name in JOINT_NAMES]
         if not all(index < len(msg.position) for index in order):
             return
         q = tuple(float(msg.position[index]) for index in order)
@@ -266,7 +267,7 @@ class PoseCalibrator(Node):
             tuple(float(v) for v in np.mean([s[i] for s in samples], axis=0))
             for i in (1, 2, 3)
         ]
-        point = CalibrationPoint(*means, len(samples), duration)
+        point = CalibrationPoint(means[0], means[1], means[2], len(samples), duration)
         self.get_logger().info(
             f"姿态采样完成: {point.sample_count} 条，"
             f"关节均值 {[round(v, 6) for v in point.position_rad]}，"

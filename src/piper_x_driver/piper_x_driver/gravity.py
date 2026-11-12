@@ -29,6 +29,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 import math
@@ -56,7 +57,7 @@ _XYZ = np.array([
     (0, 0, 0.123), (0, 0, 0), (0.28503, 0, 0),
     (0.27364, 0, 0), (0.07466, 0, 0), (0, -0.035, 0),
 ])
-_RPY = [
+_RPY: list[tuple[float, float, float]] = [
     (0, 0, 3.1415926), (-1.5707963, -3.005806, -3.1415926),
     (0, 0, 2.8380798), (0, 0, 0.0806342),
     (-1.5707963, 1.5707963, 0), (1.5707963, 0, 0),
@@ -85,11 +86,12 @@ _EFFECTOR_INERTIAS = {
     for key, profile in terminal_profiles().items()
     for alias in (key, profile['model'])
 }
-_MAX_INERTIA = {
-    alias: terminal_for_model(key).max_joint_inertia_kg_m2
-    for key, profile in terminal_profiles().items()
-    for alias in (key, profile['model'])
-}
+_MAX_INERTIA: dict[str, tuple[float, ...]] = {}
+for _key, _profile in terminal_profiles().items():
+    _terminal = terminal_for_model(_key)
+    assert _terminal is not None
+    for _alias in (_key, _profile['model']):
+        _MAX_INERTIA[_alias] = _terminal.max_joint_inertia_kg_m2
 _XYZ_T = tuple(tuple(map(float, row)) for row in _XYZ)
 _ROT_T = tuple(tuple(tuple(map(float, row)) for row in mat) for mat in _ROTATIONS)
 _COM_T = tuple(tuple(map(float, row)) for row in _COM)
@@ -101,23 +103,16 @@ _EFF_I_T = {
 }
 
 
-def max_critical_kd(
-    kp: tuple[float, ...] | list[float],
-    end_effector: str = 'teaching_handle',
-    gravity_model: 'ArmGravityModel | None' = None,
+@lru_cache(maxsize=256)
+def _max_critical_kd_cached(
+    kp: tuple[float, ...],
+    end_effector: str,
+    scales: tuple[float, ...],
+    added_mass_kg: float,
 ) -> tuple[float, ...]:
-    """Return maximum critical damping kd (Nm/(rad/s)) across all URDF poses for kp."""
-    if gravity_model is not None and gravity_model.effector_model:
-        end_effector = gravity_model.effector_model
     inertias = _MAX_INERTIA.get(end_effector, _MAX_INERTIA['teaching_handle'])
-    scales = (
-        (1.0,) * 6
-        if gravity_model is None
-        else tuple(gravity_model.joint(i).scale or 1.0 for i in range(1, 7))
-    )
     terminal = terminal_for_model(end_effector)
-    if (terminal is not None and terminal.payload_link is not None
-            and gravity_model is not None and gravity_model.added_mass_kg):
+    if terminal is not None and terminal.payload_link is not None and added_mass_kg:
         shape = terminal.components[terminal.payload_link]
         unit = shape.inertia / shape.mass_kg
         radius = float(np.linalg.norm(shape.com_m))
@@ -127,14 +122,33 @@ def max_critical_kd(
             for j in range(6)
         ]
         increment[5] = unit[2, 2] + shape.com_m[0] ** 2 + shape.com_m[1] ** 2
-        inertias = tuple(v + gravity_model.added_mass_kg * d for v, d in zip(inertias, increment))
+        inertias = tuple(v + added_mass_kg * d for v, d in zip(inertias, increment))
     return tuple(
         round(math.sqrt(2.0 * (scale * inertia) * max(0.0, float(k))), 2)
         for scale, inertia, k in zip(scales, inertias, kp)
     )
 
 
-def link6_rotation_in_base(position: tuple[float, ...] | list[float]) -> np.ndarray:
+def max_critical_kd(
+    kp: Sequence[float],
+    end_effector: str = 'teaching_handle',
+    gravity_model: 'ArmGravityModel | None' = None,
+) -> tuple[float, ...]:
+    """Return maximum critical damping kd (Nm/(rad/s)) across all URDF poses for kp."""
+    if gravity_model is not None and gravity_model.effector_model:
+        end_effector = gravity_model.effector_model
+    scales = (
+        (1.0,) * 6
+        if gravity_model is None
+        else tuple(gravity_model.joint(i).scale or 1.0 for i in range(1, 7))
+    )
+    added_mass = 0.0 if gravity_model is None else float(gravity_model.added_mass_kg)
+    return _max_critical_kd_cached(
+        tuple(float(k) for k in kp), str(end_effector), scales, added_mass,
+    )
+
+
+def link6_rotation_in_base(position: Sequence[float] | np.ndarray) -> np.ndarray:
     """Return the SDK-compatible link6 rotation for measured joint angles (rad)."""
     if len(position) < 6:
         raise ValueError('Six joint positions are required')
@@ -196,11 +210,11 @@ def _fast_fk(position, effector_com=None):
 
 
 def joint_inertias(
-    position: tuple[float, ...] | list[float],
+    position: Sequence[float] | np.ndarray,
     end_effector: str = 'teaching_handle',
     mass_kg: float | None = None,
-    com_m: tuple[float, ...] | None = None,
-    scales: tuple[float, ...] = (1.0,) * 6,
+    com_m: Sequence[float] | np.ndarray | None = None,
+    scales: Sequence[float] | np.ndarray = (1.0,) * 6,
     inertia_tensor=None,
 ) -> tuple[float, ...]:
     """Return pose-dependent diagonal joint-space inertias J_j(q) (kg*m^2) from URDF 3x3 tensors.
@@ -254,8 +268,8 @@ def _joint_inertias_cached(position, mass_kg, com_m, scales, eff_t):
 
 
 def gravity_torques(
-    position: tuple[float, ...], mass_kg: float = float(_MASS[6]),
-    com_m: tuple[float, ...] = tuple(_COM[6]),
+    position: Sequence[float] | np.ndarray, mass_kg: float = float(_MASS[6]),
+    com_m: Sequence[float] | np.ndarray = tuple(_COM[6]),
 ) -> tuple[float, ...]:
     """Return joint-side Nm opposing gravity, not motor-side current/torque."""
     return _gravity_torques_cached(
@@ -284,8 +298,8 @@ def _gravity_torques_cached(position, mass_kg, com_m):
 
 
 def geometric_jacobian(
-    position: tuple[float, ...] | list[float],
-    tool_offset_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.0),
+    position: Sequence[float] | np.ndarray,
+    tool_offset_m: Sequence[float] | np.ndarray = (0.0, 0.0, 0.0),
     *,
     frame: str = 'gripper',
 ) -> np.ndarray:
@@ -324,18 +338,18 @@ def geometric_jacobian(
 
 
 def estimate_joint_torques(
-    position: tuple[float, ...] | list[float],
-    velocity: tuple[float, ...] | list[float],
-    target_position: tuple[float, ...] | list[float],
-    target_velocity: tuple[float, ...] | list[float],
-    kp: tuple[float, ...] | list[float],
-    kd: tuple[float, ...] | list[float],
-    torque_cmd: tuple[float, ...] | list[float] = (0.0,) * 6,
-    acceleration: tuple[float, ...] | list[float] = (0.0,) * 6,
+    position: Sequence[float],
+    velocity: Sequence[float],
+    target_position: Sequence[float],
+    target_velocity: Sequence[float],
+    kp: Sequence[float],
+    kd: Sequence[float],
+    torque_cmd: Sequence[float] = (0.0,) * 6,
+    acceleration: Sequence[float] = (0.0,) * 6,
     *,
     end_effector: str = 'teaching_handle',
     mass_kg: float | None = None,
-    com_m: tuple[float, ...] | None = None,
+    com_m: Sequence[float] | None = None,
     gravity_model: 'ArmGravityModel | None' = None,
 ) -> tuple[float, ...]:
     """Estimate 6-joint load/external torques (Nm) from MIT impedance error minus inertial torque."""
@@ -370,11 +384,11 @@ def estimate_joint_torques(
 
 
 def end_effector_wrench(
-    joint_torques: tuple[float, ...] | list[float],
-    position: tuple[float, ...] | list[float],
+    joint_torques: Sequence[float] | np.ndarray,
+    position: Sequence[float] | np.ndarray,
     *,
     gravity_model: 'ArmGravityModel | None' = None,
-    tool_offset_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.0),
+    tool_offset_m: Sequence[float] | np.ndarray = (0.0, 0.0, 0.0),
     damping: float = 1e-2,
     frame: str = 'gripper',
 ) -> tuple[float, ...]:
@@ -465,17 +479,81 @@ def _solve_damped_wrench(
             j4[i] = zy
             j5[i] = zz
     lam2 = damping * damping
-    fx, fy, fz = _solve_3x6_block((j0, j1, j2), tau, lam2)
-    tau_rem = (
-        t0 - (j0[0] * fx + j1[0] * fy + j2[0] * fz),
-        t1 - (j0[1] * fx + j1[1] * fy + j2[1] * fz),
-        t2 - (j0[2] * fx + j1[2] * fy + j2[2] * fz),
-        t3 - (j0[3] * fx + j1[3] * fy + j2[3] * fz),
-        t4 - (j0[4] * fx + j1[4] * fy + j2[4] * fz),
-        t5 - (j0[5] * fx + j1[5] * fy + j2[5] * fz),
-    )
-    mx, my, mz = _solve_3x6_block((j3, j4, j5), tau_rem, max(lam2, 1e-2))
-    return (fx, fy, fz, mx, my, mz)
+    a00 = j0[0]*j0[0] + j0[1]*j0[1] + j0[2]*j0[2] + j0[3]*j0[3] + j0[4]*j0[4] + j0[5]*j0[5] + lam2
+    a01 = j0[0]*j1[0] + j0[1]*j1[1] + j0[2]*j1[2] + j0[3]*j1[3] + j0[4]*j1[4] + j0[5]*j1[5]
+    a02 = j0[0]*j2[0] + j0[1]*j2[1] + j0[2]*j2[2] + j0[3]*j2[3] + j0[4]*j2[4] + j0[5]*j2[5]
+    a11 = j1[0]*j1[0] + j1[1]*j1[1] + j1[2]*j1[2] + j1[3]*j1[3] + j1[4]*j1[4] + j1[5]*j1[5] + lam2
+    a12 = j1[0]*j2[0] + j1[1]*j2[1] + j1[2]*j2[2] + j1[3]*j2[3] + j1[4]*j2[4] + j1[5]*j2[5]
+    a22 = j2[0]*j2[0] + j2[1]*j2[1] + j2[2]*j2[2] + j2[3]*j2[3] + j2[4]*j2[4] + j2[5]*j2[5] + lam2
+
+    b00 = j0[0]*j3[0] + j0[1]*j3[1] + j0[2]*j3[2] + j0[3]*j3[3] + j0[4]*j3[4] + j0[5]*j3[5]
+    b01 = j0[0]*j4[0] + j0[1]*j4[1] + j0[2]*j4[2] + j0[3]*j4[3] + j0[4]*j4[4] + j0[5]*j4[5]
+    b02 = j0[0]*j5[0] + j0[1]*j5[1] + j0[2]*j5[2] + j0[3]*j5[3] + j0[4]*j5[4] + j0[5]*j5[5]
+    b10 = j1[0]*j3[0] + j1[1]*j3[1] + j1[2]*j3[2] + j1[3]*j3[3] + j1[4]*j3[4] + j1[5]*j3[5]
+    b11 = j1[0]*j4[0] + j1[1]*j4[1] + j1[2]*j4[2] + j1[3]*j4[3] + j1[4]*j4[4] + j1[5]*j4[5]
+    b12 = j1[0]*j5[0] + j1[1]*j5[1] + j1[2]*j5[2] + j1[3]*j5[3] + j1[4]*j5[4] + j1[5]*j5[5]
+    b20 = j2[0]*j3[0] + j2[1]*j3[1] + j2[2]*j3[2] + j2[3]*j3[3] + j2[4]*j3[4] + j2[5]*j3[5]
+    b21 = j2[0]*j4[0] + j2[1]*j4[1] + j2[2]*j4[2] + j2[3]*j4[3] + j2[4]*j4[4] + j2[5]*j4[5]
+    b22 = j2[0]*j5[0] + j2[1]*j5[1] + j2[2]*j5[2] + j2[3]*j5[3] + j2[4]*j5[4] + j2[5]*j5[5]
+
+    d00 = j3[0]*j3[0] + j3[1]*j3[1] + j3[2]*j3[2] + j3[3]*j3[3] + j3[4]*j3[4] + j3[5]*j3[5] + lam2
+    d01 = j3[0]*j4[0] + j3[1]*j4[1] + j3[2]*j4[2] + j3[3]*j4[3] + j3[4]*j4[4] + j3[5]*j4[5]
+    d02 = j3[0]*j5[0] + j3[1]*j5[1] + j3[2]*j5[2] + j3[3]*j5[3] + j3[4]*j5[4] + j3[5]*j5[5]
+    d11 = j4[0]*j4[0] + j4[1]*j4[1] + j4[2]*j4[2] + j4[3]*j4[3] + j4[4]*j4[4] + j4[5]*j4[5] + lam2
+    d12 = j4[0]*j5[0] + j4[1]*j5[1] + j4[2]*j5[2] + j4[3]*j5[3] + j4[4]*j5[4] + j4[5]*j5[5]
+    d22 = j5[0]*j5[0] + j5[1]*j5[1] + j5[2]*j5[2] + j5[3]*j5[3] + j5[4]*j5[4] + j5[5]*j5[5] + lam2
+
+    bv0 = j0[0]*t0 + j0[1]*t1 + j0[2]*t2 + j0[3]*t3 + j0[4]*t4 + j0[5]*t5
+    bv1 = j1[0]*t0 + j1[1]*t1 + j1[2]*t2 + j1[3]*t3 + j1[4]*t4 + j1[5]*t5
+    bv2 = j2[0]*t0 + j2[1]*t1 + j2[2]*t2 + j2[3]*t3 + j2[4]*t4 + j2[5]*t5
+    bw0 = j3[0]*t0 + j3[1]*t1 + j3[2]*t2 + j3[3]*t3 + j3[4]*t4 + j3[5]*t5
+    bw1 = j4[0]*t0 + j4[1]*t1 + j4[2]*t2 + j4[3]*t3 + j4[4]*t4 + j4[5]*t5
+    bw2 = j5[0]*t0 + j5[1]*t1 + j5[2]*t2 + j5[3]*t3 + j5[4]*t4 + j5[5]*t5
+
+    # Exact 6x6 block Schur complement: S = D - B^T A^{-1} B, m = S^{-1}(bw - B^T f0), f = f0 - A^{-1} B m
+    y00, y10, y20 = _solve_sym3(a00, a01, a02, a11, a12, a22, b00, b10, b20)
+    y01, y11, y21 = _solve_sym3(a00, a01, a02, a11, a12, a22, b01, b11, b21)
+    y02, y12, y22 = _solve_sym3(a00, a01, a02, a11, a12, a22, b02, b12, b22)
+    f00, f01, f02 = _solve_sym3(a00, a01, a02, a11, a12, a22, bv0, bv1, bv2)
+
+    s00 = d00 - (b00*y00 + b10*y10 + b20*y20)
+    s01 = d01 - (b00*y01 + b10*y11 + b20*y21)
+    s02 = d02 - (b00*y02 + b10*y12 + b20*y22)
+    s11 = d11 - (b01*y01 + b11*y11 + b21*y21)
+    s12 = d12 - (b01*y02 + b11*y12 + b21*y22)
+    s22 = d22 - (b02*y02 + b12*y12 + b22*y22)
+
+    rw0 = bw0 - (b00*f00 + b10*f01 + b20*f02)
+    rw1 = bw1 - (b01*f00 + b11*f01 + b21*f02)
+    rw2 = bw2 - (b02*f00 + b12*f01 + b22*f02)
+
+    mx, my, mz = _solve_sym3(s00, s01, s02, s11, s12, s22, rw0, rw1, rw2)
+    fx = f00 - (y00*mx + y01*my + y02*mz)
+    fy = f01 - (y10*mx + y11*my + y12*mz)
+    fz = f02 - (y20*mx + y21*my + y22*mz)
+    return (float(fx), float(fy), float(fz), float(mx), float(my), float(mz))
+
+
+def _solve_sym3(
+    a00: float, a01: float, a02: float, a11: float, a12: float, a22: float,
+    b0: float, b1: float, b2: float,
+) -> tuple[float, float, float]:
+    inv0 = 1.0 / a00
+    f10 = a01 * inv0
+    f20 = a02 * inv0
+    m11 = a11 - f10 * a01
+    m12 = a12 - f10 * a02
+    rhs1 = b1 - f10 * b0
+    m22 = a22 - f20 * a02
+    rhs2 = b2 - f20 * b0
+    inv1 = 1.0 / m11
+    f21 = m12 * inv1
+    m22 -= f21 * m12
+    rhs2 -= f21 * rhs1
+    x2 = rhs2 / m22
+    x1 = (rhs1 - m12 * x2) * inv1
+    x0 = (b0 - a01 * x1 - a02 * x2) * inv0
+    return (x0, x1, x2)
 
 
 def _solve_3x6_block(
@@ -494,22 +572,7 @@ def _solve_3x6_block(
     b0 = r0[0]*t0 + r0[1]*t1 + r0[2]*t2 + r0[3]*t3 + r0[4]*t4 + r0[5]*t5
     b1 = r1[0]*t0 + r1[1]*t1 + r1[2]*t2 + r1[3]*t3 + r1[4]*t4 + r1[5]*t5
     b2 = r2[0]*t0 + r2[1]*t1 + r2[2]*t2 + r2[3]*t3 + r2[4]*t4 + r2[5]*t5
-    # 3x3 symmetric positive-definite elimination
-    inv0 = 1.0 / a00
-    f10 = a01 * inv0
-    f20 = a02 * inv0
-    m11 = a11 - f10 * a01
-    m12 = a12 - f10 * a02
-    rhs1 = b1 - f10 * b0
-    m22 = a22 - f20 * a02
-    rhs2 = b2 - f20 * b0
-    inv1 = 1.0 / m11
-    f21 = m12 * inv1
-    m22 -= f21 * m12
-    rhs2 -= f21 * rhs1
-    x2 = rhs2 / m22
-    x1 = (rhs1 - m12 * x2) * inv1
-    x0 = (b0 - a01 * x1 - a02 * x2) * inv0
+    x0, x1, x2 = _solve_sym3(a00, a01, a02, a11, a12, a22, b0, b1, b2)
     return (float(x0), float(x1), float(x2))
 
 
@@ -631,9 +694,9 @@ class ArmGravityModel:
 
     def torques(
         self,
-        position: tuple[float, ...] | list[float],
+        position: Sequence[float] | np.ndarray,
         mass_kg: float | None = None,
-        com_m: tuple[float, ...] | None = None,
+        com_m: Sequence[float] | np.ndarray | None = None,
     ) -> tuple[float, ...]:
         if len(position) < 6:
             raise ValueError('Six joint positions are required')
@@ -650,10 +713,10 @@ class ArmGravityModel:
 
     def inertias(
         self,
-        position: tuple[float, ...] | list[float],
+        position: Sequence[float] | np.ndarray,
         end_effector: str = 'teaching_handle',
         mass_kg: float | None = None,
-        com_m: tuple[float, ...] | None = None,
+        com_m: Sequence[float] | np.ndarray | None = None,
     ) -> tuple[float, ...]:
         """Return pose-dependent joint inertias J_j(q) scaled proportionally by calibrated gravity scale."""
         if len(position) < 6:
@@ -671,8 +734,8 @@ class ArmGravityModel:
 
     def jacobian(
         self,
-        position: tuple[float, ...] | list[float],
-        tool_offset_m: tuple[float, ...] | list[float] = (0.0, 0.0, 0.0),
+        position: Sequence[float] | np.ndarray,
+        tool_offset_m: Sequence[float] | np.ndarray = (0.0, 0.0, 0.0),
         *,
         frame: str = 'gripper',
     ) -> np.ndarray:

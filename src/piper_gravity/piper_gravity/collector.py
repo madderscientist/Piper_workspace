@@ -5,7 +5,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 from piper_x_driver.backend import MIT_GAIN_SCALE, MIT_KD_LSB, MIT_KP_LSB
@@ -222,12 +222,14 @@ class ProbeCollectorNode(Node):
         self.latest_velocity: tuple[float, ...] = (0.0,) * 6
         self.latest_torque: tuple[float, ...] = (0.0,) * 6
         self.latest_status: ArmStatus | None = None
-        self.effector_kwargs: dict[str, object] = {}
+        self.effector_kwargs: dict[str, Any] = {}
         self.arm_end_effector: str = 'teaching_handle'
         self.saved_gravity_scale: float = 1.0
         self.saved_friction_scale: float = 0.5
         self.applied_gravity_scale: float = 1.0
         self.applied_gravity_torques: tuple[float, ...] | None = None
+        self.applied_kp: tuple[float, ...] | None = None
+        self.applied_kd: tuple[float, ...] | None = None
         self.gravity_model: ArmGravityModel | None = None
         self._loaded_gravity_path: str = ''
 
@@ -276,10 +278,18 @@ class ProbeCollectorNode(Node):
             # Wait for the second half of the settle hold and verify velocity is near zero
             if elapsed >= 0.4 * seg.duration and abs(dq_val) <= 0.03:
                 assert self.config.kd is not None
+                kp_cmd = (
+                    self.applied_kp[j_idx]
+                    if self.applied_kp is not None and len(self.applied_kp) >= 6 and self.applied_kp[j_idx] > 0.0
+                    else self.config.kp[j_idx]
+                )
+                kd_cmd = (
+                    self.applied_kd[j_idx]
+                    if self.applied_kd is not None and len(self.applied_kd) >= 6 and self.applied_kd[j_idx] >= 0.0
+                    else self.config.kd[j_idx]
+                )
                 kp_real, kd_real = realized_gains(
-                    self.config.joint,
-                    self.config.kp[j_idx],
-                    self.config.kd[j_idx],
+                    self.config.joint, kp_cmd, kd_cmd,
                 )
                 q_val = self.latest_position[j_idx]
                 g_torques = gravity_torques(self.latest_position[:6], **self.effector_kwargs)
@@ -326,6 +336,12 @@ class ProbeCollectorNode(Node):
             g_vec = state.get('gravity_torque')
             if isinstance(g_vec, list) and len(g_vec) >= 6:
                 self.applied_gravity_torques = tuple(float(x) for x in g_vec[:6])
+            kp_vec = state.get('applied_kp')
+            if isinstance(kp_vec, list) and len(kp_vec) >= 6:
+                self.applied_kp = tuple(float(x) for x in kp_vec[:6])
+            kd_vec = state.get('applied_kd')
+            if isinstance(kd_vec, list) and len(kd_vec) >= 6:
+                self.applied_kd = tuple(float(x) for x in kd_vec[:6])
             if isinstance(cfg.get('gravity_config'), str):
                 g_cfg = cfg['gravity_config'].strip()
                 if g_cfg and g_cfg != self._loaded_gravity_path and Path(g_cfg).is_file():
@@ -363,6 +379,17 @@ class ProbeCollectorNode(Node):
         self.mit_pub.publish(msg)
 
     def _fail(self, reason: str) -> None:
+        if self.phase not in ('waiting_feedback', 'completed', 'failed') and self.config_client.service_is_ready():
+            restore_f = (
+                -4.0 - self.saved_friction_scale
+                if abs(self.saved_gravity_scale - 1.0) <= 1e-9
+                else self.saved_friction_scale
+            )
+            self.config_client.call_async(ConfigureArm.Request(
+                end_effector=self.arm_end_effector,
+                gravity_scale=self.saved_gravity_scale,
+                friction_scale=restore_f,
+            ))
         self.error = reason
         self.phase = 'failed'
         self.get_logger().error(reason)
@@ -390,11 +417,15 @@ class ProbeCollectorNode(Node):
             self.current_q_des = self.initial_position[self.config.joint - 1]
             self.current_dq_des = 0.0
             if self.config_client.service_is_ready():
+                if abs(self.saved_gravity_scale - 1.0) > 1e-9:
+                    self.config_client.call_async(ConfigureArm.Request(
+                        end_effector=self.arm_end_effector, gravity_scale=1.0, friction_scale=-1.0,
+                    ))
                 self._pending_future = self.config_client.call_async(
                     ConfigureArm.Request(
                         end_effector=self.arm_end_effector,
                         gravity_scale=1.0,
-                        friction_scale=0.0,
+                        friction_scale=-2.0,
                     )
                 )
                 self.phase = 'zeroing_compensation'
@@ -465,11 +496,16 @@ class ProbeCollectorNode(Node):
             self.current_kind = ''
             self._publish_mit(self.current_q_des, 0.0)
             if self.config_client.service_is_ready():
+                restore_f = (
+                    -4.0 - self.saved_friction_scale
+                    if abs(self.saved_gravity_scale - 1.0) <= 1e-9
+                    else self.saved_friction_scale
+                )
                 self._pending_future = self.config_client.call_async(
                     ConfigureArm.Request(
                         end_effector=self.arm_end_effector,
                         gravity_scale=self.saved_gravity_scale,
-                        friction_scale=self.saved_friction_scale,
+                        friction_scale=restore_f,
                     )
                 )
                 self.phase = 'restoring_compensation'

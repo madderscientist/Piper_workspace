@@ -27,7 +27,7 @@ def make_handler(actions: dict, route):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
-        def log_message(self, *args) -> None:
+        def log_message(self, format: str, *args) -> None:  # noqa: A002
             pass
 
         def send_bytes(self, code: int, body: bytes, ctype: str) -> None:

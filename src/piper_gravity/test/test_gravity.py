@@ -57,14 +57,18 @@ def payload_samples(model, added_mass=0.16):
 
 def test_composite_payload_mass_cli_and_inertia_roundtrip(tmp_path):
     fleet = FleetConfig(default_config_path())
-    baseline = fleet.gravity_model('arm_3').with_added_mass(0)
+    arm3_model = fleet.gravity_model('arm_3')
+    assert arm3_model is not None
+    baseline = arm3_model.with_added_mass(0)
     samples = payload_samples(baseline)
     fitted, reports = identify_gripper_payload(samples, baseline)
     assert fitted.added_mass_kg == pytest.approx(0.16, abs=1e-7)
     assert all(fitted.joint(j).scale == baseline.joint(j).scale for j in range(1, 7))
     assert all(report.rmse_calibrated < 1e-7 for report in reports.values())
     assert all(report.static_friction_mean == pytest.approx(0.12) for report in reports.values())
-    shape = terminal_for_model('gripper_with_wrench').components['gripper_base']
+    terminal = terminal_for_model('gripper_with_wrench')
+    assert terminal is not None
+    shape = terminal.components['gripper_base']
     nominal, loaded = baseline.effector_body(), fitted.effector_body()
     def about_origin(body):
         c = np.asarray(body.com_m)
@@ -89,7 +93,9 @@ def test_composite_payload_mass_cli_and_inertia_roundtrip(tmp_path):
     config_path = tmp_path / 'arms.yaml'
     config_path.write_text(yaml.safe_dump(config))
     loaded_fleet = FleetConfig(config_path)
-    assert loaded_fleet.gravity_model('arm_3').added_mass_kg == pytest.approx(0.16)
+    loaded_arm3 = loaded_fleet.gravity_model('arm_3')
+    assert loaded_arm3 is not None
+    assert loaded_arm3.added_mass_kg == pytest.approx(0.16)
     payload = loaded_fleet.public(loaded_fleet.arm('arm_3'))['gravity_payload']
     assert payload['total_mass_kg'] == pytest.approx(nominal.mass_kg + 0.16)
 
@@ -149,6 +155,8 @@ def test_ros_probe_collector_and_cli_pipeline(tmp_path):
     )
     arm = driver.arm
     effector = driver.control.effector
+    assert effector is not None
+    driver.control.adaptive_stiffness_scale_applied = driver.control.s_a
     kp_real, _ = realized_gains(2, 30.0, 6.58)
     true_scale = 1.10
     true_fs = 0.65
@@ -167,6 +175,11 @@ def test_ros_probe_collector_and_cli_pipeline(tmp_path):
         torques[1] = true_tau2
         if collector.current_kind == 'measure':
             g_mod = driver.control.gravity_model
+            kp_hw = (
+                realized_gains(2, arm.mit_output.kp[1], arm.mit_output.kd[1])[0]
+                if arm.mit_output is not None and arm.mit_output.kp[1] > 0.0
+                else kp_real
+            )
             for _ in range(4):
                 eval_settled = (pos[0], pos[1], pos[2], pos[3], pos[4], pos[5])
                 g_settled = gravity_torques(
@@ -178,7 +191,7 @@ def test_ros_probe_collector_and_cli_pipeline(tmp_path):
                     else g_mod.torques(eval_settled, mass_kg=effector.mass_kg, com_m=effector.com_m)[1]
                 )
                 true_tau2 = true_scale * g_settled[1] + direction * true_fs
-                pos[1] = q_ref - (true_tau2 - g_app) / kp_real
+                pos[1] = q_ref - (true_tau2 - g_app) / kp_hw
             torques[1] = true_tau2
         return Feedback(
             tuple(pos), arm.status.copy(), arm.enabled, (0.0,) * 11,
@@ -207,6 +220,8 @@ def test_ros_probe_collector_and_cli_pipeline(tmp_path):
         assert len(collector.samples) >= 10
         # Compensation scales are restored upon completion
         assert driver.control.gravity_scale == 1.0
+        assert driver.control.friction_scale == FleetConfig(cfg_path).arm('arm_1').friction_scale
+        assert driver.control.s_a == FleetConfig(cfg_path).arm('arm_1').s_a
         assert FleetConfig(cfg_path).arm('arm_1').gravity_scale == 1.0
 
         csv_file = save_probe_samples_csv(collector.samples, tmp_path / 'probe_j2.csv')

@@ -106,7 +106,7 @@ class Controller:
                  offset_ramp_s=2.0,
                  kp=None,
                  kd=None,
-                 debug_kp=(20.0, 18.0, 15.0, 6.0, 5.0, 4.0),
+                 debug_kp=(17.0, 16.0, 15.0, 4.0, 3.0, 3.0),
                  debug_kd=None):
         self.arm = arm
         self.clock = clock
@@ -186,11 +186,11 @@ class Controller:
 
     @property
     def end_force(self) -> tuple[float, float, float]:
-        return self.end_wrench[:3]
+        return (self.end_wrench[0], self.end_wrench[1], self.end_wrench[2])
 
     @property
     def end_torque(self) -> tuple[float, float, float]:
-        return self.end_wrench[3:6]
+        return (self.end_wrench[3], self.end_wrench[4], self.end_wrench[5])
 
     @property
     def debug_kp(self) -> tuple[float, ...]:

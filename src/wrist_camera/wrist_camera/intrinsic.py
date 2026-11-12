@@ -26,7 +26,7 @@ def calibrate(board: Board, views: list[dict], flags: int = 0) -> dict:
     rms, matrix, distortion, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
         [v['detection'].corners for v in usable],
         [v['detection'].ids for v in usable],
-        board.raw, size, None, None, flags=flags)
+        board.raw, size, np.empty((0, 0)), np.empty((0, 0)), flags=flags)
 
     per_image = []
     for view, rvec, tvec in zip(usable, rvecs, tvecs):

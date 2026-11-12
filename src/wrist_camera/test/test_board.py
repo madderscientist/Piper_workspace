@@ -1,14 +1,9 @@
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 import numpy as np
 import pytest
 
 from wrist_camera import transforms
 from wrist_camera.board import Board, probe
-from conftest import BOARD_CONFIG, front_pose, render
+from .conftest import BOARD_CONFIG, front_pose, render
 
 K = np.array([[900.0, 0, 640.0], [0, 900.0, 360.0], [0, 0, 1.0]])
 D = np.zeros(5)

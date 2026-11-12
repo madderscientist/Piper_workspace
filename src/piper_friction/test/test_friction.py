@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 from piper_friction.cli import evaluate_main, fit_main
-from piper_friction.collector import SweepCollectorNode, SweepConfig
+from piper_friction.collector import SweepCollectorNode, SweepConfig, sample_velocity_confidence
 from piper_friction.identification import (
     SweepSample,
     identify_joint_friction,
@@ -107,6 +107,7 @@ def test_identify_stribeck_and_periodic_harmonics_and_yaml_roundtrip(tmp_path):
 
     report = identify_joint_friction(loaded_samples, max_harmonics=2)
     est = report.model
+    assert isinstance(est, JointFrictionModel)
 
     assert est.fc == pytest.approx(truth.fc, abs=0.02)
     assert est.fs == pytest.approx(truth.fs, abs=0.03)
@@ -162,6 +163,7 @@ def test_ros_sweep_collector_and_cli_pipeline(tmp_path):
     assert driver.control.friction_scale == FleetConfig(cfg_path).arm('arm_1').friction_scale
     arm = driver.arm
     effector = driver.control.effector
+    assert effector is not None
 
     def simulated_snapshot():
         vel = [0.0] * 6
@@ -193,10 +195,18 @@ def test_ros_sweep_collector_and_cli_pipeline(tmp_path):
         zeroed_during_sweep = False
         while not collector.completed and not collector.error and time.monotonic() < deadline:
             executor.spin_once(timeout_sec=0.005)
-            if collector.phase == 'running' and driver.control.friction_scale == 0.0:
+            if (
+                collector.phase == 'running'
+                and driver.control.friction_scale == 0.0
+                and driver.control.s_a == 0.0
+            ):
                 zeroed_during_sweep = True
         assert collector.completed, collector.error
         assert zeroed_during_sweep
+        assert driver.control.s_a == FleetConfig(cfg_path).arm('arm_1').s_a
+        # 200 Hz (5 ms) quantized encoder steps over >=80 ms window retain steady high-speed sweeps
+        vel_200hz = [(i * 0.005, 0.50 + (0.02 if i % 4 >= 2 else -0.02)) for i in range(20)]
+        assert sample_velocity_confidence(vel_200hz, 0.50) > 0.5
         # Calibration never modifies arms.yaml on disk
         assert FleetConfig(cfg_path).arm('arm_1').friction_scale == FleetConfig(default_config_path()).arm('arm_1').friction_scale
         assert len(collector.samples) > 40

@@ -8,23 +8,29 @@ arms:
   gravity_scale: 1.0
   mounting: upright
   kp:
-  - 20.0
-  - 18.0
+  - 17.0
+  - 16.0
   - 15.0
-  - 6.0
-  - 5.0
   - 4.0
+  - 3.0
+  - 3.0
   kd:
-  - 5.34
-  - 5.24
+  - 4.92
+  - 4.94
   - 2.39
-  - 0.43
-  - 0.39
-  - 0.09
+  - 0.35
+  - 0.3
+  - 0.08
   s_a: 2.0
   friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_1_gravity.yaml
+  friction_error_epsilon: 0.05
+  friction_velocity_epsilon: 0.02
+  target_velocity_cutoff_hz: 5.0
+  adaptive_stiffness_b: 0.08
+  adaptive_stiffness_power: 3.0
+  offset_ramp_s: 2.0
 - id: arm_2
   name: 机械臂 2
   namespace: /arm_2
@@ -33,23 +39,29 @@ arms:
   gravity_scale: 1.0
   mounting: upright
   kp:
-  - 20.0
-  - 18.0
+  - 17.0
+  - 16.0
   - 15.0
-  - 6.0
-  - 5.0
   - 4.0
+  - 3.0
+  - 3.0
   kd:
-  - 5.34
-  - 5.31
+  - 4.92
+  - 5.01
   - 2.36
-  - 0.43
-  - 0.39
-  - 0.09
+  - 0.35
+  - 0.3
+  - 0.08
   s_a: 2.0
   friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_2_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_2_gravity.yaml
+  friction_error_epsilon: 0.05
+  friction_velocity_epsilon: 0.02
+  target_velocity_cutoff_hz: 5.0
+  adaptive_stiffness_b: 0.08
+  adaptive_stiffness_power: 3.0
+  offset_ramp_s: 2.0
 - id: arm_3
   name: 机械臂 3
   namespace: /arm_3
@@ -58,23 +70,29 @@ arms:
   gravity_scale: 1.0
   mounting: upright
   kp:
-  - 20.0
-  - 18.0
+  - 17.0
+  - 16.0
   - 15.0
-  - 6.0
-  - 5.0
   - 4.0
+  - 3.0
+  - 3.0
   kd:
-  - 6.49
-  - 6.43
+  - 5.99
+  - 6.06
   - 3.16
-  - 0.65
-  - 0.4
-  - 0.09
+  - 0.53
+  - 0.31
+  - 0.08
   s_a: 2.0
   friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_3_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_3_gravity.yaml
+  friction_error_epsilon: 0.05
+  friction_velocity_epsilon: 0.02
+  target_velocity_cutoff_hz: 5.0
+  adaptive_stiffness_b: 0.08
+  adaptive_stiffness_power: 3.0
+  offset_ramp_s: 2.0
 - id: arm_4
   name: 机械臂 4
   namespace: /arm_4
@@ -83,20 +101,26 @@ arms:
   gravity_scale: 1.0
   mounting: upright
   kp:
-  - 20.0
-  - 18.0
+  - 17.0
+  - 16.0
   - 15.0
-  - 6.0
-  - 5.0
   - 4.0
+  - 3.0
+  - 3.0
   kd:
-  - 6.52
-  - 6.47
+  - 6.01
+  - 6.1
   - 3.2
-  - 0.65
-  - 0.4
-  - 0.09
+  - 0.53
+  - 0.31
+  - 0.08
   s_a: 2.0
   friction_scale: 0.88
   friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_4_friction.yaml
   gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_4_gravity.yaml
+  friction_error_epsilon: 0.05
+  friction_velocity_epsilon: 0.02
+  target_velocity_cutoff_hz: 5.0
+  adaptive_stiffness_b: 0.08
+  adaptive_stiffness_power: 3.0
+  offset_ramp_s: 2.0

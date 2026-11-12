@@ -121,7 +121,7 @@ class _PreviewSlot:
         poll_period_s: float = 1.0,
         stale_timeout_s: float = 5.0,
         config_file: str | Path | None = None,
-        reader_cls=RtspReader,
+        reader_cls: Any = RtspReader,
         probe_fn=probe_size,
     ) -> None:
         self.entry = entry
@@ -261,7 +261,7 @@ class _PreviewSlot:
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.0'
 
-    def log_message(self, *_args) -> None:
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass
 
     def do_GET(self) -> None:  # noqa: N802
@@ -346,7 +346,7 @@ class PreviewServer(ThreadingHTTPServer):
         stream: str = 'stream1',
         jpeg_quality: int = 75,
         config_file: str | Path | None = None,
-        reader_cls=RtspReader,
+        reader_cls: Any = RtspReader,
         probe_fn=probe_size,
     ) -> None:
         selected = resolve_camera_selection(arm=arm, camera=camera, config_file=config_file)

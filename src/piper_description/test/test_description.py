@@ -29,6 +29,11 @@ SHARE = get_package_share_path('piper_description')
 MODELS = sorted(path for path in (SHARE / 'urdf').glob('*') if path.is_file())
 
 
+def _xacro_xml(path: Path) -> str:
+    doc: Any = xacro.process_file(str(path))
+    return doc.toxml()
+
+
 @pytest.mark.parametrize('entry,model,config,rate', [
     ('piper_with_gripper/display_urdf.launch.py',
      'piper_description.urdf', 'piper_ctrl.rviz', 200.0),
@@ -73,8 +78,7 @@ def test_display_entries_preserve_defaults_gui_conditions_and_rates(
 
 @pytest.mark.parametrize('model', MODELS, ids=lambda model: model.name)
 def test_models_parse_and_resolve_all_resources(model):
-    doc: Any = xacro.process_file(str(model))
-    text = doc.toxml()
+    text = _xacro_xml(model)
     parsed = URDF.from_xml_string(text)
     assert parsed.get_root() in ('base_link', 'world')
     assert {f'joint{index}' for index in range(1, 7)} <= set(parsed.joint_map)
@@ -94,7 +98,7 @@ def test_models_parse_and_resolve_all_resources(model):
 
 
 def test_gripper_with_wrench_stacks_measured_parts_and_keeps_finger_alignment():
-    text = xacro.process_file(str(SHARE / 'urdf/paxini/gripper_with_wrench.xacro')).toxml()
+    text = _xacro_xml(SHARE / 'urdf/paxini/gripper_with_wrench.xacro')
     robot = URDF.from_xml_string(text)
     assert robot.get_root() == 'arm_sensor_flange'
     assert set(robot.link_map) == {
@@ -117,7 +121,7 @@ def test_gripper_with_wrench_stacks_measured_parts_and_keeps_finger_alignment():
     assert mass['link7'] == mass['link8'] == 0.025
 
     previous = URDF.from_xml_string(
-        xacro.process_file(str(SHARE / 'urdf/piper_description.urdf')).toxml())
+        _xacro_xml(SHARE / 'urdf/piper_description.urdf'))
     for name in ('joint7', 'joint8'):
         joint = robot.joint_map[name]
         old_joint = previous.joint_map[name]
@@ -138,11 +142,11 @@ def test_gripper_with_wrench_stacks_measured_parts_and_keeps_finger_alignment():
 
 def test_piper_with_wrench_attaches_complete_terminal_to_link6():
     robot = URDF.from_xml_string(
-        xacro.process_file(str(SHARE / 'urdf/piper_description_with_wrench.urdf')).toxml())
+        _xacro_xml(SHARE / 'urdf/piper_description_with_wrench.urdf'))
     arm = URDF.from_xml_string(
-        xacro.process_file(str(SHARE / 'urdf/piper_description.urdf')).toxml())
+        _xacro_xml(SHARE / 'urdf/piper_description.urdf'))
     terminal = URDF.from_xml_string(
-        xacro.process_file(str(SHARE / 'urdf/paxini/gripper_with_wrench.xacro')).toxml())
+        _xacro_xml(SHARE / 'urdf/paxini/gripper_with_wrench.xacro'))
     assert robot.get_root() == 'base_link'
     assert set(robot.link_map) == (
         set(arm.link_map) - {'gripper_base', 'link7', 'link8'}) | set(terminal.link_map)

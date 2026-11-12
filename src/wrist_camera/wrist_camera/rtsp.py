@@ -556,7 +556,7 @@ class WristCamera:
         stale_timeout_s: float = 5.0,
         config_file: str | Path | None = None,
         probe_fn=probe_size,
-        reader_cls=RtspReader,
+        reader_cls: Any = RtspReader,
     ) -> None:
         self.camera = camera
         self._config_file = config_file
@@ -672,6 +672,7 @@ class WristCamera:
         if self._reader is None or not self._reader.alive():
             self.open()
         deadline = time.monotonic() + timeout
+        raw: bytes | None = None
         for attempt in range(2):
             with self._cond:
                 if (not fresh and self._raw is not None
@@ -693,6 +694,7 @@ class WristCamera:
                 self.open()
             else:
                 raise TimeoutError(f'等待腕部相机新帧超时（{timeout:.1f}s）：{self.url}')
+        assert raw is not None
         return np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 3).copy()
 
     def latest(self) -> np.ndarray | None:

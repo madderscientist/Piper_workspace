@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import select
 import threading
 import time
 from typing import Any, Callable, List, Optional
@@ -119,7 +120,10 @@ class SerialSensorTransport(SensorTransport):
         if hasattr(self._serial, "in_waiting"):
             waiting = int(self._serial.in_waiting)
             if waiting == 0 and timeout > 0.0:
-                time.sleep(min(timeout, 0.0001))
+                if hasattr(self._serial, "fileno"):
+                    select.select([self._serial], [], [], timeout)
+                else:
+                    time.sleep(min(timeout, 0.0001))
                 waiting = int(self._serial.in_waiting)
             if waiting == 0:
                 return []

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from typing import Any
 
 import numpy as np
 
@@ -123,7 +124,7 @@ class CameraSource:
         auto_start: bool = True,
         poll_period_s: float = 1.0,
         stale_timeout_s: float = 5.0,
-        reader_cls=RtspReader,
+        reader_cls: Any = RtspReader,
         probe_fn=probe_size,
     ) -> None:
         self.name = name

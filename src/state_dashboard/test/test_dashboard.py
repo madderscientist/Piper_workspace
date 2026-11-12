@@ -467,6 +467,7 @@ def test_ros_subscriptions_and_enable_service_integration():
             source.create_service(Enable, namespace + '/enable_srv', handle)
 
         deadline = time.monotonic() + 6
+        snapshot = dashboard.store.snapshot()
         while time.monotonic() < deadline:
             for publisher, message in publishers:
                 publisher.publish(message)

@@ -81,6 +81,8 @@ def test_master_slave_mode_self_references_masters_and_couples_slaves():
     )
     coupling = BilateralCoupling(ms_config)
     coupling.start(state, 100)
+    target = coupling.targets
+    kp = ms_config.kp
     now = 100.01
     while not coupling.engaged:
         now += 0.02

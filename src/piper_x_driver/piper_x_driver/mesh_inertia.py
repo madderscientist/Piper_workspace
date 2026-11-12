@@ -60,20 +60,26 @@ def terminal_from_meshes(urdf: Path, reference_urdf: Path, payload_link='gripper
     links = {link.attrib['name']: link for link in root.findall('link')}
     children = {}
     for joint in root.findall('joint'):
-        children.setdefault(joint.find('parent').attrib['link'], []).append(joint)
+        parent_el = joint.find('parent')
+        assert parent_el is not None
+        children.setdefault(parent_el.attrib['link'], []).append(joint)
     components = {}
     pending = [('link6', old_rotation.T @ new_rotation,
                 old_rotation.T @ (new_translation - old_translation))]
     while pending:
         parent, rotation, translation = pending.pop()
         for joint in children.get(parent, []):
-            name = joint.find('child').attrib['link']
+            child_el = joint.find('child')
+            assert child_el is not None
+            name = child_el.attrib['link']
             joint_rotation, joint_translation = _pose(joint)
             child_rotation = rotation @ joint_rotation
             child_translation = translation + rotation @ joint_translation
             link = links[name]
             visual = link.find('visual')
+            assert visual is not None
             mesh = visual.find('geometry/mesh')
+            assert mesh is not None
             uri = mesh.attrib['filename']
             if uri.startswith('package://'):
                 package, relative = uri[len('package://'):].split('/', 1)
@@ -86,9 +92,11 @@ def terminal_from_meshes(urdf: Path, reference_urdf: Path, payload_link='gripper
             visual_rotation, visual_translation = _pose(visual)
             frame = child_rotation @ visual_rotation
             center = child_translation + child_rotation @ visual_translation + frame @ center
+            mass_el = link.find('inertial/mass')
+            assert mass_el is not None
             components[name] = {
                 'mesh': uri,
-                'mass_kg': float(link.find('inertial/mass').attrib['value']),
+                'mass_kg': float(mass_el.attrib['value']),
                 'com_m': center.tolist(),
                 'inertia_per_kg': (frame @ inertia @ frame.T).tolist(),
             }

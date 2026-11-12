@@ -5,7 +5,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from piper_x_driver.gravity import ArmGravityModel, gravity_torques, load_gravity_model, max_critical_kd
 from piper_x_interfaces.msg import ArmStatus, GripperCommand, MitCommand
@@ -149,6 +149,22 @@ def build_sweep_schedule(
     return segments
 
 
+def _recent_velocity_window(
+    vel_window: Sequence[tuple[float, float]],
+    min_span: float = 0.08,
+    min_samples: int = 5,
+) -> Sequence[tuple[float, float]]:
+    """Select trailing velocity samples spanning at least min_span s (and >= min_samples)."""
+    n = len(vel_window)
+    if n <= min_samples:
+        return vel_window
+    t_end = vel_window[-1][0]
+    idx = n - min_samples
+    while idx > 0 and (t_end - vel_window[idx][0]) < min_span:
+        idx -= 1
+    return vel_window[idx:]
+
+
 def sample_velocity_confidence(
     vel_window: Sequence[tuple[float, float]],
     dq_des: float,
@@ -162,7 +178,7 @@ def sample_velocity_confidence(
     if speed <= 1e-6 or len(vel_window) < 3:
         return 0.0
     sign = 1.0 if dq_des > 0 else -1.0
-    recent = vel_window[-min(5, len(vel_window)):]
+    recent = _recent_velocity_window(vel_window)
     v_mean = sum(sign * v for _, v in recent) / len(recent)
     dt = recent[-1][0] - recent[0][0]
     if dt <= 1e-5:
@@ -202,7 +218,7 @@ def is_velocity_stabilized(
         return False
     if all(abs(v) <= 1e-6 for _, v in vel_window):
         return True
-    recent = vel_window[-min(5, len(vel_window)):]
+    recent = _recent_velocity_window(vel_window)
     v_mean = sum(sign * v for _, v in recent) / len(recent)
     dt = recent[-1][0] - recent[0][0]
     if dt <= 1e-5:
@@ -232,7 +248,7 @@ class SweepCollectorNode(Node):
         self._has_ctrl_grip_vel: bool = False
         self._prev_grip_sample: tuple[float, float] | None = None
         self.latest_status: ArmStatus | None = None
-        self.effector_kwargs: dict[str, object] = {}
+        self.effector_kwargs: dict[str, Any] = {}
         self.arm_end_effector: str = 'teaching_handle'
         self.arm_gravity_scale: float = 1.0
         self.arm_friction_scale: float = 0.85
@@ -395,17 +411,19 @@ class SweepCollectorNode(Node):
         msg.torque = [0.0] * 6
         self.mit_pub.publish(msg)
 
-    def _restore_friction_scale(self) -> None:
+    def _restore_friction_scale(self):
         if (self._saved_friction_scale is not None
                 and self.config_client.service_is_ready()):
-            self.config_client.call_async(
+            fut = self.config_client.call_async(
                 ConfigureArm.Request(
                     end_effector=self.arm_end_effector,
                     gravity_scale=self.arm_gravity_scale,
-                    friction_scale=-2.0 - self._saved_friction_scale,
+                    friction_scale=-4.0 - self._saved_friction_scale,
                 )
             )
             self._saved_friction_scale = None
+            return fut
+        return None
 
     def _fail(self, reason: str) -> None:
         self._restore_friction_scale()
@@ -515,7 +533,20 @@ class SweepCollectorNode(Node):
             self._publish_mit(self.current_q_des, 0.0)
             if self.config.joint == 7:
                 self.gripper_pub.publish(GripperCommand(width=float(self.current_q_des), effort=0.0))
-            self._restore_friction_scale()
+            restore_fut = self._restore_friction_scale()
+            if restore_fut is not None:
+                self._pending_future = restore_fut
+                self.phase = 'restoring_friction'
+                return
+            self.phase = 'completed'
+            self.completed = True
+            return
+
+        if self.phase == 'restoring_friction':
+            assert self.anchor_position is not None
+            self._publish_mit(self.current_q_des, 0.0)
+            if self._pending_future is not None and not self._pending_future.done():
+                return
             self.phase = 'completed'
             self.completed = True
 

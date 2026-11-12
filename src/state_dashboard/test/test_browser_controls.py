@@ -74,6 +74,7 @@ def test_browser_mit_sliders_configuration_and_explicit_close(tmp_path, monkeypa
 
                     def until(predicate, timeout=5):
                         deadline = time.monotonic() + timeout
+                        snapshot = {'arms': []}
                         while time.monotonic() < deadline:
                             snapshot = page.request.get(url + '/api/status').json()
                             if predicate(snapshot):

@@ -25,7 +25,7 @@ class FakeArm(SdkArm):
             (0.2, 0.0, 0.2, 0.0, 0.0, 0.0), (0.0,) * 6, (0.0,) * 6,
         )
 
-    def _write_power(self, enabled, width):
+    def _write_power(self, enabled, width=0.0, *_):
         self.calls.append(('power', enabled, width))
         self.enabled = (enabled,) * 7
 
@@ -55,7 +55,7 @@ class FakeArm(SdkArm):
     def _write_mit(self, command):
         self.calls.append(('mit', command))
 
-    def grip(self, width, effort):
+    def grip(self, width, effort, interpolate=True):
         self.calls.append(('grip', width, effort))
         if effort > 0:
             self.position = self.position[:6] + (width,)

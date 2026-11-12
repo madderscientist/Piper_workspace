@@ -582,6 +582,7 @@ class CalibrationApp:
             seq, image, _ = frame
             return handler.send_bytes(
                 200, self._preview_jpeg(cam, seq, image, overlay=overlay), 'image/jpeg')
+        assert live is not None
         image = live['image']
         detection = live['detection'] if overlay else None
         return handler.send_bytes(200, self._jpeg(image, detection=detection), 'image/jpeg')
@@ -623,7 +624,7 @@ class CalibrationApp:
             cached = self._jpeg_cache.get(key)
             if cached is not None and cached[0] == seq and cached[1] == det_seq:
                 return cached[2]
-        detection = live['detection'] if det_seq else None
+        detection = live['detection'] if (det_seq and live is not None) else None
         jpeg = self._jpeg(image, detection=detection)
         with self._jpeg_lock:
             self._jpeg_cache[key] = (seq, det_seq, jpeg)

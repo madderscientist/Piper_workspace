@@ -1,6 +1,5 @@
 import json
 from pathlib import Path
-import sys
 import time
 from urllib.request import Request, urlopen
 
@@ -9,9 +8,7 @@ import numpy as np
 import pytest
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from conftest import front_pose, render
+from .conftest import front_pose, render
 from piper_x_driver.gravity import _fast_fk
 from wrist_camera import transforms
 from wrist_camera.board import Board
@@ -97,7 +94,8 @@ def test_camera_source_apply_profile_switches_native_stream(cameras_cfg):
 
         applied = src.apply_profile(1920, 1080, timeout=1.0)
         assert applied == {'width': 1920, 'height': 1080}
-        assert src.latest()[1].shape == (1080, 1920, 3)
+        latest = src.latest()
+        assert latest is not None and latest[1].shape == (1080, 1920, 3)
         assert 'rtsp://admin:123456@192.168.123.98/stream0' in opened[-1][0]
     finally:
         src.close()
@@ -160,7 +158,9 @@ def test_dashboard_single_arm_extrinsic_workflow(tmp_path, board, flat):
             det = app.board.detect(scene)
             assert det.count >= 6
             app.active_source.push_bgr(scene)
-            cur_seq = app.active_source.latest()[0]
+            latest_frame = app.active_source.latest()
+            assert latest_frame is not None
+            cur_seq = latest_frame[0]
             with app.gate._lock:
                 app.gate._speed = 0.0
                 app.gate._still_since = time.monotonic() - 1.0

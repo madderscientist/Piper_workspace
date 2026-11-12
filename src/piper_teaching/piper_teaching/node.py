@@ -1,5 +1,6 @@
 """Bilateral teaching as a ROS client: no SDK objects, CAN sockets or handover."""
 
+import array
 from dataclasses import replace
 import json
 import math
@@ -36,7 +37,8 @@ class TeachingNode(Node):
         self.declare_parameter('rate_hz', 200.0)
         self.dry_run = bool(self.get_parameter('dry_run').value)
         self.auto_start = bool(self.get_parameter('auto_start').value)
-        self.rate_hz = max(10.0, min(1000.0, float(self.get_parameter('rate_hz').value)))
+        rate_param = self.get_parameter('rate_hz').value
+        self.rate_hz = max(10.0, min(1000.0, float(200.0 if rate_param is None else rate_param)))
         defaults = TeachingConfig()
         values = {}
         for name in defaults.__dataclass_fields__:
@@ -240,17 +242,17 @@ class TeachingNode(Node):
 
     def _send(self, samples, targets, kp, velocities=((0.0,) * 6,) * 4):
         kp_list, kd_list = list(kp), list(self.config.kd)
-        zero_6 = [0.0] * 6
+        zero_6 = (0.0,) * 6
         for index, (sample, target, velocity) in enumerate(zip(samples, targets, velocities)):
             free_master = self.config.mode == 'master_slave' and index in MASTER_INDICES
             follow = self.coupling.engaged and not free_master
             zero_gain = self.coupling.engaged and free_master
             m_msg = self._mit_msgs[index]
-            m_msg.position = list(target[:6])
-            m_msg.velocity = list(velocity[:6])
-            m_msg.kp = zero_6 if zero_gain else kp_list
-            m_msg.kd = zero_6 if zero_gain else kd_list
-            m_msg.torque = zero_6
+            m_msg.position[:] = target[:6]
+            m_msg.velocity[:] = velocity[:6]
+            m_msg.kp[:] = zero_6 if zero_gain else kp_list
+            m_msg.kd[:] = zero_6 if zero_gain else kd_list
+            m_msg.torque[:] = zero_6
             self.mit_pubs[index].publish(m_msg)
             g_msg = self._grip_msgs[index]
             g_msg.width = float(target[6] if follow else sample.position[6])
@@ -340,7 +342,7 @@ class TeachingNode(Node):
                     self.deadline += elapsed
         if refs is not None:
             for publisher, t_msg, target in zip(self.target_pubs, self._target_msgs, refs):
-                t_msg.position = list(target)
+                t_msg._position = array.array('d', target)
                 publisher.publish(t_msg)
         state_key = (self.phase, self.holding, self.reason, block, self.config.mode)
         if (

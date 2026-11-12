@@ -506,7 +506,7 @@ def test_stiction_breakaway_and_adaptive_stiffness_match_g1_laws(fake_arm):
     base_q = arm.position[:6]
 
     # Activation fade-in over offset_ramp_s=2.0s: starts at 1.0x, reaches 1.5x at 0.5s, 2.0x at 1.0s, and settles at 3.0x
-    base_kp = (20.0, 18.0, 15.0, 6.0, 5.0, 4.0)
+    base_kp = (17.0, 16.0, 15.0, 4.0, 3.0, 3.0)
     base_kd = (6.0, 6.0, 3.0, 0.6, 0.4, 0.1)
     assert control.applied_kp == pytest.approx(base_kp)
     now[0] = 0.5
@@ -564,7 +564,7 @@ def test_stiction_breakaway_and_adaptive_stiffness_match_g1_laws(fake_arm):
     # Staircase target velocity recovery (50 Hz steps sampled at 200 Hz)
     control._reset_dynamics_state()
     q_step = list(base_q)
-    control._update_target_velocity(q_step, 0.005)
+    vel_est = control._update_target_velocity(q_step, 0.005)
     speed = 0.25
     for tick in range(1, 401):
         if tick % 4 == 0:
@@ -693,6 +693,9 @@ def test_end_effector_wrench_estimation_with_impedance_and_inertia(fake_arm):
     assert end_effector_wrench(
         tau_from_wrench, q, tool_offset_m=offset, damping=0.0,
     ) == pytest.approx(true_wrench, abs=1e-6)
+    assert end_effector_wrench(
+        tau_from_wrench, q, tool_offset_m=offset, damping=1e-4,
+    ) == pytest.approx(true_wrench, abs=1e-3)
 
     # Verify Controller estimates joint external torque (subtracting inertia) and 6D end wrench
     now = [0.0]

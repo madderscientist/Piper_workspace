@@ -4,7 +4,7 @@ import csv
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 from piper_x_driver.gravity import ArmGravityModel, JointGravityModel
@@ -333,7 +333,7 @@ def identify_joint_gravity(
 
 
 def identify_gripper_payload(
-    samples_by_joint: dict[int, Sequence[ProbeSample]],
+    samples_by_joint: Mapping[int, Sequence[ProbeSample]],
     arm_model: ArmGravityModel,
     *,
     torque_source: str = 'auto',

@@ -89,8 +89,10 @@ def test_intrinsics_extrinsics_pose_and_wrist_camera_reader():
             self.stopped = True
 
     with WristCamera('arm_4', stream='stream1', reader_cls=FakeReader) as cam:
-        assert cam.intrinsics()['width'] == 720
-        assert cam.extrinsic()['child'] == 'camera_arm_4'
+        intr = cam.intrinsics()
+        extr = cam.extrinsic()
+        assert intr is not None and intr['width'] == 720
+        assert extr is not None and extr['child'] == 'camera_arm_4'
         assert np.allclose(cam.pose_in_base(q, angle_offsets=zero_offsets), expected, atol=1e-12)
 
         holders['on_frame'](bytes([1, 2, 3]) * (720 * 480), 720, 480)

@@ -284,7 +284,7 @@ def serialize_report(
     env0 = m.envelope(float(d.speeds[0]))
     cog_fit_0 = (
         [float(m.bias_force(float(th))) for th in theta_sub]
-        if is_gripper
+        if isinstance(m, GripperFrictionModel)
         else [float(env0 * m.cogging_torque(float(th))) for th in theta_sub]
     )
     mod_fit_0 = [float(env0 * m.modulation_torque(float(th))) for th in theta_sub]
@@ -492,10 +492,15 @@ class FrictionWorkbenchNode(Node):
         return self.runners[self.active_namespace].error
 
     def _on_joints(self, ns: str, message: JointState) -> None:
-        names = list(message.name)
-        if len(names) != 7 or set(names) != set(JOINT_NAMES) or len(message.position) != 7:
+        names = tuple(message.name)
+        if len(message.position) != 7:
             return
-        order = [names.index(name) for name in JOINT_NAMES]
+        if names == JOINT_NAMES:
+            order = range(7)
+        else:
+            if len(names) != 7 or set(names) != set(JOINT_NAMES):
+                return
+            order = [names.index(name) for name in JOINT_NAMES]
         pos = tuple(float(message.position[i]) for i in order)
         vel = (
             tuple(float(message.velocity[i]) for i in order[:6])
@@ -648,7 +653,8 @@ class FrictionWorkbenchNode(Node):
                 raise ValueError(f'Unknown namespace {ns}')
             runner = self.runners[ns]
             if runner.phase in (
-                'waiting_feedback', 'zeroing_friction', 'enabling', 'setting_mode', 'running',
+                'waiting_feedback', 'zeroing_friction', 'enabling',
+                'setting_mode', 'running', 'restoring_friction',
             ):
                 raise ValueError(f'{ns} already has an active sweep; stop it first')
             runner.queue = queue
@@ -695,7 +701,7 @@ class FrictionWorkbenchNode(Node):
                 self._restore_friction_scale_locked(ns, runner)
         return self.status_payload()
 
-    def _restore_friction_scale_locked(self, ns: str, runner: _ArmSweepRunner) -> None:
+    def _restore_friction_scale_locked(self, ns: str, runner: _ArmSweepRunner):
         if (runner.saved_friction_scale is not None
                 and ns in self.config_clients
                 and self.config_clients[ns].service_is_ready()):
@@ -704,12 +710,14 @@ class FrictionWorkbenchNode(Node):
             cfg_dict = ctrl.get('configuration', {})
             end_eff = str(cfg_dict.get('end_effector') or arm.end_effector)
             grav_scale = float(cfg_dict.get('gravity_scale', arm.gravity_scale))
-            self.config_clients[ns].call_async(ConfigureArm.Request(
+            fut = self.config_clients[ns].call_async(ConfigureArm.Request(
                 end_effector=end_eff,
                 gravity_scale=grav_scale,
-                friction_scale=-2.0 - runner.saved_friction_scale,
+                friction_scale=-4.0 - runner.saved_friction_scale,
             ))
             runner.saved_friction_scale = None
+            return fut
+        return None
 
     def _fail_sweep_locked(self, runner: _ArmSweepRunner, reason: str, ns: str = '') -> None:
         if ns:
@@ -751,13 +759,41 @@ class FrictionWorkbenchNode(Node):
             ))
             return True
 
+    def reload_saved_model(self, arm_id: str, output_yaml: str | Path) -> bool:
+        """Hot-reload the saved friction YAML in the running driver without modifying arms.yaml."""
+        with self.lock:
+            arm = self.fleet.arm(arm_id)
+            runner = self.runners[arm.namespace]
+            if runner.phase in (
+                'waiting_feedback', 'zeroing_friction', 'enabling', 'setting_mode', 'running',
+            ):
+                return False
+            ctrl = self.control_states.get(arm.namespace, {})
+            cfg_dict = ctrl.get('configuration', {})
+            active_path = cfg_dict.get('friction_config') or arm.friction_config
+            if not active_path or Path(active_path).resolve() != Path(output_yaml).resolve():
+                return False
+            end_eff = str(cfg_dict.get('end_effector') or arm.end_effector)
+            grav_scale = float(cfg_dict.get('gravity_scale', arm.gravity_scale))
+            f_scale = float(cfg_dict.get('friction_scale', arm.friction_scale))
+            client = self.config_clients[arm.namespace]
+            if not client.service_is_ready():
+                return False
+            client.call_async(ConfigureArm.Request(
+                end_effector=end_eff,
+                gravity_scale=grav_scale,
+                friction_scale=-4.0 - f_scale,
+            ))
+            return True
+
     def _tick_sweep(self) -> None:
         completed_jobs: list[tuple[list[SweepSample], SweepConfig, str, str, bool]] = []
 
         with self.lock:
             for ns, runner in self.runners.items():
                 if runner.phase not in (
-                    'waiting_feedback', 'zeroing_friction', 'enabling', 'setting_mode', 'running',
+                    'waiting_feedback', 'zeroing_friction', 'enabling',
+                    'setting_mode', 'running', 'restoring_friction',
                 ):
                     continue
                 cfg = runner.config
@@ -918,10 +954,21 @@ class FrictionWorkbenchNode(Node):
                         has_next_joint = True
                     else:
                         has_next_joint = False
-                        runner.phase = 'completed'
-                        self._restore_friction_scale_locked(ns, runner)
+                        restore_fut = self._restore_friction_scale_locked(ns, runner)
+                        if restore_fut is not None:
+                            runner.pending_future = restore_fut
+                            runner.phase = 'restoring_friction'
+                        else:
+                            runner.phase = 'completed'
 
                     completed_jobs.append((finished_samples, finished_cfg, out_csv, out_fit, has_next_joint))
+
+                elif runner.phase == 'restoring_friction':
+                    assert runner.anchor is not None
+                    self._publish_mit_locked(cfg, runner.anchor, runner.current_q_des, 0.0)
+                    if runner.pending_future is not None and not runner.pending_future.done():
+                        continue
+                    runner.phase = 'completed'
 
         for finished_samples, finished_cfg, out_csv, out_fit, has_next_joint in completed_jobs:
             try:
@@ -1046,7 +1093,9 @@ class FrictionWorkbenchNode(Node):
             for j_payload in self.joint_fits[arm_id].values():
                 j_payload['yaml_text'] = payload['yaml_text']
             self.latest_fit = payload
-            return payload
+        if output_yaml:
+            self.reload_saved_model(arm_id, output_yaml)
+        return payload
 
     def status_payload(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -1067,6 +1116,7 @@ class FrictionWorkbenchNode(Node):
                     if pos is not None else (0.0,) * 6
                 )
                 calibrated_joints = sorted(self.joint_fits.get(arm.id, {}).keys())
+                grip_model = self.arm_models[arm.id].gripper
                 arms_data.append({
                     'id': arm.id,
                     'name': arm.name,
@@ -1094,12 +1144,10 @@ class FrictionWorkbenchNode(Node):
                     'sweep_phase': self.runners[ns].phase,
                     'calibrated_joints': calibrated_joints,
                     'gripper_calibrated': (
-                        7 in calibrated_joints or self.arm_models[arm.id].gripper is not None
+                        7 in calibrated_joints or grip_model is not None
                     ),
                     'gripper_model': (
-                        self.arm_models[arm.id].gripper.to_dict()
-                        if self.arm_models[arm.id].gripper is not None
-                        else None
+                        grip_model.to_dict() if grip_model is not None else None
                     ),
                 })
 
@@ -1363,6 +1411,7 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                     if model is None or (not model.joints and model.gripper is None):
                         raise ValueError('No fitted joint or gripper model available to save')
                 saved = save_friction_model(model, yaml_path).resolve()
+                self.node.reload_saved_model(arm_id, saved)
                 self._send_json(200, {'ok': True, 'path': str(saved)})
                 return
 
