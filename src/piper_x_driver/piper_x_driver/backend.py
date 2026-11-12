@@ -3,6 +3,7 @@
 from collections import deque
 from dataclasses import dataclass
 import math
+import socket
 import threading
 import time
 from typing import Literal
@@ -34,6 +35,8 @@ MIT_KP_LSB = tuple(scale * _MIT_KP_MAX / _MIT_KP_STEPS for scale in MIT_GAIN_SCA
 MIT_KD_LSB = tuple(scale * _MIT_KD_SPAN / _MIT_KP_STEPS for scale in MIT_GAIN_SCALE)
 MAX_GRAVITY_OFFSET = 1.0
 SUPPORTED_FIRMWARE = ('S-V1.9-0', 'S-V1.9-1')
+# Linux doubles setsockopt(SO_RCVBUF, n) internally; 65536 -> 131072 bytes (~137 sk_buffs / ~60 ms FIFO cap).
+_SOCKETCAN_RCVBUF_REQUEST = 65536
 
 
 @dataclass(frozen=True)
@@ -86,9 +89,16 @@ class SdkArm:
         self.robot = AgxArmFactory.create_arm(config)
         try:
             self.gripper = self.robot.init_effector('agx_gripper')
-            self.robot.connect()
-            if not self.robot.is_connected():
-                raise RuntimeError(f'{channel}: SDK did not connect')
+            if self._real_sdk():
+                self.robot.connect(start_read_thread=False)
+                if not self.robot.is_connected():
+                    raise RuntimeError(f'{channel}: SDK did not connect')
+                self._configure_rx_socket()
+                self.robot._ctx.start_th()
+            else:
+                self.robot.connect()
+                if not self.robot.is_connected():
+                    raise RuntimeError(f'{channel}: SDK did not connect')
             # Exit native Leader mode if left from a previous session so 200Hz CAN push resumes.
             self.robot.set_follower_mode()
             # The pinned SDK discards firmware segments while receive FPS is zero.
@@ -99,11 +109,19 @@ class SdkArm:
                 time.sleep(0.02)
             identity = None
             for attempt in range(4):
-                identity = (
-                    self.robot.get_firmware(timeout=2.0)
-                    if attempt == 0 else
-                    self.robot.get_firmware(timeout=0.5, min_interval=0.0)
-                )
+                fw_cache = getattr(getattr(self.robot, '_parser', None), 'firmware_info', None)
+                if fw_cache is not None and hasattr(fw_cache, 'msg'):
+                    fw_cache.msg.clear()
+                try:
+                    identity = (
+                        self.robot.get_firmware(timeout=2.0)
+                        if attempt == 0 else
+                        self.robot.get_firmware(timeout=0.5, min_interval=0.0)
+                    )
+                except UnicodeDecodeError:
+                    identity = None
+                    if fw_cache is not None and hasattr(fw_cache, 'msg'):
+                        fw_cache.msg.clear()
                 if (identity is not None
                         and identity['software_version'].strip('\x00 ') in SUPPORTED_FIRMWARE):
                     break
@@ -133,18 +151,43 @@ class SdkArm:
                     daemon=True,
                 )
                 self._grip_thread.start()
-                # Stop SDK background FPS counter lock contention after startup check completes.
+                # Stop unused SDK background FPS/monitor threads and lock contention after startup.
                 for dev in (self.robot, self.gripper):
                     ctx = getattr(dev, '_ctx', None)
                     fps_mgr = getattr(ctx, 'fps', None)
                     if fps_mgr is not None:
                         fps_mgr.increment = lambda *_: None
+                        fps_mgr.stop()
+                    mon_stop = getattr(ctx, '_monitor_stop_event', None)
+                    if mon_stop is not None:
+                        mon_stop.set()
         except (RuntimeError, ValueError, OSError, CanError):
             self.robot.disconnect()
             raise
 
     def _real_sdk(self) -> bool:
         return hasattr(self, 'robot') and type(self.robot).__module__.startswith('pyAgxArm')
+
+    def _configure_rx_socket(self) -> None:
+        comm = getattr(getattr(self.robot, '_ctx', None), 'comm', None)
+        recv_bus = getattr(comm, 'recv_bus', None)
+        if recv_bus is None:
+            return
+        allowed_ids = set(getattr(getattr(self.robot, '_parser', None), '_rx_map', ()))
+        allowed_ids |= set(getattr(getattr(self.gripper, '_parser', None), '_rx_map', ()))
+        if allowed_ids and hasattr(recv_bus, 'set_filters'):
+            recv_bus.set_filters([
+                {'can_id': int(cid), 'can_mask': 0x7FF, 'extended': False}
+                for cid in sorted(allowed_ids)
+            ])
+        sock = getattr(recv_bus, 'socket', None)
+        if sock is not None:
+            sock.setsockopt(
+                socket.SOL_SOCKET, socket.SO_RCVBUF, _SOCKETCAN_RCVBUF_REQUEST
+            )
+        if hasattr(recv_bus, 'recv'):
+            while recv_bus.recv(timeout=0.0) is not None:
+                pass
 
     def _initialize_shutdown(self):
         self._mode = 'standby'

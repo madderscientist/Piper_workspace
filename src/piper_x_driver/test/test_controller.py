@@ -359,6 +359,23 @@ def test_sdk_waits_for_receive_fps_before_querying_firmware(fw_version):
     adapter.close()
 
 
+def test_sdk_retries_misaligned_firmware_segments_after_clearing_cache():
+    from unittest.mock import Mock
+
+    robot = Mock()
+    robot.get_fps.return_value = 200
+    robot.get_firmware.side_effect = [
+        UnicodeDecodeError('utf-8', b'\x00\x00\x00\x00\xda\xf2\x00\x00', 4, 5, 'invalid'),
+        {'software_version': 'S-V1.9-1'},
+    ]
+    with patch('piper_x_driver.backend.AgxArmFactory.create_arm', return_value=robot):
+        with patch('piper_x_driver.backend.time.sleep'):
+            adapter = SdkArm('can2')
+    assert robot.get_firmware.call_count == 2
+    assert robot._parser.firmware_info.msg.clear.call_count == 3
+    adapter.close()
+
+
 def test_sdk_missing_receive_stream_fails_and_disconnects():
     from unittest.mock import Mock
 
@@ -376,6 +393,41 @@ def offline_adapter() -> Any:
     adapter = SdkArm.__new__(SdkArm)
     adapter._initialize_shutdown()
     return adapter
+
+
+def test_sdk_configures_rx_whitelist_and_bounded_socket_rcvbuf():
+    import socket
+    from piper_x_driver.backend import _SOCKETCAN_RCVBUF_REQUEST
+
+    applied_filters = []
+    sock_opts = []
+    backlog = [object(), object(), None]
+    recv_timeouts = []
+
+    def fake_recv(timeout=None):
+        recv_timeouts.append(timeout)
+        return backlog.pop(0)
+
+    recv_bus = SimpleNamespace(
+        set_filters=lambda flt: applied_filters.append(flt),
+        socket=SimpleNamespace(setsockopt=lambda *args: sock_opts.append(args)),
+        recv=fake_recv,
+    )
+    adapter = offline_adapter()
+    adapter.robot = SimpleNamespace(
+        _ctx=SimpleNamespace(comm=SimpleNamespace(recv_bus=recv_bus)),
+        _parser=SimpleNamespace(_rx_map={0x2A5: object(), 0x261: object(), 0x476: object()}),
+    )
+    adapter.gripper = SimpleNamespace(
+        _parser=SimpleNamespace(_rx_map={0x2A8: object(), 0x476: object()}),
+    )
+    adapter._configure_rx_socket()
+    assert applied_filters == [[
+        {'can_id': cid, 'can_mask': 0x7FF, 'extended': False}
+        for cid in (0x261, 0x2A5, 0x2A8, 0x476)
+    ]]
+    assert sock_opts == [(socket.SOL_SOCKET, socket.SO_RCVBUF, _SOCKETCAN_RCVBUF_REQUEST)]
+    assert recv_timeouts == [0.0, 0.0, 0.0]
 
 
 @pytest.mark.parametrize('entrypoint', ['power', 'close'])
