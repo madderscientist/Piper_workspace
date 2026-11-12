@@ -1,0 +1,78 @@
+# PiPER-X 腕部相机统一配置：仅 arm_3 (192.168.123.97) 与 arm_4 (192.168.123.98) 装有腕部相机。
+# 外参参考点统一定义为夹爪底座 Mesh 最高点中心 gripper_base_top：
+#   - piper_description_with_wrench.urdf（含 PX6D-75A 力传感器 + 双侧法兰）：link6 +Z = 92.8 mm (0.0928 m)
+#   - gripper_base.STL（含 10.5 mm 底法兰）：最高点在自身 Z = +63.0 mm (0.063 m)
+#   - gripper_base_without_flange.STL（去底法兰）：最高点在自身 Z = +52.5 mm (0.0525 m)
+
+version: 1
+defaults:
+  rtsp_user: admin
+  rtsp_password: "123456"
+  default_stream: stream1
+
+cameras:
+  camera_arm_3:
+    arm: arm_3
+    arm_namespace: /arm_3
+    ip: 192.168.123.97
+    label: 机械臂 3 腕部相机
+    frame: camera_arm_3
+    parent_frame: gripper_base_top
+    base_frame: base_link
+    link6_to_top_z_m: 0.0928
+    gripper_variant: gripper_with_wrench
+    role: target
+    joint_states_topic: /arm_3/joint_states_feedback
+    rtsp_url: rtsp://admin:123456@192.168.123.97/stream1
+    stream0_url: rtsp://admin:123456@192.168.123.97/stream0
+    stream1_url: rtsp://admin:123456@192.168.123.97/stream1
+    profiles:
+      - {name: stream1, width: 720, height: 480, url: 'rtsp://admin:123456@192.168.123.97/stream1'}
+      - {name: stream0, width: 1920, height: 1080, url: 'rtsp://admin:123456@192.168.123.97/stream0'}
+    aliases:
+      - camera_arm_3
+      - arm_3_camera
+      - arm3_camera
+      - camera_arm3
+      - camera_3
+      - cam3
+      - arm_3
+      - arm3
+      - /arm_3
+      - "3"
+      - 192.168.123.97
+
+  camera_arm_4:
+    arm: arm_4
+    arm_namespace: /arm_4
+    ip: 192.168.123.98
+    label: 机械臂 4 腕部相机
+    frame: camera_arm_4
+    parent_frame: gripper_base_top
+    base_frame: base_link
+    link6_to_top_z_m: 0.0928
+    gripper_variant: gripper_with_wrench
+    role: target
+    joint_states_topic: /arm_4/joint_states_feedback
+    rtsp_url: rtsp://admin:123456@192.168.123.98/stream1
+    stream0_url: rtsp://admin:123456@192.168.123.98/stream0
+    stream1_url: rtsp://admin:123456@192.168.123.98/stream1
+    profiles:
+      - {name: stream1, width: 720, height: 480, url: 'rtsp://admin:123456@192.168.123.98/stream1'}
+      - {name: stream0, width: 1920, height: 1080, url: 'rtsp://admin:123456@192.168.123.98/stream0'}
+    aliases:
+      - camera_arm_4
+      - arm_4_camera
+      - arm4_camera
+      - camera_arm4
+      - camera_4
+      - cam4
+      - arm_4
+      - arm4
+      - /arm_4
+      - "4"
+      - 192.168.123.98
+
+motion_gate:
+  max_joint_speed: 0.1      # rad/s
+  settle_seconds: 0.5

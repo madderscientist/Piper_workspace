@@ -35,6 +35,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from piper_x_driver.configuration import default_config_path, FleetConfig
+from wrist_camera import default_calibration_path, load_calibrations
 
 from .control import ArmController, drain_client, TeachingController
 
@@ -51,20 +52,12 @@ _CAMERA_CALIB_CACHE: dict[str, Any] = {'mtime': None, 'path': None, 'data': {}}
 
 
 def default_camera_calibration_path() -> Path | None:
-    local = Path(__file__).resolve().parents[2] / 'camera_calibration/config/calibration.yaml'
-    if local.is_file():
-        return local
-    try:
-        share = Path(get_package_share_directory('camera_calibration')) / 'config/calibration.yaml'
-        if share.is_file():
-            return share
-    except Exception:
-        pass
-    return local if local.parent.is_dir() else None
+    path = default_calibration_path()
+    return path if path.parent.is_dir() else None
 
 
 def load_camera_calibrations(calib_path: Path | None = None) -> dict[str, dict[str, Any]]:
-    """Load per-arm camera intrinsic and extrinsic calibration from camera_calibration YAML."""
+    """Load per-arm camera intrinsic and extrinsic calibration from wrist_camera YAML."""
     path = calib_path or default_camera_calibration_path()
     if path is None or not path.is_file():
         return {}
@@ -75,7 +68,7 @@ def load_camera_calibrations(calib_path: Path | None = None) -> dict[str, dict[s
     if _CAMERA_CALIB_CACHE['path'] == str(path) and _CAMERA_CALIB_CACHE['mtime'] == mtime:
         return _CAMERA_CALIB_CACHE['data']
     try:
-        raw = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+        raw = load_calibrations(path)
     except Exception:
         return {}
     intrinsics = raw.get('intrinsics') or {}
