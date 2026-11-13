@@ -1,14 +1,11 @@
 """End-to-end tests for bidirectional quasi-static gravity & static friction calibration."""
 
 import json
-import shutil
 import threading
-import time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
-from piper_gravity.cli import evaluate_main, fit_main
-from piper_gravity.collector import ProbeCollectorNode, ProbeConfig, realized_gains
+from piper_gravity.cli import fit_main
 from piper_gravity.identification import (
     ProbeSample,
     identify_gripper_payload,
@@ -24,7 +21,6 @@ from piper_gravity.model import (
     save_gravity_model,
 )
 from piper_gravity.web import GravityWorkbenchNode, create_http_server, synthesize_demo_probe_samples
-from conftest import Feedback, MockDriverNode as DriverNode
 from piper_x_driver.configuration import default_config_path, FleetConfig
 from piper_x_driver.gravity import estimate_joint_torques
 from piper_x_driver.terminal import terminal_for_model
@@ -32,8 +28,6 @@ import numpy as np
 import yaml
 import pytest
 import rclpy
-from rclpy.executors import SingleThreadedExecutor
-from rclpy.parameter import Parameter
 
 
 def payload_samples(model, added_mass=0.16):
@@ -88,6 +82,11 @@ def test_composite_payload_mass_cli_and_inertia_roundtrip(tmp_path):
         acceleration=(1,) * 6, gravity_model=restored,
     ) == pytest.approx(restored.inertias(q))
     config = yaml.safe_load(default_config_path().read_text())
+    fleet = FleetConfig(default_config_path())
+    for arm in config['arms']:
+        configured = fleet.arm(arm['id'])
+        arm['friction_config'] = configured.friction_config
+        arm['gravity_config'] = configured.gravity_config
     config['arms'][2]['gravity_config'] = str(output)
     config_path = tmp_path / 'arms.yaml'
     config_path.write_text(yaml.safe_dump(config))
@@ -142,118 +141,9 @@ def test_identify_gravity_and_static_friction_and_yaml_roundtrip(tmp_path):
     assert tensors_cal[1] == pytest.approx(est.scale * tensors_base[1])
 
 
-@pytest.mark.usefixtures('fake_arm')
-def test_ros_probe_collector_and_cli_pipeline(tmp_path):
-    cfg_path = tmp_path / 'arms.yaml'
-    shutil.copyfile(default_config_path(), cfg_path)
-    rclpy.init()
-    executor = SingleThreadedExecutor()
-    driver = DriverNode(
-        namespace='/arm_1',
-        parameter_overrides=[Parameter('config_file', value=str(cfg_path))],
-    )
-    arm = driver.arm
-    effector = driver.control.effector
-    assert effector is not None
-    driver.control.adaptive_stiffness_scale_applied = driver.control.s_a
-    kp_real, _ = realized_gains(2, 30.0, 6.58)
-    true_scale = 1.10
-    true_fs = 0.65
-
-    def simulated_snapshot():
-        vel = [0.0] * 6
-        if arm.mit_output is not None:
-            vel = list(arm.mit_output.velocity)
-        pos = list(arm.position)
-        q_ref = collector.current_q_des if collector.current_kind == 'measure' else pos[1]
-        eval_pos = (pos[0], q_ref, pos[2], pos[3], pos[4], pos[5])
-        g_cad = gravity_torques(eval_pos, mass_kg=effector.mass_kg, com_m=effector.com_m)
-        torques = list(g_cad)
-        direction = 1.0 if collector.current_direction >= 0 else -1.0
-        true_tau2 = true_scale * g_cad[1] + direction * true_fs
-        torques[1] = true_tau2
-        if collector.current_kind == 'measure':
-            g_mod = driver.control.gravity_model
-            kp_hw = (
-                realized_gains(2, arm.mit_output.kp[1], arm.mit_output.kd[1])[0]
-                if arm.mit_output is not None and arm.mit_output.kp[1] > 0.0
-                else kp_real
-            )
-            for _ in range(4):
-                eval_settled = (pos[0], pos[1], pos[2], pos[3], pos[4], pos[5])
-                g_settled = gravity_torques(
-                    eval_settled, mass_kg=effector.mass_kg, com_m=effector.com_m
-                )
-                g_app = (
-                    g_settled[1]
-                    if g_mod is None
-                    else g_mod.torques(eval_settled, mass_kg=effector.mass_kg, com_m=effector.com_m)[1]
-                )
-                true_tau2 = true_scale * g_settled[1] + direction * true_fs
-                pos[1] = q_ref - (true_tau2 - g_app) / kp_hw
-            torques[1] = true_tau2
-        return Feedback(
-            tuple(pos), arm.status.copy(), arm.enabled, (0.0,) * 11,
-            (0.2, 0.0, 0.2, 0.0, 0.0, 0.0), tuple(vel), tuple(torques),
-        )
-
-    collector = ProbeCollectorNode(ProbeConfig(
-        namespace='/arm_1',
-        joint=2,
-        q_min=0.60,
-        q_max=1.25,
-        num_points=5,
-        pre_travel=0.04,
-        approach_speed=1.5,
-        settle_time=0.10,
-        rate_hz=200.0,
-    ))
-    arm.snapshot = simulated_snapshot
-    executor.add_node(driver)
-    executor.add_node(collector)
-    try:
-        deadline = time.monotonic() + 15.0
-        while not collector.completed and not collector.error and time.monotonic() < deadline:
-            executor.spin_once(timeout_sec=0.005)
-        assert collector.completed, collector.error
-        assert len(collector.samples) >= 10
-        # Compensation scales are restored upon completion
-        assert driver.control.gravity_scale == 1.0
-        assert driver.control.friction_scale == FleetConfig(cfg_path).arm('arm_1').friction_scale
-        assert driver.control.s_a == FleetConfig(cfg_path).arm('arm_1').s_a
-        assert FleetConfig(cfg_path).arm('arm_1').gravity_scale == 1.0
-
-        csv_file = save_probe_samples_csv(collector.samples, tmp_path / 'probe_j2.csv')
-        yaml_file = tmp_path / 'arm1_gravity.yaml'
-        rc = fit_main([str(csv_file), '-o', str(yaml_file)])
-        assert rc == 0
-        assert yaml_file.exists()
-        fitted = load_gravity_model(yaml_file).joint(2)
-        assert fitted.scale == pytest.approx(true_scale, abs=0.03)
-        assert fitted.static_friction == pytest.approx(true_fs, abs=0.03)
-
-        rc_eval = evaluate_main(['-m', str(yaml_file), '-q', '0', '0.6', '-1.2', '0', '0', '0'])
-        assert rc_eval == 0
-    finally:
-        executor.shutdown(timeout_sec=1)
-        collector.destroy_node()
-        driver.destroy_node()
-        rclpy.shutdown()
-
-
-@pytest.mark.usefixtures('fake_arm')
 def test_gravity_web_workbench(tmp_path):
-    cfg_path = tmp_path / 'arms.yaml'
-    shutil.copyfile(default_config_path(), cfg_path)
     rclpy.init()
-    executor = SingleThreadedExecutor()
-    driver = DriverNode(
-        namespace='/arm_1',
-        parameter_overrides=[Parameter('config_file', value=str(cfg_path))],
-    )
-    web_node = GravityWorkbenchNode(config_file=cfg_path)
-    executor.add_node(driver)
-    executor.add_node(web_node)
+    web_node = GravityWorkbenchNode(config_file=default_config_path())
     server = create_http_server(web_node, host='127.0.0.1', port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -312,7 +202,5 @@ def test_gravity_web_workbench(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
-        executor.shutdown(timeout_sec=1)
         web_node.destroy_node()
-        driver.destroy_node()
         rclpy.shutdown()

@@ -410,6 +410,7 @@ FleetConfig::FleetConfig(const std::string & raw_path) {
         throw std::invalid_argument("friction_config file not found: " + cfg.friction_config);
       }
       f_model = load_friction_model(fcanon.string());
+      cfg.friction_config = fcanon.string();
     }
     friction_models[cfg.id] = f_model;
 
@@ -425,6 +426,7 @@ FleetConfig::FleetConfig(const std::string & raw_path) {
         throw std::invalid_argument("gravity_config file not found: " + cfg.gravity_config);
       }
       g_model = load_gravity_model(gcanon.string());
+      cfg.gravity_config = gcanon.string();
     }
     ArmGravityModel base_g = g_model.value_or(ArmGravityModel{cfg.id, {}, "", 0.0});
     ArmGravityModel candidate = base_g.for_effector(effectors.at(cfg.end_effector).model);
@@ -627,8 +629,9 @@ FleetConfig FleetConfig::save_arm(
   out << YAML::BeginMap;
   out << YAML::Key << "version" << YAML::Value << 1;
   out << YAML::Key << "arms" << YAML::Value << YAML::BeginSeq;
-  for (const auto & a : latest.arms) {
-    ArmConfig item = a;
+  for (size_t i = 0; i < latest.arms.size(); ++i) {
+    ArmConfig item = latest.arms[i];
+    const YAML::Node raw_arm = raw_doc["arms"][i];
     if (item.id == current.id) {
       item.end_effector = end_effector;
       item.gravity_scale = gravity_scale;
@@ -646,8 +649,11 @@ FleetConfig FleetConfig::save_arm(
     out << YAML::Key << "kd" << YAML::Value << std::vector<double>(item.kd.begin(), item.kd.end());
     out << YAML::Key << "s_a" << YAML::Value << item.s_a;
     out << YAML::Key << "friction_scale" << YAML::Value << item.friction_scale;
-    out << YAML::Key << "friction_config" << YAML::Value << item.friction_config;
-    out << YAML::Key << "gravity_config" << YAML::Value << item.gravity_config;
+    for (const auto * field : {"friction_config", "gravity_config"}) {
+      out << YAML::Key << field << YAML::Value
+          << (raw_arm[field] && !raw_arm[field].IsNull()
+              ? yaml_strict_string(raw_arm[field], field) : "");
+    }
     out << YAML::Key << "friction_error_epsilon" << YAML::Value << item.friction_error_epsilon;
     out << YAML::Key << "friction_velocity_epsilon" << YAML::Value << item.friction_velocity_epsilon;
     out << YAML::Key << "target_velocity_cutoff_hz" << YAML::Value << item.target_velocity_cutoff_hz;

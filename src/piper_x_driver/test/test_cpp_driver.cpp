@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <yaml-cpp/yaml.h>
 
 #include <chrono>
 #include <cmath>
@@ -487,8 +488,30 @@ TEST(PiperXDriverCppTest, EffectorCalibrationSafetyGatesAndConfigureProtocol) {
     rclcpp::init(0, nullptr);
   }
   const auto tmp_yaml = std::filesystem::temp_directory_path() / "piper_cpp_test_arms.yaml";
-  std::filesystem::copy_file(
-    default_config_path(), tmp_yaml, std::filesystem::copy_options::overwrite_existing);
+  const FleetConfig source_fleet(default_config_path());
+  YAML::Node data = YAML::LoadFile(source_fleet.path);
+  for (size_t i = 0; i < source_fleet.arms.size(); ++i) {
+    data["arms"][i]["friction_config"] = std::filesystem::relative(
+      source_fleet.arms[i].friction_config, tmp_yaml.parent_path()).string();
+    data["arms"][i]["gravity_config"] = std::filesystem::relative(
+      source_fleet.arms[i].gravity_config, tmp_yaml.parent_path()).string();
+  }
+  {
+    std::ofstream stream(tmp_yaml);
+    stream << data;
+  }
+  const FleetConfig copied_fleet(tmp_yaml.string());
+  const auto & copied_arm = copied_fleet.arm("arm_2");
+  EXPECT_EQ(copied_arm.friction_config, source_fleet.arm("arm_2").friction_config);
+  EXPECT_EQ(copied_arm.gravity_config, source_fleet.arm("arm_2").gravity_config);
+  copied_fleet.save_arm(copied_arm, copied_arm.end_effector, copied_arm.gravity_scale);
+  const YAML::Node saved = YAML::LoadFile(tmp_yaml.string());
+  for (size_t i = 0; i < source_fleet.arms.size(); ++i) {
+    for (const auto * field : {"friction_config", "gravity_config"}) {
+      EXPECT_EQ(saved["arms"][i][field].as<std::string>(),
+                data["arms"][i][field].as<std::string>());
+    }
+  }
 
   auto mock = std::make_unique<MockArm>("can1");
   MockArm * raw_mock = mock.get();
@@ -567,6 +590,7 @@ TEST(PiperXDriverCppTest, EffectorCalibrationSafetyGatesAndConfigureProtocol) {
   exec.remove_node(client_node);
   driver->shutdown_driver();
   std::filesystem::remove(tmp_yaml);
+  std::filesystem::remove(tmp_yaml.string() + ".lock");
 }
 
 }  // namespace

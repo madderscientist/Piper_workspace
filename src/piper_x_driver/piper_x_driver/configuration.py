@@ -204,6 +204,7 @@ class FleetConfig:
                 except OSError as error:
                     raise ValueError(f'friction_config file not found: {friction_str}') from error
                 friction_model = load_friction_model(resolved_path)
+                friction_str = str(resolved_path)
             self.friction_models[values['id']] = friction_model
             gravity_str = values['gravity_config'].strip()
             gravity_model = None
@@ -217,6 +218,7 @@ class FleetConfig:
                 except OSError as error:
                     raise ValueError(f'gravity_config file not found: {gravity_str}') from error
                 gravity_model = load_gravity_model(resolved_g_path)
+                gravity_str = str(resolved_g_path)
             candidate = (gravity_model or ArmGravityModel(arm_id=values['id'])).for_effector(
                 self.effectors[values['end_effector']].model)
             if gravity_model is not None or candidate.effector_model:
@@ -340,6 +342,11 @@ class FleetConfig:
             }
             if latest._inline_effectors is not None:
                 data['effectors'] = latest._inline_effectors
+            with self.path.open(encoding='utf-8') as stream:
+                raw_data = yaml.safe_load(stream)
+            for arm, raw_arm in zip(data['arms'], raw_data['arms']):
+                for field in ('friction_config', 'gravity_config'):
+                    arm[field] = raw_arm.get(field) or ''
             temporary = None
             try:
                 with tempfile.NamedTemporaryFile(

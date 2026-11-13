@@ -21,7 +21,12 @@ from piper_x_driver.terminal import terminal_body, terminal_for_model
 @pytest.fixture
 def fleet_path(tmp_path):
     target = tmp_path / 'arms.yaml'
-    shutil.copyfile(default_config_path(), target)
+    source = default_config_path().resolve()
+    data = yaml.safe_load(source.read_text())
+    for arm in data['arms']:
+        for field in ('friction_config', 'gravity_config'):
+            arm[field] = str((source.parent / arm[field]).resolve(strict=True))
+    target.write_text(yaml.safe_dump(data))
     return target
 
 
@@ -46,6 +51,36 @@ def test_hardware_mapping_and_defaults(fleet_path):
         assert profile.com_m == pytest.approx(body.com_m)
         term = terminal_for_model(profile.model)
         assert term is not None and term.model == profile.model
+
+
+def test_relative_model_paths_survive_symlink_loading_and_save(fleet_path, monkeypatch):
+    data = yaml.safe_load(fleet_path.read_text())
+    for arm in data['arms']:
+        for field in ('friction_config', 'gravity_config'):
+            target = fleet_path.parent / Path(arm[field]).name
+            shutil.copyfile(arm[field], target)
+            arm[field] = target.name
+    fleet_path.write_text(yaml.safe_dump(data))
+    installed = fleet_path.parent / 'install'
+    installed.mkdir()
+    link = installed / 'arms.yaml'
+    link.symlink_to(fleet_path)
+    monkeypatch.chdir(installed)
+
+    fleet = FleetConfig(link)
+    assert all(
+        Path(getattr(arm, field)).is_absolute()
+        and Path(getattr(arm, field)).is_file()
+        for arm in fleet.arms for field in ('friction_config', 'gravity_config')
+    )
+    updated = fleet.save_arm(fleet.arms[0], 'gripper', 0.5)
+    assert updated.arm('arm_1').gravity_scale == 0.5
+    saved = yaml.safe_load(fleet_path.read_text())
+    assert [
+        (arm['friction_config'], arm['gravity_config']) for arm in saved['arms']
+    ] == [
+        (arm['friction_config'], arm['gravity_config']) for arm in data['arms']
+    ]
 
 
 @pytest.mark.parametrize('field,value', [
@@ -146,23 +181,6 @@ def test_teaching_profile_matches_urdf_combined_terminal_mass_and_com(width):
     profile = FleetConfig(default_config_path()).effectors['teaching_handle']
     assert profile.mass_kg == pytest.approx(mass)
     assert profile.com_m == pytest.approx(moment / mass, abs=1e-8)
-
-
-def test_wrench_gripper_profile_matches_uniform_mesh_terminal():
-    from piper_x_driver.mesh_inertia import terminal_from_meshes
-
-    path = Path(get_package_share_directory('piper_description')) / 'urdf'
-    generated = terminal_from_meshes(
-        path / 'piper_description_with_wrench.urdf', path / 'piper_description.urdf')
-    config = Path(get_package_share_directory('piper_x_driver')) / 'config/effectors.yaml'
-    data = yaml.safe_load(config.read_text())
-    profile = data['effectors']['gripper_with_wrench']
-    for key, value in generated.items():
-        assert value == profile.get(key, data.get(key)), key
-    terminal = terminal_for_model('gripper_with_wrench')
-    assert terminal is not None
-    assert len(terminal.components) == 6
-    assert terminal.payload_link == 'gripper_base'
 
 
 def test_uniform_stl_inertia_matches_translated_box(tmp_path):

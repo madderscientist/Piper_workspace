@@ -97,6 +97,8 @@ tau_g = g_model.torques(q)
 
 ```bash
 cd /home/a/piper_x_ws
+sudo apt install ros-humble-rmw-cyclonedds-cpp
+sudo apt install direnv
 direnv allow
 uv venv --python 3.10 --system-site-packages
 uv pip install --python .venv/bin/python -r requirements-dev.txt
@@ -106,23 +108,23 @@ ROS_DOMAIN_ID=213 python -m pytest -q
 
 必须使用 `.venv/bin/python /usr/bin/colcon` 构建，确保生成的 ROS 入口脚本指向 `.venv` 解释器。
 
-可选浏览器集成测试（仅使用测试替身，禁止真实 SDK 连接）：
+Python 测试覆盖公共数学库与上层客户端；依赖旧 Python 驱动的集成测试已移除。原生 C++ 驱动测试使用模拟机械臂，不连接真实硬件：
 
 ```bash
-PIPER_BROWSER_TESTS=1 ROS_DOMAIN_ID=227 python -m pytest -q \
-  src/state_dashboard/test/test_browser_controls.py
+colcon test --packages-select piper_x_driver
+colcon test-result --verbose
 ```
 
 ## 启动驱动、Dashboard 与示教
 
 共享配置位于 [arms.yaml](src/piper_x_driver/config/arms.yaml)：
 
-| CAN | 机械臂 / 命名空间 | 默认末端 | 重力补偿系数 |
+| CAN | 机械臂 / 命名空间 | 默认末端 |
 |---|---|---|---|
-| can0 | arm_1 / /arm_1 | 示教手柄 | 1.0 |
-| can1 | arm_2 / /arm_2 | 示教手柄 | 1.0 |
-| can2 | arm_3 / /arm_3 | 标准夹爪 | 1.0 |
-| can3 | arm_4 / /arm_4 | 标准夹爪 | 1.0 |
+| can0 | arm_1 / /arm_1 | 示教手柄 |
+| can1 | arm_2 / /arm_2 | 示教手柄 |
+| can2 | arm_3 / /arm_3 | 标准夹爪 |
+| can3 | arm_4 / /arm_4 | 标准夹爪 |
 
 先在系统中激活 `can0`～`can3`（波特率 `1000000`），各终端保持同一 `ROS_DOMAIN_ID`：
 

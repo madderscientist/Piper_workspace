@@ -247,6 +247,8 @@ $$
 
 驱动在启动或配置更新时，根据 [config/arms.yaml](config/arms.yaml) 中各臂的 `friction_config` 字段加载对应的六轴摩擦参数文件（如 `src/piper_friction/config/arm_1_friction.yaml`；若置空则不启用摩擦补偿）。
 
+`friction_config` 和 `gravity_config` 支持绝对路径或相对于 `arms.yaml` 实际文件所在目录的路径（先解析安装目录中的软链接），不依赖启动命令的当前目录。仓库默认使用 `../../piper_friction/config/arm_1_friction.yaml` 和 `../../piper_gravity/config/arm_1_gravity.yaml` 这样的相对路径，配合 `colcon build --symlink-install` 可直接迁移工作空间。运行时向标定工具提供解析后的绝对路径，保存机械臂配置时保留 YAML 中原有的路径写法。
+
 每轮控制周期，驱动读取当前六轴实测关节角 $q_{1..6}$ 与实测角速度 $\dot{q}_{1..6}$，调用 `ArmFrictionModel.torques(q, dq)` 计算六轴摩擦力矩 $f_i(q_i, \dot{q}_i)$（含 Stribeck 干摩擦、粘滞阻尼、方向相关的周期性啮合摩擦调制 $\tau_{\text{mod}}$ 以及方向无关的齿槽转矩 $\tau_{\text{cog}}$）。
 
 - **静摩擦死区克服（Breakaway Stiction Feedforward）**：

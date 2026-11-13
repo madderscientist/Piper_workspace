@@ -23,8 +23,8 @@ arms:
   - 0.08
   s_a: 2.0
   friction_scale: 0.88
-  friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml
-  gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_1_gravity.yaml
+  friction_config: ../../piper_friction/config/arm_1_friction.yaml
+  gravity_config: ../../piper_gravity/config/arm_1_gravity.yaml
   friction_error_epsilon: 0.05
   friction_velocity_epsilon: 0.02
   target_velocity_cutoff_hz: 5.0
@@ -54,8 +54,8 @@ arms:
   - 0.08
   s_a: 2.0
   friction_scale: 0.88
-  friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_2_friction.yaml
-  gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_2_gravity.yaml
+  friction_config: ../../piper_friction/config/arm_2_friction.yaml
+  gravity_config: ../../piper_gravity/config/arm_2_gravity.yaml
   friction_error_epsilon: 0.05
   friction_velocity_epsilon: 0.02
   target_velocity_cutoff_hz: 5.0
@@ -85,8 +85,8 @@ arms:
   - 0.08
   s_a: 2.0
   friction_scale: 0.88
-  friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_3_friction.yaml
-  gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_3_gravity.yaml
+  friction_config: ../../piper_friction/config/arm_3_friction.yaml
+  gravity_config: ../../piper_gravity/config/arm_3_gravity.yaml
   friction_error_epsilon: 0.05
   friction_velocity_epsilon: 0.02
   target_velocity_cutoff_hz: 5.0
@@ -116,8 +116,8 @@ arms:
   - 0.08
   s_a: 2.0
   friction_scale: 0.88
-  friction_config: /home/a/piper_x_ws/src/piper_friction/config/arm_4_friction.yaml
-  gravity_config: /home/a/piper_x_ws/src/piper_gravity/config/arm_4_gravity.yaml
+  friction_config: ../../piper_friction/config/arm_4_friction.yaml
+  gravity_config: ../../piper_gravity/config/arm_4_gravity.yaml
   friction_error_epsilon: 0.05
   friction_velocity_epsilon: 0.02
   target_velocity_cutoff_hz: 5.0
