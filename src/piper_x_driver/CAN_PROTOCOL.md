@@ -44,9 +44,10 @@
 - [V188+ MIT 调用实现](https://github.com/agilexrobotics/pyAgxArm/blob/d90e234ba8e408cfa964b38aa9120b3131fc9f85/pyAgxArm/protocols/can_protocol/drivers/piper/versions/v188/driver.py)
 - [PiPER-X V189 型号覆盖](https://github.com/agilexrobotics/pyAgxArm/blob/d90e234ba8e408cfa964b38aa9120b3131fc9f85/pyAgxArm/protocols/can_protocol/drivers/piper_x/versions/v189/driver.py)
 - [夹爪编解码器](https://github.com/agilexrobotics/pyAgxArm/blob/d90e234ba8e408cfa964b38aa9120b3131fc9f85/pyAgxArm/protocols/can_protocol/drivers/effector/agx_gripper/default/parser.py)
-- [自有 CAN 适配器](piper_x_driver/backend.py)、
-  [控制语义](piper_x_driver/controller.py)、
-  [ROS 节点](piper_x_driver/node.py)。
+- [自有原生 SocketCAN 协议与适配器](src/socketcan_arm.cpp)、
+  [CAN 报文编码器](src/can_protocol.cpp)、
+  [C++ 实时控制语义](src/controller.cpp)、
+  [C++ ROS 2 节点](src/node.cpp)。
 
 ### 报文层级总览
 
@@ -198,8 +199,8 @@ SDK：`move_j(joints)`，JS 使用 `move_js(joints)`，都用这三帧，控制�
 一条六关节目标拆成三帧，不是单帧原子更新；每帧本身不带速度、夹爪或模式字段。
 
 **ROS：J 位置控制已开放**于 `command/joints`：
-先用 `set_mode joint` 并等 `ctrl_mode=1, mode_feedback=1`；
-命令的 `speed_percent` 先通过 `0x151` 发送，再发上述三帧。JS 未开放。
+先调用 `set_mode joint` 选定驱动模式（无需等待固件预先锁存 `ctrl_mode=1, mode_feedback=1`，因为部分固件仅在 `0x151` 后紧跟目标帧时才保持 `ctrl_mode=1`）；
+每次发送 `command/joints` 时，驱动在同一批次内先发 `0x151`（速度比例与 J 模式），紧接着发出上述 `0x155`～`0x157` 三帧。JS 未开放。
 关节角使用设备原始值，无软件零偏、中心对齐或默认模型范围裁剪。
 不过固定 SDK 在关闭型号限位后，普通关节目标仍经过通用 ±2π 裁剪；
 这不同于 CAN 的 int32 毫度编码范围，不能把驱动验证通过等同于 SDK 原样发送。
@@ -256,7 +257,7 @@ SDK：`move_p(pose)` / `move_l(pose)`；两者发送相同三帧，区别在 `0x
 SDK 位姿入口还会处理姿态角范围；本工程没有另加工作空间几何裁剪。
 
 **ROS：已开放**于 `command/cartesian`，消息为 XYZ m + RPY rad 及 `speed_percent`（同样先通过 `0x151` 发送速度比例，再发上述三帧）；
-需先选择 point 或 linear 并等实际模式反馈。目标不自动包含任意工具偏移。
+需先通过 `set_mode` 选择 `point` 或 `linear`（无需等待固件提前切到 `ctrl_mode=1`；每次 `command/cartesian` 同轮批量连发 `0x151` 与 `0x152`～`0x154` 激活运动）。目标不自动包含任意工具偏移。
 
 #### RX `0x2A2`～`0x2A4`：设备反馈的基座到法兰位姿
 
@@ -353,12 +354,11 @@ T_ref = kp × (p_des - p) + kd × (v_des - v) + t_ff
     $$\tau_{\text{joint}} = (\alpha_i \cdot k_{p,\text{raw}})(p_{\text{des}} - p) + (\alpha_i \cdot k_{d,\text{raw}})(v_{\text{des}} - v) + t_{\text{ff}}$$
     其中 J1..J6 的关节刚度/阻尼放大系数为 `MIT_GAIN_SCALE = [24.75, 24.75, 28.41, 2.10, 1.36, 1.0]`。
 - **本工程统一以减速后物理量为准**：
-  - 实际使用中，本工程在 [`backend.py`](piper_x_driver/backend.py) 的 `SdkArm` 边界层屏蔽减速比放大问题，**所有上层接口（ROS `command/mit`、`debug_mit`、`Controller`、示教配置 `kp/kd` 以及重力折合 `offset = gravity / kp`）统一直接以减速后关节端展现的刚度（Nm/rad）与阻尼（Nm/(rad/s)）为准**。
+  - 实际使用中，本工程在 [`src/can_protocol.cpp`](src/can_protocol.cpp) 的 `encode_mit_command` 边界层屏蔽减速比放大问题，**所有上层接口（ROS `command/mit`、`Controller`、配置 `kp/kd` 以及重力折合 `offset = gravity / kp`）统一直接以减速后关节端展现的刚度（Nm/rad）与阻尼（Nm/(rad/s)）为准**。
   - `SdkArm._write_mit` 在调用 `move_mit` 下发前，自动将减速后的 `kp`、`kd` 除以各轴 `MIT_GAIN_SCALE[i]` 换算为线侧原始值，并按 12 位 `kp` 量化后的实际关节刚度校准重力位置偏置，使关节端实际产生的补偿力矩与上层减速后物理量严格一致。
 
 **ROS：已开放**于 `command/mit`，每条 ROS 消息必须含六轴完整五组数组；
-驱动每轮拆成六帧发送，不是六轴原子 CAN 消息。切模式走 `0x151`，使能仍独立。
-`debug_mit` 与四臂示教也是复用这条链路，没有另一套专用 MIT CAN 协议。
+驱动每轮将 `0x151`（`ctrl_mode=1, move_mode=6, mit_mode=0xAD`）作为第 0 帧与 `0x15A`～`0x15F` 六帧合并为 7 帧批量发送，防止部分固件在仅收到 MIT 关节帧时隔拍回落 `ctrl_mode=0`。使能仍独立。
 主机重力补偿如何作用于目标、输入超时如何保留输出、显式停止如何渐变，
 见 [驱动与 ROS MIT 语义](README.md#3-重力补偿及其分配机制)；它们不是上述 8 字节之外的固件功能。
 

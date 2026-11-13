@@ -6,7 +6,7 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from piper_x_interfaces.srv import CalibrateEffector, ConfigureArm, DebugMit, SetMode
+from piper_x_interfaces.srv import CalibrateEffector, ConfigureArm, SetMode
 import pytest
 from rclpy.task import Future
 from std_srvs.srv import Trigger
@@ -39,9 +39,7 @@ class Client:
             elif isinstance(request, Trigger.Request):
                 response = Trigger.Response(success=self.success, message='teaching ok')
             else:
-                response = DebugMit.Response(
-                    success=self.success, message='test response', session='test-session',
-                    position=[0.0, 0.5, -0.5, 0.0, 0.0, 0.0])
+                raise TypeError(f'Unexpected request {type(request)}')
             future.set_result(response)
         return future
 
@@ -59,7 +57,7 @@ def controller() -> Any:
     pubs = {}
     ctrl: Any = ArmController(
         [Client() for _ in range(4)], [Client() for _ in range(4)],
-        [Client() for _ in range(4)], [Client() for _ in range(4)],
+        [Client() for _ in range(4)],
         lambda idx, kind: pubs.setdefault((idx, kind), Publisher()),
         timeout=0.01)
     ctrl.pubs = pubs
@@ -116,7 +114,6 @@ def test_configure_and_calibrate_dispatch_only_to_selected_arm(http, controller)
 
     assert [len(c.calls) for c in controller.config_clients] == [1, 1, 1, 1]
     assert [len(c.calls) for c in controller.calibration_clients] == [1, 1, 1, 1]
-    assert all(not c.calls for c in controller.debug_clients)
 
 
 def test_mit_session_commands_and_mesh_endpoints(http, controller):
@@ -126,21 +123,14 @@ def test_mit_session_commands_and_mesh_endpoints(http, controller):
     with urlopen(url + '/meshes/base_link.STL', timeout=3) as response:
         assert response.status == 200 and len(response.read()) > 84
 
-    status, payload = post(http, 2, 'mit/start', {})
-    assert status == 200 and payload['session'] == 'test-session'
-    assert payload['position'] == [0, 0.5, -0.5, 0, 0, 0]
-
     for angle_deg in (-2.0, 195.0):
         position = [0.0, math.radians(angle_deg), -0.5, 0.0, 0.0, 0.0]
-        status, _ = post(
-            http, 2, 'mit/target', {'session': payload['session'], 'position': position})
+        status, _ = post(http, 2, 'mit/command', {
+            'position': position, 'velocity': [0.0] * 6,
+            'kp': [-1.0] * 6, 'kd': [-1.0] * 6, 'torque': [0.0] * 6,
+        })
         assert status == 200
-        assert list(controller.debug_clients[1].calls[-1].position) == position
-
-    status, _ = post(http, 2, 'mit/stop', {'session': payload['session']})
-    assert status == 200
-    assert [r.action for r in controller.debug_clients[1].calls] == [
-        'start', 'target', 'target', 'stop']
+        assert list(controller.pubs[(1, 'mit')].messages[-1].position) == position
 
     status, _ = post(http, 1, 'mode', {'mode': 'joint'})
     assert status == 200 and controller.mode_clients[0].calls[-1].mode == 'joint'
@@ -167,28 +157,28 @@ def test_teaching_validation_and_failure_handling(http, controller, teaching):
     assert post(http, None, 'start', {'extra': 1})[0] == 400
     assert post(http, None, 'mode', {'mode': 'invalid'})[0] == 400
 
-    assert post(http, 1, 'mit/start', {}, token='wrong')[0] == 403
+    assert post(http, 1, 'mode', {'mode': 'mit'}, token='wrong')[0] == 403
     for action, body in [
         ('configure', {'end_effector': 'gripper', 'gravity_scale': True}),
         ('configure', {'end_effector': 'gripper', 'gravity_scale': 1.01}),
         ('configure', {'end_effector': 'gripper'}),
         ('calibrate', {'confirm_closed': False}),
         ('calibrate', {'confirm_closed': True, 'extra': 1}),
-        ('mit/start', {'extra': 1}),
-        ('mit/target', {'session': 'test', 'position': [0.0]}),
-        ('mit/target', {'session': 'test', 'position': [20.0] * 6}),
-        ('mit/stop', {'session': ''}),
+        ('mit/command', {'position': [0.0]}),
+        ('mit/command', {'position': [20.0] * 6, 'velocity': [0.0] * 6, 'kp': [1.0] * 6, 'kd': [0.1] * 6, 'torque': [0.0] * 6}),
+        ('mode', {'mode': 'invalid'}),
     ]:
         assert post(http, 1, action, body)[0] == 400
+    assert post(http, 1, 'mit/start', {})[0] == 404
     assert not any(
         c.calls for c in (
-            controller.config_clients + controller.debug_clients + controller.calibration_clients
+            controller.config_clients + controller.calibration_clients
         )
     )
 
     for failure, code in [('unavailable', 503), ('rejected', 409), ('timeout', 504)]:
         for action, body, attr in [
-            ('mit/start', {}, 'debug_clients'),
+            ('mode', {'mode': 'mit'}, 'mode_clients'),
             ('calibrate', {'confirm_closed': True}, 'calibration_clients'),
         ]:
             client = getattr(controller, attr)[0]

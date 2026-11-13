@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Compute six-joint critical damping kd from kp."""
+
+import sys
+
+from piper_x_driver.gravity import damping_main
+
+if __name__ == '__main__':
+    raise SystemExit(damping_main())

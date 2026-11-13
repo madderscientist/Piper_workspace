@@ -1,4 +1,4 @@
-"""Independent ROS calibration client: move, sample, solve, save, request driver reload."""
+"""独立 ROS 多姿态标定客户端：控制机械臂走位、等待原始力稳定采样、最小二乘解算、写回 YAML 并通知 C++ 驱动热重载。"""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
 CALIB_KP = (25.0, 25.0, 25.0, 8.0, 6.0, 4.0)
 CALIB_KD = (4.5, 4.5, 2.2, 0.3, 0.24, 0.06)
 MIT_POSITION_LIMIT = (
-    12.5  # MIT protocol representation range, not an added motion limit.
+    12.5  # MIT 协议编码表示上限，并非额外附加的软件运动限位。
 )
 
 
@@ -137,7 +137,7 @@ class PoseCalibrator(Node):
                 self._reset_collection()
 
     def _reset_collection(self) -> None:
-        """Reset collection while holding self._lock."""
+        """在已持有 self._lock 的前提下清空当前姿态采样缓存。"""
         self._calib_collecting = False
         self._calib_samples.clear()
 
@@ -203,7 +203,7 @@ class PoseCalibrator(Node):
                 res = fut.result() if fut.done() else None
                 if res is not None and not res.success:
                     return False, f"切换 MIT 模式失败: {res.message}"
-        # Smoothly ramp MIT gains up at current pose to avoid any engage jerk.
+        # 在初始姿态处平滑爬升 MIT 刚度与阻尼，避免切入控制瞬间产生冲击。
         ramp_sec = 0.30
         steps = max(1, int(ramp_sec / 0.005))
         for i in range(1, steps + 1):
@@ -217,7 +217,7 @@ class PoseCalibrator(Node):
         return True, "ok"
 
     def _command_pose(self, q_target: Sequence[float]) -> None:
-        """Set all six final joint targets together; the arm controller handles motion."""
+        """一次性下发六个关节的最终目标角，重置力稳定窗口，由底层机械臂驱动完成运动。"""
         if self._stop_event.is_set():
             raise RuntimeError("校准已停止")
         with self._lock:

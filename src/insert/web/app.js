@@ -3,6 +3,8 @@
 
   const $ = (id) => document.getElementById(id);
   let lastServerOffsetSig = '';
+  let lastServerGripEffort = '';
+  let lastServerWrenchSource = '';
 
   const fmt = (val, digits = 1, unit = '') => (Number.isFinite(val) ? val.toFixed(digits) + unit : '—');
 
@@ -66,6 +68,14 @@
     $('gripper-state-badge').textContent = gLabels[grip.state] || ('夹爪：' + grip.state);
     $('gripper-state-badge').dataset.tone = grip.state === 'closed' ? 'ok' : '';
     $('grip-actual-mm').textContent = Number.isFinite(arm.gripper_width_mm) ? arm.gripper_width_mm.toFixed(1) + ' mm' : '— mm';
+    if (Number.isFinite(grip.effort)) {
+      const effStr = grip.effort.toFixed(2);
+      if (effStr !== lastServerGripEffort && document.activeElement !== $('input-grip-effort')) {
+        lastServerGripEffort = effStr;
+        if ($('input-grip-effort')) $('input-grip-effort').value = effStr;
+        if ($('grip-effort-val')) $('grip-effort-val').textContent = effStr;
+      }
+    }
 
     if (goal) {
       $('goal-status-badge').textContent = '已记录目标';
@@ -95,10 +105,34 @@
       }
     }
 
+    const wSource = wrench.source || policy.wrench_source || 'paxini';
+    const selSource = $('select-wrench-source');
+    if (selSource && wSource !== lastServerWrenchSource && document.activeElement !== selSource) {
+      lastServerWrenchSource = wSource;
+      selSource.value = wSource;
+    }
+    const srcBadge = $('wrench-source-badge');
+    if (srcBadge) {
+      if (wSource === 'paxini') {
+        const hz = Number.isFinite(wrench.paxini_hz) ? wrench.paxini_hz.toFixed(0) + ' Hz' : '— Hz';
+        const sensorHz = Number.isFinite(wrench.paxini_sensor_hz) ? wrench.paxini_sensor_hz.toFixed(0) + ' Hz' : '— Hz';
+        srcBadge.textContent = wrench.paxini_fresh ? ('力传感器 · 驱动 ' + sensorHz + ' · insert 接收 ' + hz) : 'paxini_driver 等待数据';
+        srcBadge.dataset.tone = wrench.paxini_fresh ? 'ok' : '';
+      } else {
+        const hz = Number.isFinite(wrench.estimated_hz) ? wrench.estimated_hz.toFixed(0) + ' Hz' : '— Hz';
+        srcBadge.textContent = wrench.estimated_fresh ? ('估计力在线 · ' + hz) : (wrench.estimated_enabled === false ? '估计力：等待开启' : '估计力：等待数据');
+        srcBadge.dataset.tone = wrench.estimated_fresh ? 'ok' : '';
+      }
+    }
+
     $('policy-state-badge').textContent = mLabels[policy.mode] || policy.mode;
+    if (policy.mode === 'policy' && policy.controller === 'rule') {
+      const stageLabel = policy.rule_stage === 'press' ? '垂直下压' : '水平+角度对准';
+      $('policy-state-badge').textContent = '规则插入：' + stageLabel;
+    }
     $('policy-state-badge').dataset.tone = policy.mode === 'policy' ? 'active' : '';
     $('policy-steps-time').textContent = (policy.steps || 0) + ' 步 · ' + (policy.elapsed_s || 0).toFixed(1) + ' s';
-    const lat = policy.last_step ? policy.last_step.latency_ms.toFixed(2) + ' ms' : '— ms';
+    const lat = policy.last_step ? (policy.last_step.compute_ms ?? policy.last_step.latency_ms).toFixed(2) + ' ms' : '— ms';
     $('policy-rate-latency').textContent = (policy.rate_hz || 0).toFixed(1) + ' Hz · ' + lat;
     $('policy-reached').textContent = policy.reached_goal
       ? '✓ 已到位 (保持 ≥5 步)'
@@ -152,7 +186,9 @@
     });
     $('wrench-summary-tag').textContent = '|F| ' + fmt(wrench.force_norm_n, 2) + ' N · |M| ' + fmt(wrench.moment_norm_nm, 3) + ' N·m';
     if (Number.isFinite(wrench.filter_tau_ms) && $('wrench-card-title')) {
-      $('wrench-card-title').textContent = '插头末端六维力旋量 (200Hz 等效 1kHz 滤波 τ=' + wrench.filter_tau_ms.toFixed(2) + 'ms)';
+      const srcTag = wSource === 'paxini' ? 'paxini_driver' : '估计力';
+      const alphaTag = Number.isFinite(wrench.filter_alpha) ? ' · α=' + wrench.filter_alpha.toFixed(3) : '';
+      $('wrench-card-title').textContent = '插头末端六维力旋量 (' + srcTag + ' · 滤波 τ=' + wrench.filter_tau_ms.toFixed(2) + 'ms' + alphaTag + ')';
     }
 
     const qDeg = arm.joints_deg || [];
@@ -185,26 +221,52 @@
     $('btn-grip-close').addEventListener('click', () => runPost('/api/gripper', () => ({
       action: 'close',
       width_m: (Number.parseFloat($('input-close-mm').value) || 0.0) / 1000.0,
-      effort: Number.parseFloat($('input-grip-effort').value) || 2.0,
+      effort: Number.isFinite(Number.parseFloat($('input-grip-effort').value)) ? Number.parseFloat($('input-grip-effort').value) : 2.0,
     })));
     $('btn-grip-open').addEventListener('click', () => runPost('/api/gripper', () => ({
       action: 'open',
       width_m: (Number.parseFloat($('input-open-mm').value) || 50.0) / 1000.0,
-      effort: Number.parseFloat($('input-grip-effort').value) || 2.0,
+      effort: Number.isFinite(Number.parseFloat($('input-grip-effort').value)) ? Number.parseFloat($('input-grip-effort').value) : 2.0,
     })));
     $('btn-grip-release').addEventListener('click', () => runPost('/api/gripper', { action: 'release' }));
+    if ($('input-grip-effort')) {
+      $('input-grip-effort').addEventListener('input', (ev) => {
+        const val = Number.parseFloat(ev.target.value);
+        if (Number.isFinite(val)) {
+          lastServerGripEffort = val.toFixed(2);
+          if ($('grip-effort-val')) $('grip-effort-val').textContent = val.toFixed(2);
+          runPost('/api/gripper', { action: 'effort', effort: val });
+        }
+      });
+    }
     $('btn-enter-drag').addEventListener('click', () => runPost('/api/drag', {}));
     $('btn-apply-tip-offset').addEventListener('click', () => runPost('/api/parameters', () => ({ tip_offset_cm: readTipOffsetCm() })));
     $('btn-record-goal').addEventListener('click', () => runPost('/api/goal/record', () => ({ tip_offset_cm: readTipOffsetCm() })));
     $('btn-clear-goal').addEventListener('click', () => runPost('/api/goal/clear', {}));
-    $('btn-start-policy').addEventListener('click', () => runPost('/api/policy/start', {}));
+    if ($('select-wrench-source')) {
+      $('select-wrench-source').addEventListener('change', (ev) => {
+        lastServerWrenchSource = ev.target.value;
+        runPost('/api/parameters', { wrench_source: ev.target.value });
+      });
+    }
+    $('btn-start-policy').addEventListener('click', () => runPost('/api/policy/start', () => ({
+      controller: 'onnx',
+      wrench_source: $('select-wrench-source') ? $('select-wrench-source').value : undefined,
+    })));
+    if ($('btn-start-rule')) {
+      $('btn-start-rule').addEventListener('click', () => runPost('/api/rule/start', () => ({
+        wrench_source: $('select-wrench-source') ? $('select-wrench-source').value : undefined,
+      })));
+    }
     $('btn-stop-drag').addEventListener('click', () => runPost('/api/policy/stop', { mode: 'drag' }));
     $('btn-stop-hold').addEventListener('click', () => runPost('/api/policy/stop', { mode: 'hold' }));
     $('btn-tare-wrench').addEventListener('click', () => runPost('/api/wrench/tare', {}));
-    $('btn-save-params').addEventListener('click', () => runPost('/api/parameters', () => ({
-      tip_offset_cm: readTipOffsetCm(),
-      kp: String($('input-kp-list').value || '').split(/[\s,]+/).map(Number.parseFloat).filter(Number.isFinite),
-    })));
+    if ($('btn-save-params')) {
+      $('btn-save-params').addEventListener('click', () => runPost('/api/parameters', () => ({
+        tip_offset_cm: readTipOffsetCm(),
+        wrench_source: $('select-wrench-source') ? $('select-wrench-source').value : undefined,
+      })));
+    }
   }
 
   async function pollLoop() {

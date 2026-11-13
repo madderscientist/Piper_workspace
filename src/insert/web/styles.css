@@ -168,11 +168,20 @@ body {
 .param-item { display: flex; flex-direction: column; gap: 4px; }
 .param-action { justify-content: flex-end; }
 .param-item label { font-size: 11px; color: var(--muted); font-weight: 600; }
-.param-item input {
+.param-item input, .param-item select {
   padding: 6px 9px; border: 1px solid #cbd5e1; border-radius: 7px; font-size: 13px;
   background: #fff; color: var(--text); font-variant-numeric: tabular-nums;
 }
-.param-item input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15); }
+.param-item input:focus, .param-item select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15); }
+.param-item input.effort-slider {
+  padding: 0; height: 32px; accent-color: var(--primary); cursor: pointer; border: none; background: transparent;
+}
+.wrench-source-row {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 12px;
+  background: #f8fafc; padding: 10px 12px; border-radius: 10px; border: 1px solid #e2e8f0;
+  margin-bottom: 12px; flex-wrap: wrap;
+}
+.wrench-source-item { flex: 1; min-width: 220px; }
 .metric-inline { font-size: 15px; color: var(--primary); padding-top: 4px; font-variant-numeric: tabular-nums; }
 .divider { height: 1px; background: var(--border); margin: 12px 0; }
 .recorded-box, .metric-card, .readout-box, .wrench-item {

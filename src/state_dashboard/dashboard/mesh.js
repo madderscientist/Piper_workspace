@@ -2,12 +2,12 @@
 
 window.PiperMesh = (() => {
   const JOINT_ORIGINS = [
-    {xyz: [0, 0, 0.123], rpy: [0, 0, 0]},
-    {xyz: [0, 0, 0], rpy: [1.5708, -0.1359, -3.1416]},
-    {xyz: [0.28503, 0, 0], rpy: [0, 0, -1.7939]},
-    {xyz: [-0.021984, -0.25075, 0], rpy: [1.5708, 0, 0]},
-    {xyz: [0, 0, 0], rpy: [-1.5708, 0, 0]},
-    {xyz: [8.8259e-5, -0.091, 0], rpy: [1.5708, 0, 0]},
+    {xyz: [0, 0, 0.123], rpy: [0, 0, 3.1415926]},
+    {xyz: [0, 0, 0], rpy: [-1.5707963, -3.005806, -3.1415926]},
+    {xyz: [0.28503, 0, 0], rpy: [0, 0, 2.8380798]},
+    {xyz: [0.27364, 0, 0], rpy: [0, 0, 0.0806342]},
+    {xyz: [0.07466, 0, 0], rpy: [-1.5707963, 1.5707963, 0]},
+    {xyz: [0, -0.035, 0], rpy: [1.5707963, 0, 0]},
   ];
 
   const LINK_COLORS = [
@@ -123,7 +123,7 @@ window.PiperMesh = (() => {
       links.push({mesh: `link${i + 1}.STL`, matrix: current, color: LINK_COLORS[i + 1]});
     }
     if (isWrench) {
-      const mArmFlange = mat4Mul(current, mat4FromOriginRpy([0, 0, 0], [0, 0, -Math.PI / 2], 0, 0));
+      const mArmFlange = current;
       const mSensor = mat4Mul(mArmFlange, mat4FromOriginRpy([0, 0, 0.0075], [0, 0, -Math.PI / 4], 0, 0));
       const mGripFlange = mat4Mul(mSensor, mat4FromOriginRpy([0, 0, 0.024], [0, 0, Math.PI / 2], 0, 0));
       const mGripBase = mat4Mul(mGripFlange, mat4FromOriginRpy([0, 0, 0.0088], [0, 0, 0], 0, 0));
@@ -142,12 +142,13 @@ window.PiperMesh = (() => {
     const fingerL = isTeach ? "teach_link7.STL" : "link7.STL";
     const fingerR = isTeach ? "teach_link8.STL" : "link8.STL";
     const fingerZ = isTeach ? 0.0795 : 0.1358;
-    links.push({mesh: baseMesh, matrix: current, color: LINK_COLORS[7]});
-    const m7 = mat4Mul(current, mat4FromOriginRpy([0, 0, fingerZ], [1.5708, 0, 0], 0, width / 2));
-    const m8 = mat4Mul(current, mat4FromOriginRpy([0, 0, fingerZ], [1.5708, 0, -3.1416], 0, width / 2));
+    const mTermBase = mat4Mul(current, mat4FromOriginRpy([0, 0, 0], [0, 0, Math.PI / 2], 0, 0));
+    links.push({mesh: baseMesh, matrix: mTermBase, color: LINK_COLORS[7]});
+    const m7 = mat4Mul(mTermBase, mat4FromOriginRpy([0, 0, fingerZ], [1.5708, 0, 0], 0, width / 2));
+    const m8 = mat4Mul(mTermBase, mat4FromOriginRpy([0, 0, fingerZ], [1.5708, 0, -3.1416], 0, width / 2));
     links.push({mesh: fingerL, matrix: m7, color: LINK_COLORS[8]});
     links.push({mesh: fingerR, matrix: m8, color: LINK_COLORS[9]});
-    return {links, flangeMatrix: current, gripperBaseMatrix: current, gripperTopZ: 0.063};
+    return {links, flangeMatrix: current, gripperBaseMatrix: mTermBase, gripperTopZ: 0.063};
   }
 
   function parseBinaryStl(buffer) {
@@ -242,10 +243,9 @@ window.PiperMesh = (() => {
 
   function resolveCameraPoses(fk, calib) {
     if (!fk || !calib || !Array.isArray(calib.translation) || !Array.isArray(calib.rpy)) return null;
-    const baseMat = fk.gripperBaseMatrix || fk.flangeMatrix;
-    const topZ = fk.gripperTopZ ?? 0.063;
-    // Align driver link6 frame to visual STL gripper_base_top frame (-90 deg around Z)
-    const topMatrix = mat4Mul(baseMat, mat4FromOriginRpy([0, 0, topZ], [0, 0, -Math.PI / 2], 0, 0));
+    // Camera extrinsics are calibrated relative to PiPER-X link6 translated along +Z to gripper_base_top
+    const topZ = Number.isFinite(calib.link6_to_top_z_m) ? calib.link6_to_top_z_m : (fk.gripperTopZ ?? 0.063);
+    const topMatrix = mat4Mul(fk.flangeMatrix, mat4FromOriginRpy([0, 0, topZ], [0, 0, 0], 0, 0));
     const extMat = mat4FromOriginRpy(calib.translation, calib.rpy, 0, 0);
     const camMatrix = mat4Mul(topMatrix, extMat);
     let boardMatrix = null;

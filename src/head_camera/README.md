@@ -102,3 +102,14 @@ source ./setup_env.bash
 .venv/bin/python /usr/bin/colcon test --packages-select head_camera --event-handlers console_direct+
 .venv/bin/python /usr/bin/colcon test-result --test-result-base build/head_camera --verbose
 ```
+
+若启动时报 `libk4arecord.so.1.4` 或 `libk4a.so.1.4` 找不到，说明已构建程序依赖的 Azure Kinect SDK 库当前不可用。仅使用默认 V4L2 纯 RGB 模式时，可清理旧 SDK 的 CMake 缓存并重新构建：
+
+```bash
+source ./setup_env.bash
+.venv/bin/python /usr/bin/colcon build --symlink-install --packages-select head_camera --cmake-clean-cache
+ros2 run head_camera head_camera list
+ros2 run head_camera head_camera serve
+```
+
+未找到 SDK 时，构建会自动使用纯 RGB 分支，保留视频流与内参标定；深度采集和 Kinect 录像功能需要先将 Azure Kinect SDK 安装到持久目录，再重新配置构建。不要将 `k4a_DIR`、`k4arecord_DIR` 指向可能被清理的会话临时目录。

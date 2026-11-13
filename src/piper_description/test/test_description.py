@@ -174,7 +174,7 @@ def test_piper_with_wrench_attaches_complete_terminal_to_link6():
     assert mount.parent == 'link6'
     assert mount.child == 'arm_sensor_flange'
     assert mount.origin.xyz == [0, 0, 0]
-    assert mount.origin.rpy == pytest.approx([0, 0, -math.pi / 2])
+    assert mount.origin.rpy == pytest.approx([0, 0, 0])
     assert robot.joint_map['joint7'].origin.xyz == terminal.joint_map['joint7'].origin.xyz
     assert robot.joint_map['joint8'].origin.xyz == terminal.joint_map['joint8'].origin.xyz
 
@@ -298,9 +298,17 @@ def test_real_ros_follow_launch_converts_feedback_to_finger_tf():
 @pytest.mark.parametrize('index,terminal', [
     (1, 'teach_base'), (2, 'teach_base'), (3, 'gripper_base'), (4, 'gripper_base'),
 ])
-def test_follow_chooses_configured_end_effector_model(index, terminal):
-    from piper_x_driver.configuration import default_config_path
-
+def test_follow_chooses_configured_end_effector_model(index, terminal, tmp_path):
+    cfg_file = tmp_path / 'arms.yaml'
+    cfg_file.write_text(yaml.safe_dump({
+        'version': 1,
+        'arms': [
+            {'id': 'arm_1', 'namespace': '/arm_1', 'end_effector': 'teaching_handle'},
+            {'id': 'arm_2', 'namespace': '/arm_2', 'end_effector': 'teaching_handle'},
+            {'id': 'arm_3', 'namespace': '/arm_3', 'end_effector': 'gripper_with_wrench'},
+            {'id': 'arm_4', 'namespace': '/arm_4', 'end_effector': 'gripper_with_wrench'},
+        ],
+    }), encoding='utf-8')
     spec = importlib.util.spec_from_file_location(
         'follow_entry', SHARE / 'launch/follow.launch.py')
     assert spec is not None and spec.loader is not None
@@ -308,7 +316,7 @@ def test_follow_chooses_configured_end_effector_model(index, terminal):
     spec.loader.exec_module(module)
     context = LaunchContext()
     context.launch_configurations.update({
-        'namespace': f'arm_{index}', 'config_file': str(default_config_path()),
+        'namespace': f'arm_{index}', 'config_file': str(cfg_file),
         'model': '', 'rvizconfig': str(SHARE / 'rviz/piper_ctrl.rviz'), 'rviz': 'false',
     })
     with patch.object(module, 'Node') as node:

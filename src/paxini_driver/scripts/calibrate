@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Entrypoint for the standalone PaXini multi-pose calibration client."""
+
+from paxini_driver.calibrator import main
+
+if __name__ == "__main__":
+    main()

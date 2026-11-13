@@ -1,10 +1,11 @@
 from dataclasses import replace
 import time
 
+from conftest import MockDriverNode as DriverNode
 from piper_teaching.bilateral import ArmSample, TeachingFault
 from piper_teaching.node import TeachingNode
 from piper_x_driver.gravity import gravity_torques
-from piper_x_driver.node import DriverNode
+from piper_x_driver.protocol import MAX_GRAVITY_OFFSET
 from piper_x_interfaces.srv import Enable, SetMode
 import pytest
 import rclpy
@@ -123,8 +124,6 @@ def test_master_slave_mode_controls_slaves_with_position_folded_gravity():
         for index, (driver, base_target) in enumerate(zip(
             drivers, (master_1[:6], master_2[:6], master_1[:6], master_2[:6]),
         )):
-            from piper_x_driver.backend import MAX_GRAVITY_OFFSET
-
             profile = driver.fleet.effectors[driver.arm_config.end_effector]
             g_model = driver.control.gravity_model
             expected_g = (

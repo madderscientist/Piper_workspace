@@ -1,6 +1,6 @@
 # PiPER-X 四臂驱动 (`piper_x_driver`)
 
-`piper_x_driver` 是工作空间中唯一直接打开 SocketCAN 并持有 `pyAgxArm` SDK 实例的底层驱动包。
+`piper_x_driver` 是工作空间唯一的机械臂底层硬件驱动包与公共运动学/动力学底座，采用 **原生 C++17 (`rclcpp` + Linux SocketCAN) 实时驱动 + 无状态 C++/Python 共享数学库** 分层设计，不依赖 `pyAgxArm` 或 `python-can`，也不反向耦合任何上层业务包。
 
 > **硬件频率上限说明**：PiPER-X 机械臂固件（`S-V1.9-0` / `S-V1.9-1`）的 CAN 状态与关节位置/速度上报频率写死为 **`200 Hz`（周期 `5 ms`）**，CAN 协议中没有任何改频指令，且受限于 `1 Mbps` CAN 2.0A 总线物理带宽（单臂仅 `200 Hz` 状态上报已达 `~3040 帧/秒`、占总线约 `39%` 容量），**无法通过软件配置将底层有效反馈与控制频率改大**。
 
@@ -10,16 +10,99 @@
 - **200 Hz 示教耦合层（`piper_teaching`，`rate_hz=200.0`，周期 `5 ms`）**：主从/双向示教节点与驱动同频运行，以 **200 Hz** 订阅关节反馈并发送 `command/mit`、`command/gripper` 与参考轨迹 `target`。
 - **50 Hz 上层控制与状态汇总（周期 `20 ms`）**：驱动以 **50 Hz** 发布 `control_state` JSON（含各层实时频率 `rates`）、`arm_status` 与 `end_pose_stamped`；上层策略/规划节点以 **50 Hz** 发送目标时，驱动在相邻两帧目标之间仍以 **200 Hz** 紧跟实测反馈高频刷新重力与摩擦力补偿。
 
-## 0. 模块结构与职责边界
+## 0. 架构设计与外部包复用指南
 
-| 模块 | 核心类 / 函数 | 职责边界 |
-|---|---|---|
-| [`backend.py`](piper_x_driver/backend.py) | `SdkArm`, `Feedback`, `MitTarget`, `fresh` | **唯一接触 `pyAgxArm` 与 SocketCAN 的边界层**。负责固件版本校验（`S-V1.9-0/1`）、11 段 CAN 报文时效追踪、夹爪 `30 ms` 滑窗速度估计、200 Hz 夹爪指令插值线程、原生零力拖动（`Leader`）切换，以及关节侧 `kp/kd` 减速比折算（`MIT_GAIN_SCALE`）与 12-bit `kp` 量化重力残差校准。 |
-| [`controller.py`](piper_x_driver/controller.py) | `Controller`, `RateMeter` | **与 ROS 及 CAN 传输解耦的控制状态机与动力学律层**。管理模式状态（`standby/joint/point/linear/mit/drag/hold`）、200 Hz MIT 看门狗（`watchdog`）、MIT 调试会话（`debug_start/update/stop`）、重力补偿两级守恒分配、关节与夹爪摩擦力补偿、一阶滤波角加速度 $\ddot{q}$、惯性力矩 $I(q)\ddot{q}$、六轴外力矩 $\hat{\tau}_{\text{ext}}$ 与末端六维力螺旋 $\hat{\mathcal{F}}$ 估计。 |
-| [`node.py`](piper_x_driver/node.py) | `DriverNode`, `main`, `power_off_main` | **ROS 2 适配层**。将 `Controller` 与 `FleetConfig` 映射为单臂命名空间下的反馈话题、命令话题和服务；以 200 Hz 发布关节及按需启用的末端六维力，以 50 Hz 汇总发布状态、位姿与 JSON `control_state`（含各层实时频率 `rates`）。 |
-| [`configuration.py`](piper_x_driver/configuration.py) | `FleetConfig`, `ArmConfig`, `Effector` | **四臂共享配置管理**。严格校验 [`config/arms.yaml`](config/arms.yaml)，加载各臂标定的重力/摩擦模型 YAML，并通过 `.yaml.lock` 文件锁 + 临时文件原子替换（`os.replace`）持久化运行时配置修改。 |
-| [`gravity.py`](piper_x_driver/gravity.py) | `ArmGravityModel`, `gravity_torques`, `joint_inertias`, `geometric_jacobian`, `end_effector_wrench`, `max_critical_kd` | **运动学、重力/惯量与末端六维力求解器**。采用纯标量快速正运动学 `_fast_fk` 计算静态重力矩、随姿态变化的对角连杆惯量、临界阻尼包络、夹爪局部系/基座系 $6\times 6$ 几何雅可比矩阵及阻尼转置伪逆六维力。 |
-| [`friction.py`](piper_x_driver/friction.py) | `ArmFrictionModel`, `JointFrictionModel`, `GripperFrictionModel`, `SpatialHarmonic` | **关节与夹爪摩擦力模型**。对旋转关节 J1..J6 提供 Stribeck + 空间谐波（齿槽 `a,b` + 啮合调制 `c,d`）零速门控补偿；对夹爪/示教手柄提供非周期开度网格插值剖面与串级反演补偿。 |
+### 0.1 模块结构与职责边界
+
+| 层级 | 模块 | 核心类 / 函数 | 职责边界 |
+|---|---|---|---|
+| **C++ 实时驱动层** | [`src/socketcan_arm.cpp`](src/socketcan_arm.cpp)<br/>[`src/can_protocol.cpp`](src/can_protocol.cpp) | `SocketCanArm`, `encode_mit_command` | **原生 Linux SocketCAN 硬件与协议层**。使用内核 `CAN_RAW_FILTER` 白名单、`recvmmsg` + `SO_TIMESTAMPNS` 纳秒级硬件时间戳接收解码、`sendmmsg` 单次系统调用批量下发 6 轴 MIT 帧，管理固件校验（`0x4AF`）、使能、200 Hz 夹爪插值与零点标定（`0x476`）。 |
+| **C++ 实时控制层** | [`src/controller.cpp`](src/controller.cpp)<br/>[`src/node.cpp`](src/node.cpp)<br/>[`src/main.cpp`](src/main.cpp) | `Controller`, `DriverNode` | **4 独立原生 `rclcpp` 驱动进程**。每臂独立进程隔离故障，以 200 Hz 执行看门狗、误差自适应刚度 $s_a$、重力两级守恒分配、关节/夹爪摩擦补偿与末端六维力估计，对外暴露 ROS 2 话题与服务。 |
+| **C++ 共享核心库** | [`include/piper_x_driver/*.hpp`](include/piper_x_driver)<br/>[`src/gravity.cpp`](src/gravity.cpp)<br/>[`src/friction.cpp`](src/friction.cpp)<br/>[`src/configuration.cpp`](src/configuration.cpp) | `piper_x_driver_core` | **零 ROS 节点耦合的 C++17 静态核心库**。单向依赖更底层的 `piper_description` 包，启动时直接解析 `piper_description/urdf/piper_no_gripper_description.urdf` 获取 6 轴关节原点/RPY 与连杆质量、质心、3×3 惯性张量，统一提供正运动学、连杆姿态惯量、雅可比、外力螺旋、重力/摩擦模型与 `arms.yaml` 解析。 |
+| **Python 公共绑定层** | [`piper_x_driver/__init__.py`](piper_x_driver/__init__.py)<br/>[`src/pybind_module.cpp`](src/pybind_module.cpp) | `_core`, `gravity.py`, `friction.py`, `configuration.py`, `protocol.py` | **供上层 Python 包单向 `import` 的无状态库**。导入时不打开任何硬件或 ROS 上下文；计算密集函数自动路由至 `pybind11` 编译的 `_core` C++ 模块，保证全工作空间 C++ 与 Python 共享唯一一份公式真值。 |
+
+### 0.2 外部 Python 包可以 `import` 哪些接口、怎么用？
+
+所有上层 Python 包（如 `insert`、`piper_teaching`、`piper_gravity`、`piper_friction`、`state_dashboard`、`paxini_driver`、`wrist_camera`）统一从顶层 `piper_x_driver`（或对应子模块）导入纯函数与数据模型：
+
+1. **正/逆运动学（FK / IK）、旋转矩阵与几何雅可比（`piper_x_driver` / `piper_x_driver.gravity`）**
+
+```python
+from piper_x_driver import (
+    IkResult,
+    forward_kinematics,
+    inverse_kinematics,
+    link6_rotation_in_base,
+    geometric_jacobian,
+)
+
+q = (0.0, 0.8, -1.2, 0.1, 0.3, -0.2)  # 6 轴关节角 (rad)
+
+# 1) 计算 base_link -> link6（或加 link6 系下工具偏移 [x, y, z] m）的 4x4 齐次矩阵
+T_base_link6 = forward_kinematics(q)
+T_base_tip = forward_kinematics(q, tool_offset_m=(0.0, 0.0, 0.16))
+
+# 2) 6-DOF 逆运动学：目标可传 4x4 齐次矩阵或 6D [x, y, z, roll, pitch, yaw]，自动遵守 URDF 关节限位
+q_ik = inverse_kinematics(T_base_tip, q_seed=q, tool_offset_m=(0.0, 0.0, 0.16))
+res = inverse_kinematics((0.28, 0.0, 0.22, 0.0, 1.4, 0.0), q_seed=q, return_result=True)  # -> IkResult(joints, converged, ...)
+
+# 3) 仅取 base_link -> link6 的 3x3 旋转矩阵
+R_base_link6 = link6_rotation_in_base(q)
+
+# 4) 计算 6x6 几何雅可比矩阵（frame 可选 "gripper" 夹爪系 或 "base_link" 基座系）
+J_grip = geometric_jacobian(q, tool_offset_m=(0.0, 0.0, 0.16), frame="gripper")
+```
+
+2. **标定重力模型、惯量、临界阻尼与末端六维力求解**
+
+```python
+from piper_x_driver import (
+    ArmGravityModel,
+    load_gravity_model,
+    gravity_torques,
+    joint_inertias,
+    max_critical_kd,
+    end_effector_wrench,
+)
+
+# 未标定 CAD 名义重力矩与临界阻尼
+tau_cad = gravity_torques(q, mass_kg=0.685, com_m=(0.0, 0.0, 0.05))
+kd_auto = max_critical_kd((17.0, 16.0, 15.0, 4.0, 3.0, 3.0), end_effector="gripper_with_wrench")
+
+# 加载标定重力模型（自动应用各关节 angle_offset、scale 与末端等效附加质量 added_mass_kg）
+g_model = load_gravity_model("src/piper_gravity/config/arm_3_gravity.yaml")
+T_cal = g_model.forward_kinematics(q, tool_offset_m=(0.0, 0.0, 0.16))
+q_cal = g_model.inverse_kinematics(T_cal, q_seed=q, tool_offset_m=(0.0, 0.0, 0.16))
+J_cal = g_model.jacobian(q, frame="gripper")
+tau_g = g_model.torques(q)
+wrench = end_effector_wrench(tau_g, q, gravity_model=g_model, frame="gripper")
+```
+
+3. **关节/夹爪摩擦模型与四臂配置（`FleetConfig`）及协议常量**
+
+```python
+from piper_x_driver import (
+    FleetConfig,
+    default_config_path,
+    load_friction_model,
+    MIT_GAIN_SCALE,
+    MIT_KP_LSB,
+    MIT_KD_LSB,
+    MIT_POSITION_LIMIT,
+    MODES,
+    RateMeter,
+    feedback_problem,
+)
+
+fleet = FleetConfig(default_config_path())
+arm4 = fleet.arm("arm_4")                      # 读取 can_port / namespace / kp / kd / s_a 等
+f_model = fleet.friction_model(arm4)           # 读取已配置的 ArmFrictionModel
+tau_f = f_model.torques(q, (0.05,) * 6)        # 计算 6 轴摩擦力矩 (Nm)
+```
+
+### 0.3 外部 C++ 包如何复用？
+
+本包已通过 `ament_cmake` 导出头文件与 `piper_x_driver_core` 库。外部 C++ 包（例如 `paxini_driver`）只需在 `package.xml` 声明 `<depend>piper_x_driver</depend>`，在 `CMakeLists.txt` 中 `find_package(piper_x_driver REQUIRED)` 并加入 `ament_target_dependencies(... piper_x_driver)`，即可直接 `#include "piper_x_driver/gravity.hpp"` 调用 `piper_x_driver::fast_fk`、`piper_x_driver::inverse_kinematics`、`link6_rotation_in_base`、`gravity_torques` 等零开销 C++ 函数。
 
 ## 1. 启动与配置
 
@@ -71,7 +154,7 @@ $$
 - **统一使用减速后关节侧物理量**：
   上层所有接口（ROS `command/mit`、`debug_kp / debug_kd`、重力矩 $g_i$、摩擦力矩 $f_i$）均统一定义为**减速器输出端（关节侧）**的物理量，单位为 $\text{rad}$、$\text{rad/s}$、$\text{N}\cdot\text{m}$、$\text{N}\cdot\text{m/rad}$、$\text{N}\cdot\text{m/(rad/s)}$。
 - **底层减速比自动换算**：
-  SDK 的 `t_ff` 已在内部按关节力矩常数换算为关节侧 $\text{N}\cdot\text{m}$，但 `kp` 与 `kd` 在驱动器内部直接作用于电机侧。驱动在 [backend.py](piper_x_driver/backend.py) 的 `SdkArm._write_mit` 中自动将关节侧 `kp`、`kd` 除以各轴放大系数 `MIT_GAIN_SCALE = (24.75, 24.75, 28.41, 2.10, 1.36, 1.0)` 换算为 CAN 线侧值。
+  CAN 报文的 `t_ff` 按关节力矩常数换算为关节侧 $\text{N}\cdot\text{m}$，但 `kp` 与 `kd` 在电机驱动器内部直接作用于电机侧。驱动在 [src/can_protocol.cpp](src/can_protocol.cpp) 的 `encode_mit_command` 中自动将关节侧 `kp`、`kd` 除以各轴放大系数 `MIT_GAIN_SCALE = (24.75, 24.75, 28.41, 2.10, 1.36, 1.0)` 换算为 CAN 线侧值。
 - **阻尼推导工具 (`damping`) 与负数阻尼自动推导 (`kd < 0`)**：
   [gravity.py](piper_x_driver/gravity.py) 提供 `max_critical_kd(kp, end_effector, gravity_model)`，基于 URDF 全姿态最大对角转动惯量包络 $M_{ii,\max}$ 按 $k_{d,i} = \sqrt{2 M_{ii,\max} k_{p,i}}$ 计算各轴阻尼：
   - **命令行工具**：可通过 `ros2 run piper_x_driver damping --kp 60 60 60 12 8 8 --effector teaching_handle` 直接算出 `kd: [9.25, 9.31, 4.51, 0.6, 0.49, 0.13]` 填入配置文件；
@@ -99,9 +182,9 @@ $$
 
 若只采用纯位置折合，当 $k_{p, i}$ 很小时，$g_i / k_{p, i}$ 会产生巨大的虚拟目标角偏置（甚至超出 CAN 位置编码范围 $\pm 12.5\text{ rad}$）；当 $k_{p, i} = 0$ 或 $k_{d, i} = 0$（如主从示教中主臂零刚度自由拖动）时，位置折合无法工作或缺少阻尼支撑。此外，CAN 报文中 `kp` 仅 12 bit，量化后的实际刚度 $K_{p, \text{realized}, i}$ 与请求值 $k_{p, i}$ 存在离散步进误差。
 
-因此，驱动在 [controller.py](piper_x_driver/controller.py) 与 [backend.py](piper_x_driver/backend.py) 中采用**基于 CAN 量化精度的两级守恒分配**。
+因此，驱动在 [src/controller.cpp](src/controller.cpp) 与 [src/can_protocol.cpp](src/can_protocol.cpp) 中采用**基于 CAN 量化精度的两级守恒分配**。
 
-### 3.3 CAN 底层量化步长与阈值 ([backend.py](piper_x_driver/backend.py))
+### 3.3 CAN 底层量化步长与阈值 ([include/piper_x_driver/can_protocol.hpp](include/piper_x_driver/can_protocol.hpp))
 
 根据 CAN `0x15A`～`0x15F` 报文的位宽定义与 `MIT_GAIN_SCALE`：
 
@@ -244,7 +327,7 @@ $$
 |---|---|
 | `configuration` | 当前臂 `id/name/namespace/can_port`、`end_effector`、`gravity_scale`、`friction_scale`、`gravity_config`、`friction_config`、`debug_kp/debug_kd`、`config_file`、当前 `effector` 详情及全部可选 `effectors` |
 | `mode`, `mit_ready` | 驱动内部模式（`standby/joint/point/linear/mit/drag/hold`）及外部 MIT 就绪标志（`ctrl_mode==1 && mode_feedback==6`） |
-| `debug_active`, `debug_target` | MIT 调试会话是否活动及 6 轴目标角（`rad`，非活动为 `null`） |
+| `mit_target` | 当前活动的外部 MIT 6 轴目标角（`rad`，无外部目标或回退重力补偿时为 `null`） |
 | `joint_lower`, `joint_upper` | 前端滑条推荐初始显示跨度（`rad`，非驱动命令限位） |
 | `gravity_torque`, `friction_torque` | 当前 6 轴重力补偿力矩 $g_i(q)$ 与旋转关节摩擦补偿力矩 $f_i(q,\dot{q})$（`Nm`） |
 | `gripper_friction`, `gripper_velocity`, `gripper_force` | 夹爪非周期摩擦与偏置补偿力（`N`）、`30 ms` 滑窗实测开合速度（`m/s`）、`0x2A8` 实测力 |
@@ -263,8 +346,8 @@ $$
 | 相对话题名 | 消息类型 | QoS | 功能说明 |
 |---|---|---|---|
 | `command/joints` | [`JointCommand`](../piper_x_interfaces/msg/JointCommand.msg) | Reliable, Depth 10 | `position[6]`（`rad`）+ `speed_percent`（`1..100`）。`joint` 模式下发 `0x151` + `0x155..157`；`mit` 模式下仅更新 MIT 目标位置 `position[6]`（保留当前或预设 `kp/kd/velocity/torque`） |
-| `command/cartesian` | [`CartesianCommand`](../piper_x_interfaces/msg/CartesianCommand.msg) | Reliable, Depth 10 | `pose[6]`（`[x,y,z,roll,pitch,yaw]`，`m/rad`）+ `speed_percent`（`1..100`）；需先切入 `point`（MoveP）或 `linear`（MoveL）模式并等待模式反馈，下发 `0x151` + `0x152..154` |
-| `command/mit` | [`MitCommand`](../piper_x_interfaces/msg/MitCommand.msg) | Best-Effort, Depth 5 | 六轴关节侧 `position[6]`（`±12.5 rad`）、`velocity[6]`（`±45 rad/s`）、`kp[6]`（`0..500 Nm/rad`）、`kd[6]`（传入 `< 0` 如 `-1.0` 时由驱动自动推导最大临界阻尼）、`torque[6]`（额外前馈 `Nm`）；输入超时窗口 `0.2 s`，下发 `0x15A..15F` |
+| `command/cartesian` | [`CartesianCommand`](../piper_x_interfaces/msg/CartesianCommand.msg) | Reliable, Depth 10 | `pose[6]`（`[x,y,z,roll,pitch,yaw]`，`m/rad`）+ `speed_percent`（`1..100`）；需先通过 `set_mode` 选择 `point`（MoveP）或 `linear`（MoveL），每次下发时驱动将 `0x151`（速度与模式）与 `0x152..154` 目标帧合并批量发送 |
+| `command/mit` | [`MitCommand`](../piper_x_interfaces/msg/MitCommand.msg) | Best-Effort, Depth 5 | 六轴关节侧 `position[6]`（`±12.5 rad`）、`velocity[6]`（`±45 rad/s`）、`kp[6]`（`0..500 Nm/rad`）、`kd[6]`（传入 `< 0` 如 `-1.0` 时由驱动自动推导最大临界阻尼）、`torque[6]`（额外前馈 `Nm`）；输入超时窗口 `0.2 s`，每周期驱动将 `0x151` MIT 保活帧与 `0x15A..15F` 六轴帧合并批量下发 |
 | `command/gripper` | [`GripperCommand`](../piper_x_interfaces/msg/GripperCommand.msg) | Best-Effort, Depth 5 | 夹爪总开度 `width`（`0..0.1 m`）与力控参数 `effort`（`0..5`；配置了夹爪摩擦模型时自动叠加非周期摩擦补偿；`effort <= 0` 为释放或被动捏合摩擦辅助），下发 `0x159` |
 
 ### 6.3 提供的 ROS 2 服务
@@ -273,9 +356,8 @@ $$
 |---|---|---|---|
 | `enable_srv` | [`Enable`](../piper_x_interfaces/srv/Enable.srv) | `bool enable_request` | `enable_response=true` 表示在 `3.0 s` 内收到了请求之后的新鲜使能位确认（`true` 使能六关节并保持夹爪零力释放；`false` 七轴全失能，不要求先有正常反馈） |
 | `set_wrench_estimation` | `std_srvs/srv/SetBool` | `bool data` | 按臂启停关节末端力估计，只影响计算与发布；关闭时清除估计历史，不改变使能、模式或控制目标 |
-| `set_mode` | [`SetMode`](../piper_x_interfaces/srv/SetMode.srv) | `string mode` | 发送模式切换请求（不阻塞等待固件到位）：<br/>• `standby`：`0x151.ctrl_mode=0` 待机（不等于失能）<br/>• `joint`：`0x151` J 模式（期望 `ctrl_mode=1, mode_feedback=1`）<br/>• `point`：`0x151` P 模式（期望 `ctrl_mode=1, mode_feedback=0`）<br/>• `linear`：`0x151` L 模式（期望 `ctrl_mode=1, mode_feedback=2`）<br/>• `mit`：预装六轴 MIT 目标后发 `0x151` MIT（期望 `ctrl_mode=1, mode_feedback=6`；若无外部预装目标则自动以实测位置预装重力补偿目标）<br/>• `drag`：固件原生零力拖动（`0x470: 0xFA` + `0x191: mode=0`）<br/>• `hold`：结束原生拖动记录请求（`0x150.B2=2`） |
+| `set_mode` | [`SetMode`](../piper_x_interfaces/srv/SetMode.srv) | `string mode` | 切换驱动模式并发送对应模式请求（不阻塞等待固件到位；部分固件在收到首组 J/P/L 目标帧前不锁存 `ctrl_mode=1`）：<br/>• `standby`：`0x151.ctrl_mode=0` 待机（不等于失能）<br/>• `joint`：选择 J 模式（后续 `command/joints` 同轮连发 `0x151` + `0x155..157` 激活 `ctrl_mode=1, mode_feedback=1`）<br/>• `point`：选择 P 模式（后续 `command/cartesian` 同轮连发 `0x151` + `0x152..154` 激活 `ctrl_mode=1, mode_feedback=0`）<br/>• `linear`：选择 L 模式（后续 `command/cartesian` 同轮连发 `0x151` + `0x152..154` 激活 `ctrl_mode=1, mode_feedback=2`）<br/>• `mit`：以带完整重力/摩擦补偿的六轴 MIT 帧预装并切入 `0x151` MIT（已在 `mit` 就绪态再次调用则释放外部目标、立即回到零重力浮动）<br/>• `drag`：固件原生零力拖动（`0x470: 0xFA` + `0x191: mode=0`）<br/>• `hold`：结束原生拖动记录请求（`0x150.B2=2`） |
 | `configure_arm` | [`ConfigureArm`](../piper_x_interfaces/srv/ConfigureArm.srv) | `string end_effector`, `float64 gravity_scale`, `float64 friction_scale` | 原子保存并应用末端键（`teaching_handle` / `gripper` / `gripper_with_wrench`，切换末端需七轴失能且非 MIT/示教）、`gravity_scale`（`0..1`）与 `friction_scale`（`0..1` 持久化写盘；`-1.0` 保持原值；`< -1.0` 按 `-(2.0 + s)` 临时覆盖内存摩擦比例供标定使用而不写盘） |
-| `debug_mit` | [`DebugMit`](../piper_x_interfaces/srv/DebugMit.srv) | `string action`, `string session`, `float64[6] position` | 调试台专用 MIT 会话：<br/>• `start`：以实测六轴角度初始化并返回新 `session`（旧会话超过 `0.3 s` 过期时允许直接接管）<br/>• `target`：携带同一 `session` 更新 6 轴目标角并刷新 `0.3 s` 心跳<br/>• `stop`：退出调试会话并保持在 MIT 重力补偿模式 |
 | `calibrate_effector` | [`CalibrateEffector`](../piper_x_interfaces/srv/CalibrateEffector.srv) | `bool confirm_closed` | 要求 `confirm_closed=true`、待机模式、七轴全失能且反馈新鲜；经 CAN `0x159` 写入夹爪零点，等待 `0x476` ACK（上限 `1.0 s`）并在 `0.5 s` 内校验新鲜零位回读（`0..0.1 mm`） |
 
 ---

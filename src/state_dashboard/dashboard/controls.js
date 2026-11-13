@@ -34,15 +34,25 @@ window.PiperControls = (() => {
 
   function bind(card, index, context) {
     const root = card.querySelector(".configuration-controls");
-    let savedSession = "";
-    try { savedSession = sessionStorage.getItem(`piper_mit_session_${index}`) || ""; } catch (_) {}
+    let savedTracking = false;
+    try { savedTracking = sessionStorage.getItem(`piper_mit_tracking_${index}`) === "1"; } catch (_) {}
     const state = {
       root, index, context,
-      session: savedSession,
+      tracking: savedTracking,
       desired: [0, 0, 0, 0, 0, 0],
       sending: false, pending: false,
     };
     states.push(state);
+  }
+
+  function mitPacket(position) {
+    return {
+      position,
+      velocity: [0, 0, 0, 0, 0, 0],
+      kp: [-1, -1, -1, -1, -1, -1],
+      kd: [-1, -1, -1, -1, -1, -1],
+      torque: [0, 0, 0, 0, 0, 0],
+    };
   }
 
   function render(arm, index, online) {
@@ -51,20 +61,13 @@ window.PiperControls = (() => {
     const fresh = online && arm.control_fresh;
     const control = arm.control;
     const config = control?.configuration;
-    if (state.session && fresh && !control.debug_active && !state.pending && !state.sending) {
-      state.session = "";
-      try { sessionStorage.removeItem(`piper_mit_session_${index}`); } catch (_) {}
+    if (state.tracking && fresh && control.mode !== "mit" && !state.pending && !state.sending) {
+      state.tracking = false;
+      try { sessionStorage.removeItem(`piper_mit_tracking_${index}`); } catch (_) {}
     }
-    if (!state.session && !state.pending && !state.sending && fresh && control?.debug_active && control?.holding) {
-      state.sending = true;
-      request(state, "mit/stop", {session: "expired"})
-        .catch(() => {})
-        .finally(() => { state.sending = false; });
-    }
-    if (!state.session && fresh && control?.debug_active && Array.isArray(control.debug_target) && control.debug_target.length === 6) {
-      state.desired = [...control.debug_target];
-    }
-    if (!state.session && !state.pending && arm.joints?.position_deg?.every(Number.isFinite)) {
+    if (!state.tracking && fresh && Array.isArray(control?.mit_target) && control.mit_target.length === 6) {
+      state.desired = [...control.mit_target];
+    } else if (!state.tracking && !state.pending && arm.joints?.position_deg?.every(Number.isFinite)) {
       state.desired = arm.joints.position_deg.map(v => v * Math.PI / 180);
     }
     if (!config) return;
@@ -93,15 +96,10 @@ window.PiperControls = (() => {
 
   setInterval(() => {
     for (const state of states) {
-      if (!state.session || state.sending) continue;
+      if (!state.tracking || state.sending) continue;
       state.sending = true;
-      request(state, "mit/target", {session: state.session, position: state.desired})
-        .catch(err => {
-          if (err && /expired|belongs to another/i.test(String(err.message))) {
-            state.session = "";
-            try { sessionStorage.removeItem(`piper_mit_session_${state.index}`); } catch (_) {}
-          }
-        })
+      request(state, "mit/command", mitPacket(state.desired))
+        .catch(() => {})
         .finally(() => { state.sending = false; });
     }
   }, 60);
@@ -109,14 +107,20 @@ window.PiperControls = (() => {
   async function startTracking(index) {
     const state = states[index];
     if (!state || state.pending) return null;
-    if (state.session) return state.desired;
+    if (state.tracking) return state.desired;
     state.pending = true;
     try {
-      const result = await request(state, "mit/start", {});
-      state.desired = [...result.position];
-      state.session = result.session;
-      try { sessionStorage.setItem(`piper_mit_session_${index}`, result.session); } catch (_) {}
-      return result.position;
+      const arm = state.context().snapshot?.arms[index];
+      if (arm?.joints?.position_deg?.every(Number.isFinite)) {
+        state.desired = arm.joints.position_deg.map(v => v * Math.PI / 180);
+      }
+      await request(state, "mit/command", mitPacket(state.desired));
+      if (arm?.control?.mode !== "mit") {
+        await request(state, "mode", {mode: "mit"});
+      }
+      state.tracking = true;
+      try { sessionStorage.setItem(`piper_mit_tracking_${index}`, "1"); } catch (_) {}
+      return [...state.desired];
     } finally {
       state.pending = false;
     }
@@ -125,19 +129,21 @@ window.PiperControls = (() => {
   async function stopTracking(index) {
     const state = states[index];
     if (!state) return;
-    const session = state.session || "force";
-    state.session = "";
-    try { sessionStorage.removeItem(`piper_mit_session_${index}`); } catch (_) {}
-    await request(state, "mit/stop", {session});
+    state.tracking = false;
+    try { sessionStorage.removeItem(`piper_mit_tracking_${index}`); } catch (_) {}
+    const arm = state.context().snapshot?.arms[index];
+    if (arm?.control?.mode === "mit") {
+      await request(state, "mode", {mode: "mit"});
+    }
   }
 
   function setDesiredJoint(index, joint, rad, push = false) {
     const state = states[index];
     if (!state) return;
     state.desired[joint] = rad;
-    if (push && state.session && !state.sending) {
+    if (push && state.tracking && !state.sending) {
       state.sending = true;
-      request(state, "mit/target", {session: state.session, position: state.desired})
+      request(state, "mit/command", mitPacket(state.desired))
         .catch(() => {})
         .finally(() => { state.sending = false; });
     }
@@ -145,16 +151,16 @@ window.PiperControls = (() => {
 
   function isMitTracking(index) {
     const state = states[index];
-    return Boolean(state?.session);
+    return Boolean(state?.tracking);
   }
 
   function trackedPosition(index) {
     const state = states[index];
     const arm = state?.context().snapshot?.arms[index];
-    if (Array.isArray(arm?.control?.debug_target) && arm.control.debug_target.length === 6) {
-      return arm.control.debug_target;
+    if (Array.isArray(arm?.control?.mit_target) && arm.control.mit_target.length === 6) {
+      return arm.control.mit_target;
     }
-    return state?.session ? state.desired : null;
+    return state?.tracking ? state.desired : null;
   }
 
   async function requestArm(index, action, body) {

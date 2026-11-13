@@ -227,6 +227,18 @@ def piper_fk(position, angle_offsets=None, tool_offset_z_m: float = 0.0) -> np.n
     """由六轴关节角计算 base_link -> 末端参考点（默认 link6，或沿 +Z 偏移到夹爪最高点）的 4x4 变换。"""
     if len(position) < 6:
         raise ValueError('需要 6 个关节角度')
+    q_eff = tuple(
+        float(position[i]) + (
+            float(angle_offsets[i]) if angle_offsets is not None and i < len(angle_offsets) else 0.0
+        )
+        for i in range(6)
+    )
+    try:
+        from piper_x_driver._core import fast_fk as _cpp_fast_fk
+        _, _, centers, rots = _cpp_fast_fk(q_eff, (0.0, 0.0, float(tool_offset_z_m)))
+        return rt_to_matrix(rots[5], centers[6])
+    except ImportError:
+        pass
     r00, r01, r02 = 1.0, 0.0, 0.0
     r10, r11, r12 = 0.0, 1.0, 0.0
     r20, r21, r22 = 0.0, 0.0, 1.0

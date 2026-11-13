@@ -24,7 +24,7 @@ from geometry_msgs.msg import PoseStamped
 from piper_x_interfaces.msg import (
     ArmStatus, CartesianCommand, GripperCommand, JointCommand, MitCommand,
 )
-from piper_x_interfaces.srv import CalibrateEffector, ConfigureArm, DebugMit, Enable, SetMode
+from piper_x_interfaces.srv import CalibrateEffector, ConfigureArm, Enable, SetMode
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -577,7 +577,6 @@ class DashboardNode(Node):
         self._command_pubs: dict[tuple[int, str], Any] = {}
         self.arm_controller = ArmController(
             [self.create_client(ConfigureArm, ns + '/configure_arm') for ns in namespaces],
-            [self.create_client(DebugMit, ns + '/debug_mit') for ns in namespaces],
             [self.create_client(CalibrateEffector, ns + '/calibrate_effector')
              for ns in namespaces],
             [self.create_client(SetMode, ns + '/set_mode') for ns in namespaces],
@@ -628,7 +627,7 @@ class DashboardNode(Node):
         try:
             payload = json.loads(message.data, parse_constant=_reject_nonfinite)
             if (not isinstance(payload, dict) or not isinstance(payload.get('configuration'), dict)
-                    or not isinstance(payload.get('debug_active'), bool)):
+                    or not isinstance(payload.get('mode'), str)):
                 raise ValueError('Invalid driver control state')
         except ValueError as error:
             self.store.reject_control(index, str(error))
@@ -705,7 +704,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         arm_match = re.fullmatch(
             r'/api/arms/([1-4])/(enable|disable|configure|calibrate|mode|joints|cartesian|gripper'
-            r'|mit/(?:start|target|stop|command))',
+            r'|mit/command)',
             self.path)
         teaching_match = re.fullmatch(r'/api/teaching/(start|stop|mode)', self.path)
         if arm_match is None and teaching_match is None:

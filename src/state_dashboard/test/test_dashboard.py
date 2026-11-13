@@ -147,7 +147,7 @@ def test_telemetry_store_freshness_frequency_and_concurrency():
     arm0 = store.snapshot()['arms'][0]
     assert arm0['connection'] == 'live' and arm0['streams']['joints']['hz'] == 1.5
 
-    store.update_control(0, {'debug_active': False, 'last_error': 'err1'})
+    store.update_control(0, {'mode': 'mit', 'last_error': 'err1'})
     now[0] = 2.3
     assert store.snapshot()['arms'][0]['control_fresh']
     now[0] = 2.300001

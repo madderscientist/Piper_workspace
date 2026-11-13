@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'web'), glob('web/*')),
+        (os.path.join('share', package_name, 'agent_web'), glob('agent_web/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -26,6 +27,8 @@ setup(
             'web = insert.web:web_main',
             'dashboard = insert.web:web_main',
             'insert = insert.web:web_main',
+            'agent_web = insert.agent_flow.server:agent_web_main',
+            'agent = insert.agent_flow.server:agent_web_main',
         ],
     },
 )

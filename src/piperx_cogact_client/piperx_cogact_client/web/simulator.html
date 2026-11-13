@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PiPER-X · URDF 仿真</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/simulator.css">
+</head>
+<body class="simulator">
+  <header class="sim-topbar">
+    <h1>PiPER-X <span>URDF 仿真</span></h1>
+    <fieldset class="sim-source" aria-label="姿态来源">
+      <label><input type="radio" name="source" value="live" checked>实测姿态</label>
+      <label><input type="radio" name="source" value="batch">批次回放</label>
+    </fieldset>
+    <span class="badge">只读仿真</span>
+  </header>
+  <main id="scene" class="sim-stage" aria-label="双臂三维模型">
+    <div class="sim-overlay">
+      <span class="sim-arm sim-left">左臂</span><span class="sim-arm sim-right">右臂</span>
+      <span id="sim-status" role="status">正在加载 URDF 与 mesh...</span>
+    </div>
+  </main>
+  <footer class="sim-footer">
+    <div class="sim-toolbar">
+      <button id="sim-load" class="btn-primary sim-request" title="请求预览" aria-label="请求预览"><i data-lucide="refresh-cw"></i><span id="sim-request-label">请求预览</span></button>
+      <button id="sim-stop" class="btn-danger icon-button" title="停止预览" aria-label="停止预览"><i data-lucide="square"></i></button>
+      <button id="sim-reset" class="btn-secondary icon-button" title="回到批次起点" aria-label="回到批次起点"><i data-lucide="rotate-ccw"></i></button>
+      <button id="sim-prev" class="btn-secondary icon-button" title="模拟上一步" aria-label="模拟上一步"><i data-lucide="skip-back"></i></button>
+      <button id="sim-play" class="btn-primary icon-button" title="播放" aria-label="播放"><i id="play-icon" data-lucide="play"></i><i id="pause-icon" data-lucide="pause" hidden></i></button>
+      <button id="sim-next" class="btn-secondary icon-button" title="模拟下一步" aria-label="模拟下一步"><i data-lucide="skip-forward"></i></button>
+      <label class="sim-speed">速度<select id="sim-speed"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select></label>
+      <label class="toggle"><input id="sim-path" type="checkbox" checked>TCP 轨迹</label>
+      <span id="sim-batch" class="muted"></span>
+      <div class="sim-view-tools">
+        <button id="sim-fit" class="btn-secondary icon-button" title="适配视图" aria-label="适配视图"><i data-lucide="focus"></i></button>
+        <button id="sim-fullscreen" class="btn-secondary icon-button" title="全屏" aria-label="全屏"><i data-lucide="maximize"></i></button>
+      </div>
+    </div>
+    <div class="sim-timeline">
+      <output id="sim-progress">0 / 0</output>
+      <input id="sim-timeline" type="range" min="0" max="0" value="0" step="1" aria-label="模拟步数">
+      <output id="sim-time">0.00 s</output>
+    </div>
+  </footer>
+  <script type="module" src="/simulator.bundle.js"></script>
+</body>
+</html>

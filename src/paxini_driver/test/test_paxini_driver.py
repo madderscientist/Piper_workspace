@@ -1,16 +1,19 @@
-"""Focused protocol and ROS node tests for paxini_driver."""
+"""Focused calibration math and end-to-end C++ driver + Python calibrator tests."""
 
 from __future__ import annotations
 
 import json
 import os
+import pty
+import select
+import signal
 import struct
+import subprocess
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from typing import List, Optional, Tuple
 
+from ament_index_python.packages import get_package_prefix
 import numpy as np
 import pytest
 import rclpy
@@ -23,207 +26,25 @@ from paxini_driver.calibration import (
     tool_gravity_wrench,
 )
 from paxini_driver.calibrator import PoseCalibrator
-from paxini_driver.configuration import (
-    resolve_sensor_configs,
-    save_sensor_calibration_to_yaml,
-)
-from paxini_driver.node import PaxiniDriverNode
-from paxini_driver.protocol import (
-    CMD_CALIBRATE,
-    CMD_GET_VERSION,
-    CMD_READ_ONCE,
-    CMD_SET_FREQ,
-    CMD_SET_ID,
-    CMD_SET_PORT_PARAMS,
-    CMD_START_AUTO,
-    CMD_STOP_AUTO,
-    CanFrameParser,
-    ProtocolEvent,
-    SerialFrameParser,
-    WrenchSample,
-    build_can_command,
-    build_can_set_protocol,
-    build_serial_frame,
-    freq_to_code,
-)
-from paxini_driver.transport import SensorTransport, SerialSensorTransport
-from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
-from rclpy.parameter import Parameter
+from paxini_driver.configuration import resolve_sensor_configs
+from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import JointState
 
 from piper_x_interfaces.msg import ArmStatus, MitCommand
 
 
-def test_serial_protocol_matches_manual_examples():
-    assert build_serial_frame(CMD_SET_ID, 0x01) == bytes.fromhex("AA 55 7F 01 01 AE")
-    assert build_serial_frame(CMD_SET_FREQ, freq_to_code(4)) == bytes.fromhex(
-        "AA 55 7F 02 01 91"
-    )
-    assert build_serial_frame(CMD_SET_FREQ, freq_to_code(100)) == bytes.fromhex(
-        "AA 55 7F 02 19 D9"
-    )
-    assert build_serial_frame(CMD_START_AUTO) == bytes.fromhex("AA 55 7F 03 04 9F")
-    assert build_serial_frame(CMD_STOP_AUTO) == bytes.fromhex("AA 55 7F 04 00 E8")
-    assert build_serial_frame(CMD_READ_ONCE) == bytes.fromhex("AA 55 7F 05 01 FA")
-    assert build_serial_frame(CMD_GET_VERSION) == bytes.fromhex("AA 55 7F 07 01 D0")
-    assert build_serial_frame(CMD_CALIBRATE) == bytes.fromhex("AA 55 7F 10 01 EC")
-
-    parser = SerialFrameParser(device_id=0x7F)
-    stream = (
-        b"\x00\xaa\x55\x7f\x03\xff"  # corrupted / false header
-        + bytes.fromhex("AA 55 7F 07 00 76 30 2E 31 2E 31 00 5B")
-        + bytes.fromhex(
-            "AA 55 7F 03 31 0C 0B BD 5C 76 38 BD FC 35 A2 3C "
-            "6E E8 B7 BA E6 9C 24 39 36 C8 9F B9 43"
-        )
-        + bytes.fromhex("AA 55 7F 10 00 00 00 00 00 00 00 00 E2")
-    )
-    events = parser.feed(stream[:15]) + parser.feed(stream[15:])
-    assert len(events) == 3
-    assert events[0].version == "v0.1.1"
-    assert events[1].wrench is not None
-    assert events[1].wrench.fx == pytest.approx(-0.03394717, abs=1e-6)
-    assert events[1].wrench.fy == pytest.approx(-0.04503475, abs=1e-6)
-    assert events[1].wrench.fz == pytest.approx(0.01980113, abs=1e-6)
-    assert events[2].ack_cmd == CMD_CALIBRATE
+def _crc8(data: bytes) -> int:
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (((crc << 1) ^ 0x07) & 0xFF) if (crc & 0x80) else ((crc << 1) & 0xFF)
+    return crc
 
 
-def test_serial_wait_receives_delayed_frame():
-    read_fd, write_fd = os.pipe()
-    ready = threading.Event()
-    frame = bytes.fromhex(
-        "AA 55 7F 03 31 0C 0B BD 5C 76 38 BD FC 35 A2 3C "
-        "6E E8 B7 BA E6 9C 24 39 36 C8 9F B9 43"
-    )
-
-    class PipeSerial:
-        is_open = True
-
-        def fileno(self):
-            return read_fd
-
-        @property
-        def in_waiting(self):
-            return len(frame) if ready.is_set() else 0
-
-        def read(self, count):
-            ready.clear()
-            return os.read(read_fd, count)
-
-        def close(self):
-            self.is_open = False
-            os.close(read_fd)
-
-    transport = SerialSensorTransport(serial_factory=lambda *_: PipeSerial())
-
-    def delayed_frame():
-        time.sleep(0.01)
-        ready.set()
-        os.write(write_fd, frame)
-
-    writer = threading.Thread(target=delayed_frame)
-    transport.open()
-    writer.start()
-    try:
-        events = transport.poll_events(timeout=0.25)
-        assert len(events) == 1 and events[0].wrench is not None
-        assert events[0].wrench.as_tuple() == WrenchSample.from_bytes(frame[4:-1]).as_tuple()
-    finally:
-        writer.join()
-        transport.close()
-        os.close(write_fd)
-
-
-def test_can_and_canfd_protocol_matches_manual():
-    assert build_can_command(CMD_SET_ID, 0x01) == (
-        0x27F,
-        bytes.fromhex("01 01 00 00 00 00 00 00"),
-    )
-    assert build_can_command(CMD_SET_FREQ, freq_to_code(4)) == (
-        0x27F,
-        bytes.fromhex("02 01 00 00 00 00 00 00"),
-    )
-    assert build_can_command(CMD_START_AUTO) == (
-        0x27F,
-        bytes.fromhex("03 00 00 00 00 00 00 00"),
-    )
-    assert build_can_command(CMD_STOP_AUTO) == (
-        0x27F,
-        bytes.fromhex("04 00 00 00 00 00 00 00"),
-    )
-    assert build_can_command(CMD_READ_ONCE) == (
-        0x27F,
-        bytes.fromhex("05 00 00 00 00 00 00 00"),
-    )
-    assert build_can_command(CMD_GET_VERSION) == (
-        0x27F,
-        bytes.fromhex("07 00 00 00 00 00 00 00"),
-    )
-    assert build_can_command(CMD_CALIBRATE) == (
-        0x27F,
-        bytes.fromhex("10 01 00 00 00 00 00 00"),
-    )
-    assert build_can_set_protocol(True) == (
-        0x27F,
-        bytes.fromhex("11 01 00 01 03 01 00 00"),
-    )
-    assert build_can_set_protocol(False) == (
-        0x27F,
-        bytes.fromhex("11 00 00 01 03 00 00 00"),
-    )
-
-    parser = CanFrameParser(device_id=0x7F)
-    ver_ev = parser.push(0x1FF, bytes.fromhex("00 07 76 30 2E 31 2E 31"))
-    assert ver_ev is not None and ver_ev.version == "v0.1.1"
-
-    mode_ev = parser.push(0x1FF, bytes.fromhex("00 11 00 00 00 00 00 00"))
-    assert (
-        mode_ev is not None
-        and mode_ev.ack_cmd == CMD_SET_PORT_PARAMS
-        and mode_ev.status == 0
-    )
-
-    expected = (1.5, -2.25, 12.0, 0.15, -0.25, 0.05)
-    raw24 = struct.pack("<6f", *expected)
-    fd_ev = parser.push(0x2FF, raw24)
-    assert fd_ev is not None and fd_ev.wrench is not None
-    assert fd_ev.wrench.as_tuple() == pytest.approx(expected)
-
-    assert parser.push(0x2FF, raw24[0:8]) is None
-    assert parser.push(0x3FF, raw24[8:16]) is None
-    can_ev = parser.push(0x4FF, raw24[16:24])
-    assert can_ev is not None and can_ev.wrench is not None
-    assert can_ev.wrench.as_tuple() == pytest.approx(expected)
-
-
-class _FakeTransport(SensorTransport):
-    interface_name = "usb"
-
-    def __init__(self) -> None:
-        self.available = False
-        self._open = False
-        self.commands: List[Tuple[int, Optional[int]]] = []
-        self.events: List[ProtocolEvent] = []
-
-    @property
-    def is_open(self) -> bool:
-        return self._open
-
-    def open(self) -> None:
-        if not self.available:
-            raise OSError("No such device /dev/ttyUSB0")
-        self._open = True
-
-    def close(self) -> None:
-        self._open = False
-
-    def poll_events(self, timeout: float = 0.002) -> List[ProtocolEvent]:
-        out = list(self.events)
-        self.events.clear()
-        return out
-
-    def send_command(self, cmd: int, arg: Optional[int] = None) -> None:
-        self.commands.append((cmd, arg))
+def _serial_wrench_frame(values) -> bytes:
+    body = bytes([0xAA, 0x55, 0x7F, 0x03]) + struct.pack("<6f", *values)
+    return body + bytes([_crc8(body)])
 
 
 def test_wrench_stability_requires_full_window_and_detects_fluctuation():
@@ -233,7 +54,6 @@ def test_wrench_stability_requires_full_window_and_detects_fluctuation():
     assert not window.is_stable(0.4)
     window.update([0.0005] * 6, 0.8)
     assert window.is_stable(0.8)
-    # One fluctuating wrench channel invalidates stability until a new stationary window exists.
     q = [0.0] * 6
     q[3] = 0.01
     window.update(q, 0.9)
@@ -242,7 +62,7 @@ def test_wrench_stability_requires_full_window_and_detects_fluctuation():
     assert not window.is_stable(1.4)
     window.update(q, 1.8)
     assert window.is_stable(1.8)
-    assert not window.is_stable(2.7)  # Old feedback cannot prove current stability.
+    assert not window.is_stable(2.7)
 
 
 def test_real_arm3_calibration_matches_independent_sdk_pose():
@@ -266,123 +86,7 @@ def test_real_arm3_calibration_matches_independent_sdk_pose():
     assert result.torque_rms_nm < 0.015
 
 
-def test_ros_driver_raw_compensation_and_reload(tmp_path, monkeypatch):
-    cfg_path = tmp_path / "px6d.yaml"
-    cfg_path.write_text(
-        yaml.safe_dump({"sensors": {"arm_3": {"namespace": "/paxini_test/arm_3"}}})
-    )
-    configs = resolve_sensor_configs()
-    assert [c["arm_id"] for c in configs] == ["arm_3", "arm_4"]
-    assert resolve_sensor_configs("右手")[0]["arm_id"] == "arm_4"
-    rclpy.init()
-    transport = _FakeTransport()
-    node = PaxiniDriverNode(
-        namespace="/paxini_test/arm_3",
-        transport=transport,
-        start_worker=False,
-        parameter_overrides=[
-            Parameter("arm_id", value="arm_3"),
-            Parameter("config_file", value=str(cfg_path)),
-            Parameter("reconnect_sec", value=0.01),
-            Parameter("frequency_hz", value=200),
-        ],
-    )
-    received, raw_received = [], []
-    logs = {"info": [], "warning": []}
-    logger = SimpleNamespace(info=logs["info"].append, warning=logs["warning"].append)
-    monkeypatch.setattr(node, "get_logger", lambda: logger)
-    node.create_subscription(WrenchStamped, "wrench_stamped", received.append, 10)
-    node.create_subscription(
-        WrenchStamped, "wrench_raw_stamped", raw_received.append, 10
-    )
-    executor = SingleThreadedExecutor()
-    executor.add_node(node)
-    try:
-        malformed_joints = JointState()
-        malformed_joints.name = ["gripper"] + [f"joint{i}" for i in range(1, 7)]
-        malformed_joints.position = [0.0] * 6
-        node._on_joints(malformed_joints)
-        assert node.latest_joint_positions is None
-        assert node.status_dict()["frequency_hz"] == 200
-        assert node.status_dict()["poll_rate_hz"] == 1000.0
-        assert not node.status_dict()["connected"]
-        assert node.calibrate_hardware()[0] is False
-        transport.available = True
-        node._last_connect_attempt = 0.0
-        transport.events = [
-            ProtocolEvent(cmd=CMD_GET_VERSION, version="v1.0.3"),
-            ProtocolEvent(
-                cmd=CMD_START_AUTO, wrench=WrenchSample(10, -5, 20, 0.1, -0.2, 0.3)
-            ),
-        ]
-        assert node.step() == 2
-        deadline = time.monotonic() + 1
-        while (not received or not raw_received) and time.monotonic() < deadline:
-            executor.spin_once(timeout_sec=0.02)
-        assert raw_received[-1].wrench.force.z == 20
-        assert received[-1].wrench.force.z == 20
-        assert transport.commands[:3] == [
-            (CMD_GET_VERSION, None),
-            (CMD_START_AUTO, None),
-            (CMD_SET_FREQ, 200),
-        ]
-        save_sensor_calibration_to_yaml(
-            "arm_3", tare_offset=[10, -5, 20, 0.1, -0.2, 0.3], config_path=cfg_path
-        )
-        before_commands = list(transport.commands)
-        assert node.reload_config()[0]
-        assert (
-            transport.commands == before_commands
-        )  # Reload only applies data; no hardware commands.
-        transport.events = [
-            ProtocolEvent(
-                cmd=CMD_START_AUTO, wrench=WrenchSample(12, -5, 25, 0.1, -0.2, 0.3)
-            )
-        ]
-        node.step()
-        assert node.latest_raw is not None and node.latest_wrench is not None
-        assert node.latest_raw.as_tuple() == (12, -5, 25, 0.1, -0.2, 0.3)
-        assert node.latest_wrench.as_tuple() == pytest.approx((2, 0, 5, 0, 0, 0))
-        assert not hasattr(node, "mit_pub")
-        assert not hasattr(node, "auto_calibrate")
-        assert node.calibrate_hardware()[0]
-        assert logs["info"] == [] and logs["warning"] == []
-        last = node._last_wrench_time
-        node._check_stream_timeout(last + 0.5)
-        assert logs["warning"] == []
-        node._check_stream_timeout(last + 1.1)
-        node._check_stream_timeout(last + 2.0)
-        assert len(logs["warning"]) == 1 and "断流" in logs["warning"][0]
-        node._process_event(
-            ProtocolEvent(
-                cmd=CMD_START_AUTO, wrench=WrenchSample(12, -5, 25, 0.1, -0.2, 0.3)
-            ),
-            last + 2.1,
-        )
-        assert not node.status_dict()["stream_gap"]
-        node._handle_disconnect(OSError("test disconnect"))
-        node._handle_disconnect(OSError("test disconnect"))
-        assert len(logs["warning"]) == 2 and "通信中断" in logs["warning"][1]
-        transport.open()
-        node.connected = True
-        node.streaming = True
-        node._process_event(
-            ProtocolEvent(
-                cmd=CMD_START_AUTO, wrench=WrenchSample(12, -5, 25, 0.1, -0.2, 0.3)
-            ),
-            last + 2.2,
-        )
-        assert logs["info"] == []
-    finally:
-        node.destroy_node()
-        executor.shutdown()
-        rclpy.try_shutdown()
-    assert transport.commands[-1] == (CMD_STOP_AUTO, None)
-
-
 def test_exact_wrench_fit_uses_mean_gravity_and_reports_observability():
-    # Independent analytic inputs: means of two different gravity directions,
-    # rather than directions recomputed from a mean joint angle.
     g = np.array(
         [[0.5, 0.5, 0], [-0.5, 0.5, 0], [0, -0.5, 0.5], [0.5, 0, -0.5], [-0.5, 0, -0.5]]
     )
@@ -409,7 +113,7 @@ def test_exact_wrench_fit_uses_mean_gravity_and_reports_observability():
     assert not static.to_dict()["com_identifiable"]
 
 
-def test_independent_calibrator_samples_saves_returns_and_reloads(tmp_path):
+def test_independent_calibrator_with_cpp_driver_pty_reloads_and_compensates(tmp_path):
     cfg_path = tmp_path / "px6d.yaml"
     cfg_path.write_text(
         yaml.safe_dump(
@@ -441,25 +145,42 @@ def test_independent_calibrator_samples_saves_returns_and_reloads(tmp_path):
         (0, 0.8, -1.2, -0.8, -0.6, 0.7),
         (0.3, 1, -1.5, 0.5, -0.8, -1.1),
     ]
-    rclpy.init()
-    transport = _FakeTransport()
-    transport.available = True
-    driver = PaxiniDriverNode(
-        namespace="/paxini_test/arm_3",
-        transport=transport,
-        start_worker=False,
-        parameter_overrides=[
-            Parameter("arm_id", value="arm_3"),
-            Parameter("config_file", value=str(cfg_path)),
+
+    master_fd, slave_fd = pty.openpty()
+    slave_path = os.ttyname(slave_fd)
+    driver_bin = Path(get_package_prefix("paxini_driver")) / "lib" / "paxini_driver" / "driver"
+    driver_proc = subprocess.Popen(
+        [
+            str(driver_bin),
+            "--ros-args",
+            "-r",
+            "__ns:=/paxini_test/arm_3",
+            "-p",
+            "arm_id:=arm_3",
+            "-p",
+            f"config_file:={cfg_path}",
+            "-p",
+            "interface:=usb",
+            "-p",
+            f"serial_port:={slave_path}",
         ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+
+    rclpy.init()
     client = PoseCalibrator("arm_3", cfg_path)
     other = PoseCalibrator("arm_4", cfg_path)
     fake_arm = rclpy.create_node("fake_arm", namespace="/paxini_test/arm_3")
     q_pub = fake_arm.create_publisher(JointState, "joint_states_feedback", 10)
     status_pub = fake_arm.create_publisher(ArmStatus, "arm_status", 10)
+    compensated_msgs = []
+    fake_arm.create_subscription(
+        WrenchStamped, "wrench_stamped", compensated_msgs.append, 10
+    )
     initial = (0.2, 0.9, -1.3, 0.1, 0.2, 0.3)
     state = {"q": initial, "disturbed": False, "commands": []}
+    tx_from_driver = bytearray()
 
     def command_cb(cmd):
         state["q"] = tuple(cmd.position[:6])
@@ -468,6 +189,8 @@ def test_independent_calibrator_samples_saves_returns_and_reloads(tmp_path):
     fake_arm.create_subscription(MitCommand, "command/mit", command_cb, 10)
 
     def feedback():
+        while select.select([master_fd], [], [], 0.0)[0]:
+            tx_from_driver.extend(os.read(master_fd, 256))
         q = state["q"]
         js = JointState()
         js.name = [f"joint{i}" for i in range(1, 7)]
@@ -479,17 +202,15 @@ def test_independent_calibrator_samples_saves_returns_and_reloads(tmp_path):
         status.motor_enabled = [True] * 6
         status_pub.publish(status)
         g = tool_gravity_wrench(q, mass, com)
-        raw = WrenchSample(*(bias[i] + g[i] for i in range(6)))
+        raw = [bias[i] + g[i] for i in range(6)]
         if client._calib_collecting and not state["disturbed"]:
-            raw = WrenchSample(raw.fx + 100, raw.fy, raw.fz, raw.mx, raw.my, raw.mz)
+            raw[0] += 100.0
             state["disturbed"] = True
-        driver._process_event(
-            ProtocolEvent(cmd=CMD_START_AUTO, wrench=raw), time.monotonic()
-        )
+        os.write(master_fd, _serial_wrench_frame(raw))
 
     fake_arm.create_timer(0.005, feedback)
     executor = MultiThreadedExecutor(num_threads=4)
-    for node in (driver, client, other, fake_arm):
+    for node in (client, other, fake_arm):
         executor.add_node(node)
     thread = threading.Thread(target=executor.spin, daemon=True)
     try:
@@ -519,19 +240,45 @@ def test_independent_calibrator_samples_saves_returns_and_reloads(tmp_path):
         assert result["tare_offset"] == pytest.approx(bias, abs=0.03)
         assert result["tool_mass_kg"] == pytest.approx(mass, abs=0.005)
         assert result["tool_com_m"] == pytest.approx(com, abs=0.005)
-        assert driver.tare_offset == pytest.approx(result["tare_offset"], abs=1e-6)
-        assert driver.tool_mass_kg == pytest.approx(result["tool_mass_kg"], abs=1e-6)
+
+        time.sleep(0.05)
+        compensated_msgs.clear()
+        deadline = time.monotonic() + 1.0
+        while len(compensated_msgs) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert compensated_msgs
+        latest_w = compensated_msgs[-1].wrench
+        assert (
+            latest_w.force.x,
+            latest_w.force.y,
+            latest_w.force.z,
+            latest_w.torque.x,
+            latest_w.torque.y,
+            latest_w.torque.z,
+        ) == pytest.approx((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), abs=0.05)
+
         saved = yaml.safe_load(cfg_path.read_text())
         samples = saved["sensors"]["arm_3"]["calibration_samples"]
         assert len(samples) == 4 and all(p["duration_sec"] >= 0.05 for p in samples)
         assert all(len(p["gravity_unit_mean"]) == 3 for p in samples)
         assert saved["sensors"]["arm_4"]["tare_offset"] == [1.0] * 6
+
+        driver_proc.send_signal(signal.SIGINT)
+        driver_proc.wait(timeout=3.0)
+        while select.select([master_fd], [], [], 0.02)[0]:
+            tx_from_driver.extend(os.read(master_fd, 256))
+        assert bytes.fromhex("AA 55 7F 04 00 E8") in bytes(tx_from_driver)
     finally:
         client._stop_event.set()
         other._stop_event.set()
         executor.shutdown()
         if thread.ident is not None:
             thread.join(timeout=2)
-        for node in (client, other, fake_arm, driver):
+        for node in (client, other, fake_arm):
             node.destroy_node()
         rclpy.try_shutdown()
+        if driver_proc.poll() is None:
+            driver_proc.kill()
+            driver_proc.wait(timeout=2)
+        os.close(slave_fd)
+        os.close(master_fd)

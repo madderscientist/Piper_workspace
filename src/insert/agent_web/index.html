@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PiPER-X · Agent 视觉引导全流程插孔控制台 (arm_4)</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-badge" id="can-badge">CAN4 · /arm_4</span>
+      <div class="brand-titles">
+        <h1>Agent 视觉引导全流程插孔控制台</h1>
+        <p class="subtitle" id="top-subtitle">三机同板标定 · gpt-6.1-sol (max) 双视角识别 · 孔前 0.5 cm 预对准 · 50 Hz 力控插入</p>
+      </div>
+    </div>
+    <div class="top-controls">
+      <span class="status-pill" id="conn-pill" data-state="offline">等待遥测</span>
+      <span class="status-pill" id="power-pill" data-state="unknown">使能未知</span>
+      <span class="status-pill" id="mode-pill" data-mode="drag">模式：Float</span>
+      <span class="status-pill" id="calib-pill" data-state="offline">外参：待标定</span>
+      <button type="button" class="btn btn-accent-sm" id="btn-top-float">🪶 保持 Float</button>
+      <button type="button" class="btn btn-outline" id="btn-top-hold">⏸ Hold 锁位</button>
+      <button type="button" class="btn btn-outline" id="btn-enable">使能机械臂</button>
+      <button type="button" class="btn btn-danger-outline" id="btn-disable">失能</button>
+    </div>
+  </header>
+
+  <div class="notice-bar" id="notice-bar">
+    <span class="notice-dot"></span>
+    <span id="notice-text">正在连接 ROS 2 与多相机服务…</span>
+  </div>
+
+  <main class="main-grid">
+    <!-- Left column: Sequential Pipeline -->
+    <section class="workflow-col">
+
+      <div class="workbench-row-top">
+      <!-- Prep Card: Float & Gripper -->
+      <article class="card step-card" id="prep-card">
+        <div class="card-header">
+          <span class="step-num prep-num">准备</span>
+          <h2>机械臂 Float（零力拖动）与夹爪控制</h2>
+          <span class="card-tag" id="gripper-state-badge">夹爪：待机</span>
+        </div>
+        <p class="card-desc">
+          默认保持 <strong>Float（零力拖动）</strong>；标定时空夹爪不挡腕部相机，识别前夹紧插头。
+        </p>
+
+        <div class="btn-row">
+          <button type="button" class="btn btn-accent" id="btn-enter-drag">🪶 保持 Float</button>
+          <button type="button" class="btn btn-primary" id="btn-grip-close">🤏 闭合夹紧</button>
+          <button type="button" class="btn btn-secondary" id="btn-grip-open">🖐 打开夹爪</button>
+          <button type="button" class="btn btn-ghost" id="btn-grip-release">🔓 释放</button>
+        </div>
+
+        <details class="compact-details" open>
+          <summary>夹爪开度 / 力度与插头末端作用点（默认 Z +19.5 cm）</summary>
+          <div class="params-grid-4" style="margin-top:6px;">
+            <div class="param-item">
+              <label>当前实测开度</label>
+              <strong class="metric-inline" id="grip-actual-mm">— mm</strong>
+            </div>
+            <div class="param-item">
+              <label for="input-open-mm">打开开度 (mm)</label>
+              <input type="number" id="input-open-mm" min="0" max="100" step="1" value="50.0">
+            </div>
+            <div class="param-item">
+              <label for="input-close-mm">闭合开度 (mm)</label>
+              <input type="number" id="input-close-mm" min="0" max="100" step="0.5" value="0.0">
+            </div>
+            <div class="param-item">
+              <label for="input-grip-effort">夹持力度 <span id="grip-effort-val">2.00</span></label>
+              <input type="range" id="input-grip-effort" class="effort-slider" min="0.0" max="2.0" step="0.05" value="2.0">
+            </div>
+          </div>
+          <div class="params-grid-4" style="margin-top:6px;">
+            <div class="param-item">
+              <label for="input-tip-x-cm">作用点 X (cm)</label>
+              <input type="number" id="input-tip-x-cm" step="0.1" value="0.0">
+            </div>
+            <div class="param-item">
+              <label for="input-tip-y-cm">作用点 Y (cm)</label>
+              <input type="number" id="input-tip-y-cm" step="0.1" value="0.0">
+            </div>
+            <div class="param-item">
+              <label for="input-tip-z-cm">作用点 Z (cm)</label>
+              <input type="number" id="input-tip-z-cm" step="0.1" value="19.5">
+            </div>
+            <div class="param-item param-action">
+              <button type="button" class="btn btn-secondary full-width" id="btn-apply-tip-offset">更新作用点</button>
+            </div>
+          </div>
+        </details>
+      </article>
+
+      <!-- Stage 1: Multi-Camera Position Calibration -->
+      <article class="card step-card" id="step-card-1">
+        <div class="card-header">
+          <span class="step-num">板块 1</span>
+          <h2>多相机位置标定（三机同看标定板）</h2>
+          <span class="card-tag" id="calib-card-badge">待标定</span>
+        </div>
+        <p class="card-desc">
+          Float 下使腕部相机 <code>camera_arm_4</code> 与 <code>head_1</code>、<code>head_2</code> 同看 ChArUco 标定板，自动解算并保存基座系外参（可多采联合精化）。
+        </p>
+
+        <div class="btn-row">
+          <button type="button" class="btn btn-primary btn-lg" id="btn-calib-capture">
+            📸 采集当前帧并标定相机位置
+          </button>
+          <button type="button" class="btn btn-secondary" id="btn-calib-clear">
+            ↺ 清空本次累计样本
+          </button>
+          <button type="button" class="btn btn-ghost" id="btn-calib-reset-file">
+            🗑 删除已存外参
+          </button>
+        </div>
+
+        <div class="calib-table-wrap">
+          <table class="compact-table">
+            <thead>
+              <tr>
+                <th>外部相机</th>
+                <th>状态 / 样本数</th>
+                <th>重投影 RMS</th>
+                <th>机械臂 B 系位置 XYZ (mm)</th>
+                <th>姿态 RPY (°)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>head_1</strong> <small class="muted">000314605112</small></td>
+                <td id="cal-h1-state">未标定</td>
+                <td id="cal-h1-rms">—</td>
+                <td id="cal-h1-xyz" class="mono">—</td>
+                <td id="cal-h1-rpy" class="mono">—</td>
+              </tr>
+              <tr>
+                <td><strong>head_2</strong> <small class="muted">000456614112</small></td>
+                <td id="cal-h2-state">未标定</td>
+                <td id="cal-h2-rms">—</td>
+                <td id="cal-h2-xyz" class="mono">—</td>
+                <td id="cal-h2-rpy" class="mono">—</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="thumb-strip hidden" id="calib-thumbs">
+          <div class="thumb-card">
+            <img id="img-calib-wrist" alt="腕部标定角点图" class="zoomable">
+            <span id="cap-calib-wrist">wrist 角点预览</span>
+          </div>
+          <div class="thumb-card">
+            <img id="img-calib-h1" alt="head_1 标定角点图" class="zoomable">
+            <span id="cap-calib-h1">head_1 角点预览</span>
+          </div>
+          <div class="thumb-card">
+            <img id="img-calib-h2" alt="head_2 标定角点图" class="zoomable">
+            <span id="cap-calib-h2">head_2 角点预览</span>
+          </div>
+        </div>
+      </article>
+      </div>
+
+      <!-- Stage 2: Dual-Camera GPT-6.1-sol Perception -->
+      <article class="card step-card" id="step-card-2">
+        <div class="card-header">
+          <span class="step-num">板块 2</span>
+          <h2>双相机 Agent 视觉识别（单次调用 gpt-6.1-sol）</h2>
+          <span class="card-tag" id="agent-card-badge">等待识别</span>
+        </div>
+        <p class="card-desc">
+          让黑色夹爪捏着插头，拖到 <code>head_1</code> 与 <code>head_2</code> 都看得到插头末端与插孔的位置。单次调用返回纯数值像素点与对称角，自动换算为机械臂系全量数值并标记在图中。
+        </p>
+
+        <div class="prompt-split">
+          <div class="prompt-block">
+            <div class="prompt-label-row">
+              <label for="input-object-prompt">第一段 Prompt（指明交互物体）</label>
+              <button type="button" class="link-btn" id="btn-reset-prompts">恢复默认 Prompt</button>
+            </div>
+            <textarea id="input-object-prompt" rows="3">把黑色夹爪捏着的插头的末端，和对应插孔标记出来。</textarea>
+          </div>
+          <div class="prompt-block">
+            <div class="prompt-label-row">
+              <label for="input-output-prompt">第二段 Prompt（指定输出纯数值结构）</label>
+            </div>
+            <textarea id="input-output-prompt" rows="3"></textarea>
+          </div>
+        </div>
+
+        <div class="agent-action-bar">
+          <div class="effort-select-wrap">
+            <label for="select-reasoning-effort">推理档位</label>
+            <select id="select-reasoning-effort">
+              <option value="max" selected>max（最深推理）</option>
+              <option value="xhigh">xhigh</option>
+              <option value="high">high</option>
+              <option value="medium">medium（~30s）</option>
+              <option value="low">low（~20s）</option>
+            </select>
+          </div>
+          <button type="button" class="btn btn-primary btn-xl agent-run-btn" id="btn-agent-perceive">
+            🧠 单次调用 gpt-6.1-sol 识别双图
+          </button>
+          <button type="button" class="btn btn-danger-solid hidden" id="btn-agent-cancel">
+            ⏹ 取消请求
+          </button>
+        </div>
+
+        <div class="job-status-box hidden" id="job-status-box">
+          <span class="job-spinner" id="job-spinner"></span>
+          <span id="job-status-text">正在请求 gpt-6.1-sol…</span>
+        </div>
+
+        <div class="perception-box hidden" id="perception-box">
+          <div class="annot-toolbar">
+            <div class="annot-tabs" id="perc-view-tabs">
+              <button type="button" class="annot-tab active" data-view="gpt">🎯 GPT 输出全图标记（6 点坐标）</button>
+              <button type="button" class="annot-tab" data-view="crop">🔍 插头 / 插孔 双局部放大特写</button>
+              <button type="button" class="annot-tab" data-view="reproj" id="tab-view-reproj">📐 GPT + 三维重投影对比</button>
+            </div>
+            <span class="annot-hint">点击图片查看 1920×1080 高清大图</span>
+          </div>
+
+          <div class="annotated-pair" style="margin-top: 0; margin-bottom: 12px;">
+            <div class="annot-card">
+              <img id="img-agent-h1" alt="head_1 GPT 标记图" class="zoomable">
+              <span id="cap-agent-h1" class="mono">head_1 GPT 输出标记（点击放大）</span>
+            </div>
+            <div class="annot-card">
+              <img id="img-agent-h2" alt="head_2 GPT 标记图" class="zoomable">
+              <span id="cap-agent-h2" class="mono">head_2 GPT 输出标记（点击放大）</span>
+            </div>
+          </div>
+
+          <div class="perc-grid">
+            <div class="perc-item highlight">
+              <span>hole_entrance_mm (B 系)</span>
+              <strong id="perc-hole-xyz" class="mono">—</strong>
+              <small id="perc-hole-gap" class="mono">ray_gap_mm: —</small>
+            </div>
+            <div class="perc-item highlight">
+              <span>insert_axis_unit (B 系)</span>
+              <strong id="perc-hole-axis" class="mono">—</strong>
+              <small id="perc-axis-angles" class="mono">—</small>
+            </div>
+            <div class="perc-item">
+              <span>target_rpy_deg / twist_deg</span>
+              <strong id="perc-target-rpy" class="mono">—</strong>
+              <small id="perc-align-rot" class="mono">align_rotvec_deg: —</small>
+            </div>
+            <div class="perc-item">
+              <span>align_delta_mm (至孔前 0.5cm)</span>
+              <strong id="perc-align-dxyz" class="mono">—</strong>
+              <small id="perc-pre-xyz" class="mono">pre_insert_mm: —</small>
+            </div>
+            <div class="perc-item">
+              <div class="flex-between">
+                <span>plug_tip_vis_mm / plug_tip_fk_mm</span>
+                <button type="button" class="link-btn" id="btn-sync-inferred-offset" title="将视觉测得的插头末端位置写入夹爪作用点偏移">
+                  同步偏移
+                </button>
+              </div>
+              <strong id="perc-tip-compare" class="mono">—</strong>
+              <small id="perc-inferred-offset" class="mono">inferred_tip_offset_cm: —</small>
+            </div>
+          </div>
+
+          <div class="json-dual-grid">
+            <div class="json-panel">
+              <div class="json-panel-head">gpt-6.1-sol 原始返回数值 (JSON)</div>
+              <pre class="json-pre" id="perc-raw-json">—</pre>
+            </div>
+            <div class="json-panel">
+              <div class="json-panel-head">换算后机械臂 B 系全量数值 (JSON)</div>
+              <pre class="json-pre" id="perc-arm-json">—</pre>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <div class="workbench-row-bottom">
+      <!-- Stage 3: Preliminary Move to 0.5 cm in front of hole -->
+      <article class="card step-card" id="step-card-3">
+        <div class="card-header">
+          <span class="step-num">板块 3</span>
+          <h2>执行初步移动（孔前 0.5 cm 预对准）</h2>
+          <span class="card-tag" id="move-card-badge">待执行</span>
+        </div>
+        <p class="card-desc">
+          将插头旋转对齐孔轴与截面角，平滑移至孔口正前方 <code>0.5 cm</code> 悬停并写入孔内目标基准。
+        </p>
+
+        <div class="params-grid-3">
+          <div class="param-item">
+            <label for="input-standoff-cm">孔前预留距离 (cm)</label>
+            <input type="number" id="input-standoff-cm" step="0.1" min="0.0" max="15.0" value="0.5">
+          </div>
+          <div class="param-item">
+            <label for="input-insert-depth-cm">孔内插入深度 (cm)</label>
+            <input type="number" id="input-insert-depth-cm" step="0.2" min="0.3" max="10.0" value="2.0">
+          </div>
+          <div class="param-item">
+            <label for="input-move-dur">移动耗时 s (空=自动)</label>
+            <input type="number" id="input-move-dur" step="0.5" min="0.5" max="20.0" placeholder="自动平滑">
+          </div>
+        </div>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="chk-use-rel-delta">
+          <span>使用双目视觉“孔口 - 插头尖端”相对位移修正（抵消插头夹持长度误差）</span>
+        </label>
+
+        <div class="btn-row" style="margin-top: 10px;">
+          <button type="button" class="btn btn-primary btn-xl" id="btn-start-move">
+            🚀 移动插头末端至孔前方 0.5 cm
+          </button>
+          <button type="button" class="btn btn-secondary" id="btn-move-stop-hold">
+            ⏸ 立即停止 (Hold)
+          </button>
+          <button type="button" class="btn btn-warning" id="btn-move-stop-float">
+            🪶 停止并切 Float
+          </button>
+        </div>
+
+        <div class="progress-wrap">
+          <div class="progress-bar"><div class="progress-fill" id="move-progress-fill"></div></div>
+          <div class="progress-meta">
+            <span id="move-progress-text">等待移动指令</span>
+            <span id="move-dist-remain">距预插点：— mm</span>
+          </div>
+        </div>
+      </article>
+
+      <!-- Stage 4: Execute Insert Policy (Rule-based or Policy-based) -->
+      <article class="card step-card" id="step-card-4">
+        <div class="card-header">
+          <span class="step-num">板块 4</span>
+          <h2>执行插入策略（Rule-based / Policy-based）</h2>
+          <span class="card-tag" id="policy-state-badge">策略：待机</span>
+        </div>
+        <p class="card-desc">
+          选择 <strong>Rule-based</strong>（孔沿搜索 + 力控下压）或 <strong>Policy-based</strong>（50 Hz <code>actor.onnx</code>）闭环插入，启动自动力清零。
+        </p>
+
+        <div class="wrench-source-row">
+          <div class="param-item wrench-source-item">
+            <label for="select-wrench-source">力反馈来源 (Wrench Source)</label>
+            <select id="select-wrench-source">
+              <option value="paxini">力传感器 (paxini_driver · wrench_stamped)</option>
+              <option value="estimated">估计力 (MIT 关节阻抗估计 · end_wrench_stamped)</option>
+            </select>
+          </div>
+          <span class="card-tag" id="wrench-source-badge">力传感器：等待数据</span>
+        </div>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="chk-auto-stop-stationary">
+          <span>深入孔口 ≥ 5 mm 且末端位置基本不变（0.5 s 内波动 &lt; 0.5 mm）时自动停止并切 Hold</span>
+        </label>
+
+        <div class="policy-btn-row" style="margin-top: 10px;">
+          <button type="button" class="btn btn-primary btn-xl" id="btn-start-rule">
+            📐 Rule-based 规则插入
+          </button>
+          <button type="button" class="btn btn-success btn-xl" id="btn-start-policy">
+            ▶ Policy-based 策略插入 (ONNX)
+          </button>
+          <button type="button" class="btn btn-warning" id="btn-stop-drag">
+            ⏹ 停止并切回 Float
+          </button>
+          <button type="button" class="btn btn-secondary" id="btn-stop-hold">
+            ⏸ 停止并保持位置 (Hold)
+          </button>
+          <button type="button" class="btn btn-ghost" id="btn-tare-wrench">
+            ⚖ 力觉清零
+          </button>
+        </div>
+
+        <div class="policy-metrics-grid">
+          <div class="metric-card">
+            <span>策略步数 / 用时</span>
+            <strong id="policy-steps-time">0 步 · 0.0 s</strong>
+          </div>
+          <div class="metric-card">
+            <span>频率 / 推理与逆解耗时</span>
+            <strong id="policy-rate-latency">0.0 Hz · — ms</strong>
+          </div>
+          <div class="metric-card">
+            <span>越过孔口深入量 / 状态</span>
+            <strong id="policy-penetration">— mm · 等待执行</strong>
+          </div>
+          <div class="metric-card">
+            <span>动作增量 Δp / Δr</span>
+            <strong id="policy-last-action">—</strong>
+          </div>
+        </div>
+      </article>
+      </div>
+    </section>
+
+    <!-- Right column: 3 Live Camera Streams + Full System States -->
+    <section class="telemetry-col">
+
+      <!-- Three Live Camera Views -->
+      <article class="card cameras-card">
+        <div class="card-header">
+          <h2>三视角实时画面</h2>
+          <div class="cam-toolbar">
+            <button type="button" class="btn btn-xs btn-outline-dark" id="btn-toggle-wrist">暂停腕部流</button>
+          </div>
+        </div>
+
+        <div class="cam-grid">
+          <div class="cam-tile">
+            <div class="cam-tile-head">
+              <strong>head_1（外部视角 1）</strong>
+              <span class="cam-badge" id="badge-h1">1920×1080</span>
+            </div>
+            <img id="live-head-1" src="/api/stream/head_1" data-full="/api/frame/head_1" alt="head_1 实时画面" class="cam-feed zoomable">
+          </div>
+
+          <div class="cam-tile">
+            <div class="cam-tile-head">
+              <strong>head_2（外部视角 2）</strong>
+              <span class="cam-badge" id="badge-h2">1920×1080</span>
+            </div>
+            <img id="live-head-2" src="/api/stream/head_2" data-full="/api/frame/head_2" alt="head_2 实时画面" class="cam-feed zoomable">
+          </div>
+
+          <div class="cam-tile">
+            <div class="cam-tile-head">
+              <strong>camera_arm_4（腕部相机）</strong>
+              <span class="cam-badge" id="badge-wrist">RTSP 实时</span>
+            </div>
+            <img id="live-wrist" src="/api/stream/wrist" data-full="/api/frame/wrist" alt="camera_arm_4 实时画面" class="cam-feed zoomable">
+          </div>
+        </div>
+      </article>
+
+      <!-- Hole Frame H Live Visualizer -->
+      <article class="card">
+        <div class="card-header">
+          <h2>孔系 H 相对位姿</h2>
+          <span class="card-tag" id="tip-pose-b-tag">B 系尖端：—</span>
+        </div>
+
+        <div class="hole-vis-layout">
+          <div class="bullseye-wrap">
+            <svg id="xy-bullseye" viewBox="-40 -40 80 80" aria-label="孔口 XY 对准靶心图">
+              <defs>
+                <radialGradient id="bullseye-bg" cx="50%" cy="50%" r="50%">
+                  <stop offset="0%" stop-color="#1e293b"/>
+                  <stop offset="100%" stop-color="#0b1120"/>
+                </radialGradient>
+              </defs>
+              <circle cx="0" cy="0" r="38" fill="url(#bullseye-bg)"></circle>
+              <circle cx="0" cy="0" r="35" class="ring-outer"></circle>
+              <circle cx="0" cy="0" r="20" class="ring-mid"></circle>
+              <circle cx="0" cy="0" r="5" class="ring-inner"></circle>
+              <line x1="-38" y1="0" x2="38" y2="0" class="axis-line"></line>
+              <line x1="0" y1="-38" x2="0" y2="38" class="axis-line"></line>
+              <line id="xy-tip-x" x1="0" y1="-38" x2="0" y2="38" class="tip-guide"></line>
+              <line id="xy-tip-y" x1="-38" y1="0" x2="38" y2="0" class="tip-guide"></line>
+              <circle id="xy-tip-dot" cx="0" cy="0" r="3.2" class="tip-dot"></circle>
+            </svg>
+            <div class="vis-caption">孔系 XY 偏差 (±35 mm)</div>
+          </div>
+
+          <div class="z-bar-wrap">
+            <div class="z-bar-track">
+              <div class="z-scale-label top">+40</div>
+              <div class="z-scale-label zero">0</div>
+              <div class="z-zero-line" title="孔内目标深度 Z=0"></div>
+              <div class="z-tip-marker" id="z-tip-marker"></div>
+            </div>
+            <div class="vis-caption">孔系 Z 高度</div>
+          </div>
+
+          <div class="hole-readouts">
+            <div class="readout-box">
+              <span>孔系 ΔX</span>
+              <strong id="rel-dx">— mm</strong>
+            </div>
+            <div class="readout-box">
+              <span>孔系 ΔY</span>
+              <strong id="rel-dy">— mm</strong>
+            </div>
+            <div class="readout-box highlight">
+              <span>孔系 ΔZ (距目标底)</span>
+              <strong id="rel-dz">— mm</strong>
+            </div>
+            <div class="readout-box">
+              <span>横向偏差 |ΔXY|</span>
+              <strong id="rel-xy-norm">— mm</strong>
+            </div>
+            <div class="readout-box">
+              <span>空间总距离 |Δp|</span>
+              <strong id="rel-total-norm">— mm</strong>
+            </div>
+            <div class="readout-box">
+              <span>姿态角偏差 Δθ</span>
+              <strong id="rel-angle-err">— °</strong>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <!-- Tip Wrench -->
+      <article class="card">
+        <div class="card-header">
+          <h2 id="wrench-card-title">插头末端六维力旋量</h2>
+          <span class="card-tag" id="wrench-summary-tag">|F| — N · |M| — N·m</span>
+        </div>
+        <div class="wrench-grid">
+          <div class="wrench-item"><span>Fx (N)</span><strong id="w-fx">0.00</strong><div class="w-meter"><i id="wb-fx"></i></div></div>
+          <div class="wrench-item"><span>Fy (N)</span><strong id="w-fy">0.00</strong><div class="w-meter"><i id="wb-fy"></i></div></div>
+          <div class="wrench-item"><span>Fz (N)</span><strong id="w-fz">0.00</strong><div class="w-meter"><i id="wb-fz"></i></div></div>
+          <div class="wrench-item"><span>Mx (N·m)</span><strong id="w-mx">0.000</strong><div class="w-meter"><i id="wb-mx"></i></div></div>
+          <div class="wrench-item"><span>My (N·m)</span><strong id="w-my">0.000</strong><div class="w-meter"><i id="wb-my"></i></div></div>
+          <div class="wrench-item"><span>Mz (N·m)</span><strong id="w-mz">0.000</strong><div class="w-meter"><i id="wb-mz"></i></div></div>
+        </div>
+      </article>
+
+      <!-- Joint Telemetry & Logs -->
+      <article class="card">
+        <div class="card-header">
+          <h2>六轴实时状态与运行日志</h2>
+          <span class="card-tag" id="driver-rates-tag">驱动频率：—</span>
+        </div>
+        <table class="joint-table">
+          <thead>
+            <tr>
+              <th>关节</th>
+              <th>实测角 (°)</th>
+              <th>角速度 (rad/s)</th>
+              <th>力矩 (N·m)</th>
+              <th>控制目标 (°)</th>
+            </tr>
+          </thead>
+          <tbody id="joint-tbody">
+            <tr><td>J1</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J2</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J3</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J4</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J5</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+            <tr><td>J6</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+          </tbody>
+        </table>
+
+        <details class="params-details" open>
+          <summary>运行事件日志</summary>
+          <div class="log-list" id="log-list"></div>
+        </details>
+      </article>
+
+    </section>
+  </main>
+
+  <!-- Image Lightbox Modal -->
+  <div class="lightbox hidden" id="lightbox">
+    <img id="lightbox-img" alt="放大预览">
+    <span class="lightbox-hint">点击任意处关闭原图预览</span>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

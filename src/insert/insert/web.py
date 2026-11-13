@@ -15,27 +15,29 @@ from ament_index_python.packages import PackageNotFoundError, get_package_share_
 from geometry_msgs.msg import WrenchStamped
 import numpy as np
 from piper_x_driver.configuration import ArmConfig, default_config_path, FleetConfig
-from piper_x_driver.controller import MIT_POSITION_LIMIT, RateMeter
-from piper_x_driver.gravity import ArmGravityModel, max_critical_kd
+from piper_x_driver.protocol import MIT_POSITION_LIMIT, RateMeter
+from piper_x_driver.gravity import ArmGravityModel
 from piper_x_interfaces.msg import ArmStatus, GripperCommand, MitCommand
 from piper_x_interfaces.srv import Enable, SetMode
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.utilities import remove_ros_args
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
+from std_srvs.srv import SetBool
 
 from .policy import (
     DEFAULT_TIP_LENGTH_M,
+    PAXINI_SENSOR_OFFSET_M,
     POLICY_PERIOD_S,
-    SERVO_LAG_TAU_S,
     GoalPose,
     InsertAnythingPolicy,
     PolicyStepResult,
+    RuleBasedInsertPolicy,
     WrenchFilter,
-    equivalent_filter_tau,
     flange_wrench_to_tip_wrench,
     forward_tip_pose,
     normalize_tip_offset,
@@ -45,10 +47,22 @@ from .policy import (
 )
 
 JOINT_NAMES = tuple(f'joint{i}' for i in range(1, 7)) + ('gripper',)
-DEFAULT_POLICY_KP = (45.0, 45.0, 45.0, 10.0, 6.0, 4.0)
+AUTO_MIT_GAINS = (-1.0,) * 6
+MAX_START_DISTANCE_M = 0.08
 DEFAULT_OPEN_WIDTH_M = 0.050
 DEFAULT_CLOSE_WIDTH_M = 0.000
 DEFAULT_GRIP_EFFORT = 2.0
+MAX_GRIP_EFFORT = 2.0
+WRENCH_SOURCES = ('estimated', 'paxini')
+
+
+def normalize_wrench_source(value: Any) -> str:
+    raw = str(value or 'estimated').strip().lower()
+    if raw in ('paxini', 'paxini_driver', 'sensor', 'px6d'):
+        return 'paxini'
+    if raw in ('estimated', 'estimate', 'driver', 'mit'):
+        return 'estimated'
+    raise ValueError(f"Unsupported wrench_source '{value}'; expected 'estimated' or 'paxini'")
 
 
 def web_root_path() -> Path:
@@ -91,9 +105,15 @@ class InsertDashboardNode(Node):
         namespace_override: str = '', onnx_path: str | Path | None = None,
         tip_length_m: float = DEFAULT_TIP_LENGTH_M,
         tip_offset_m: Sequence[float] | None = None,
+        wrench_source: str = 'paxini',
     ) -> None:
         super().__init__('insert_dashboard')
         self.lock = threading.RLock()
+        self._wrench_lock = threading.RLock()
+        self._sensor_callbacks = MutuallyExclusiveCallbackGroup()
+        self._feedback_callbacks = MutuallyExclusiveCallbackGroup()
+        self._policy_lock = threading.Lock()
+        self._policy_generation = 0
         try:
             self.fleet: FleetConfig | None = FleetConfig(Path(config_file) if config_file else default_config_path())
         except Exception:
@@ -105,19 +125,25 @@ class InsertDashboardNode(Node):
         self.can_label = 'can4' if arm_selector.lower() == 'can4' else self.can_port
         self.tip_offset_m = normalize_tip_offset(tip_offset_m, tip_length_m)
         self.tip_length_m = float(self.tip_offset_m[2])
+        self.wrench_source = normalize_wrench_source(wrench_source)
         self.policy = InsertAnythingPolicy(onnx_path=onnx_path)
-        self.wrench_filter = WrenchFilter()
-        self.policy_kp: tuple[float, ...] = DEFAULT_POLICY_KP
-        self.policy_kd: tuple[float, ...] = max_critical_kd(self.policy_kp, 'gripper', self.gravity_model)
+        self.rule_policy = RuleBasedInsertPolicy()
+        self.active_controller = 'onnx'
+        self.estimated_wrench_filter = WrenchFilter()
+        self.paxini_wrench_filter = WrenchFilter(sensor_offset_m=PAXINI_SENSOR_OFFSET_M)
+        self._wrench_filters = {
+            'estimated': self.estimated_wrench_filter,
+            'paxini': self.paxini_wrench_filter,
+        }
 
         self.mode = 'idle'
         self.goal: GoalPose | None = None
         self.hold_joints: tuple[float, ...] | None = None
         self.last_cmd_joints: tuple[float, ...] | None = None
-        self.servo_expected_joints: np.ndarray | None = None
-        self._servo_updated_at: float | None = None
+        self.last_cmd_velocity: tuple[float, ...] = (0.0,) * 6
         self.last_step_result: PolicyStepResult | None = None
         self.policy_started_at: float | None = None
+        self._last_policy_tick_at: float | None = None
         self.reached_goal = False
         self.reached_goal_steps = 0
         self.last_error = ''
@@ -140,6 +166,15 @@ class InsertDashboardNode(Node):
         self.control_state: dict[str, Any] = {}
         self.control_received_at: float | None = None
         self.wrench_received_at: float | None = None
+        self._latest_estimated_wrench = None
+        self._latest_estimated_interval = None
+        self._estimated_filter_stamp = None
+        self._paxini_last_stamp: tuple[float, tuple[int, int] | None] | None = None
+        self.paxini_received_at: float | None = None
+        self.paxini_status: dict[str, Any] = {}
+        self.paxini_status_received_at: float | None = None
+        self.estimated_wrench_rate = RateMeter()
+        self.paxini_wrench_rate = RateMeter()
         self.policy_rate = RateMeter()
         self.history: deque[dict[str, Any]] = deque(maxlen=120)
         self.logs: deque[dict[str, Any]] = deque(maxlen=50)
@@ -150,20 +185,38 @@ class InsertDashboardNode(Node):
             depth=5,
         )
         ns = self.arm_namespace
-        self.create_subscription(JointState, f'{ns}/joint_states_feedback', self._on_joints, qos)
-        self.create_subscription(WrenchStamped, f'{ns}/end_wrench_stamped', self._on_wrench, qos)
-        self.create_subscription(ArmStatus, f'{ns}/arm_status', self._on_status, qos)
-        self.create_subscription(String, f'{ns}/control_state', self._on_control_state, qos)
+        self.create_subscription(JointState, f'{ns}/joint_states_feedback', self._on_joints, qos,
+                                 callback_group=self._feedback_callbacks)
+        self.create_subscription(WrenchStamped, f'{ns}/end_wrench_stamped', self._on_wrench, qos,
+                                 callback_group=self._feedback_callbacks)
+        self.create_subscription(WrenchStamped, f'{ns}/wrench_stamped', self._on_paxini_wrench, qos,
+                                 callback_group=self._sensor_callbacks)
+        self.create_subscription(String, f'{ns}/sensor_status', self._on_paxini_status, 10,
+                                 callback_group=self._sensor_callbacks)
+        self.create_subscription(ArmStatus, f'{ns}/arm_status', self._on_status, qos,
+                                 callback_group=self._feedback_callbacks)
+        self.create_subscription(String, f'{ns}/control_state', self._on_control_state, qos,
+                                 callback_group=self._feedback_callbacks)
 
         self.mit_pub = self.create_publisher(MitCommand, f'{ns}/command/mit', 10)
         self.gripper_pub = self.create_publisher(GripperCommand, f'{ns}/command/gripper', 10)
-        self.enable_client = self.create_client(Enable, f'{ns}/enable_srv')
-        self.mode_client = self.create_client(SetMode, f'{ns}/set_mode')
+        self.enable_client = self.create_client(Enable, f'{ns}/enable_srv', callback_group=self._feedback_callbacks)
+        self.mode_client = self.create_client(SetMode, f'{ns}/set_mode', callback_group=self._feedback_callbacks)
+        self.estimation_client = self.create_client(SetBool, f'{ns}/set_wrench_estimation', callback_group=self._feedback_callbacks)
+        self._estimation_future = None
+        self._estimation_requested = None
 
         self._mit_msg = MitCommand()
         self._grip_msg = GripperCommand()
         self._timer = self.create_timer(POLICY_PERIOD_S, self._tick)
+        self._command_timer = self.create_timer(
+            POLICY_PERIOD_S, self._publish_last_target, callback_group=self._feedback_callbacks,
+        )
         self._log('INFO', f'已绑定 {self.can_label} ({self.arm_namespace})，加载模型 {self.policy.onnx_path.name}')
+
+    @property
+    def wrench_filter(self) -> WrenchFilter:
+        return self._wrench_filters[self.wrench_source]
 
     def _log(self, level: str, text: str) -> None:
         with self.lock:
@@ -193,44 +246,87 @@ class InsertDashboardNode(Node):
             self.joint_efforts = eff6 if all(math.isfinite(v) for v in eff6) else (0.0,) * 6
             self.joints_received_at = now
 
-    def _update_servo_expected(self, now: float) -> None:
+    @staticmethod
+    def _ros_timestamp(msg: WrenchStamped) -> tuple[int, int] | None:
+        stamp = msg.header.stamp
+        sec, nsec = int(stamp.sec), int(stamp.nanosec)
+        return (sec, nsec) if (sec > 0 or nsec > 0) else None
+
+    @staticmethod
+    def _interval_dt(
+        now: float,
+        ros_stamp: tuple[int, int] | None,
+        previous: tuple[float, tuple[int, int] | None] | None,
+    ) -> float | None:
+        if previous is None:
+            return None
+        prev_now, prev_ros = previous
+        if ros_stamp is not None and prev_ros is not None:
+            return float(ros_stamp[0] - prev_ros[0]) + float(ros_stamp[1] - prev_ros[1]) * 1e-9
+        return now - prev_now
+
+    def _ingest_flange_wrench(
+        self, raw_flange_wrench: Sequence[float], now: float, sample_timestamp: tuple[int, int] | None = None,
+        sample_dt: float | None = None,
+    ) -> None:
         if self.joint_positions is None:
             return
-        if self.servo_expected_joints is None or self.last_cmd_joints is None or self.mode != 'policy':
-            self.servo_expected_joints = np.array(self.joint_positions[:6], dtype=np.float64)
-            self._servo_updated_at = now
-            return
-        dt = 0.0 if self._servo_updated_at is None else max(0.0, now - self._servo_updated_at)
-        self._servo_updated_at = now
-        if 0.0 < dt <= 0.5:
-            alpha = 1.0 - math.exp(-dt / SERVO_LAG_TAU_S)
-            self.servo_expected_joints += alpha * (np.asarray(self.last_cmd_joints[:6]) - self.servo_expected_joints)
+        tip_w_g = flange_wrench_to_tip_wrench(
+            raw_flange_wrench,
+            self.joint_positions,
+            tip_offset_m=self.tip_offset_m,
+            gravity_model=self.gravity_model,
+        )
+        self.estimated_wrench_filter.update(tip_w_g, dt=sample_dt, already_at_tip=True)
+        self._estimated_filter_stamp = now
 
-    def _ingest_flange_wrench(self, raw_flange_wrench: Sequence[float], now: float) -> None:
-        if self.joint_positions is not None:
-            self._update_servo_expected(now)
-            in_policy = self.mode == 'policy'
-            tip_w_g = flange_wrench_to_tip_wrench(
-                raw_flange_wrench,
-                self.joint_positions,
-                tip_offset_m=self.tip_offset_m,
-                gravity_model=self.gravity_model,
-                q_cmd=self.last_cmd_joints if in_policy else None,
-                q_servo=self.servo_expected_joints if in_policy else None,
-                kp=self.policy_kp if in_policy else None,
-            )
-            self.wrench_filter.update(tip_w_g, timestamp=now, already_at_tip=True)
-        else:
-            self.wrench_filter.update(raw_flange_wrench, timestamp=now, already_at_tip=False)
+    def _receive_estimated_wrench(self, raw, now: float, ros_stamp: tuple[int, int] | None = None):
+        previous = self._latest_estimated_wrench
+        self._latest_estimated_interval = self._interval_dt(
+            now, ros_stamp, None if previous is None else (previous[1], previous[2]),
+        )
+        self._latest_estimated_wrench = (raw, now, ros_stamp)
+        if self.wrench_source == 'estimated':
+            self._ingest_flange_wrench(raw, now, ros_stamp, self._latest_estimated_interval)
 
     def _on_wrench(self, msg: WrenchStamped) -> None:
         now = time.monotonic()
         f, t = msg.wrench.force, msg.wrench.torque
         raw = (float(f.x), float(f.y), float(f.z), float(t.x), float(t.y), float(t.z))
         if all(math.isfinite(v) for v in raw):
-            with self.lock:
-                self._ingest_flange_wrench(raw, now)
+            with self.lock, self._wrench_lock:
+                self._receive_estimated_wrench(raw, now, self._ros_timestamp(msg))
                 self.wrench_received_at = now
+                self.estimated_wrench_rate.mark(now)
+
+    def _on_paxini_wrench(self, msg: WrenchStamped) -> None:
+        now = time.monotonic()
+        f, t = msg.wrench.force, msg.wrench.torque
+        raw = (float(f.x), float(f.y), float(f.z), float(t.x), float(t.y), float(t.z))
+        if all(math.isfinite(v) for v in raw):
+            # paxini_driver publishes in link6/sensor frame (+x=-gripper_x, +y=-gripper_y, +z=+gripper_z)
+            gripper_wrench = (-raw[0], -raw[1], raw[2], -raw[3], -raw[4], raw[5])
+            ros_stamp = self._ros_timestamp(msg)
+            with self._wrench_lock:
+                sample_dt = self._interval_dt(now, ros_stamp, self._paxini_last_stamp)
+                self._paxini_last_stamp = (now, ros_stamp)
+                self.paxini_wrench_filter.update(
+                    gripper_wrench, dt=sample_dt, already_at_tip=False,
+                )
+                self.paxini_received_at = now
+                self.paxini_wrench_rate.mark(now)
+
+    def _on_paxini_status(self, msg: String) -> None:
+        now = time.monotonic()
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        with self._wrench_lock:
+            self.paxini_status = data
+            self.paxini_status_received_at = now
 
     def _on_status(self, msg: ArmStatus) -> None:
         with self.lock:
@@ -248,29 +344,43 @@ class InsertDashboardNode(Node):
         with self.lock:
             self.control_state = data
             self.control_received_at = now
+            reported = data.get('wrench_estimation_enabled')
+            if isinstance(reported, bool) and reported != (self.wrench_source == 'estimated'):
+                if self._estimation_future is None:
+                    self._estimation_requested = None
+            if reported is False:
+                with self._wrench_lock:
+                    self.wrench_received_at = None
+                    self.estimated_wrench_rate.clear()
+                    self.estimated_wrench_filter.reset()
+                    self._latest_estimated_wrench = None
+                    self._latest_estimated_interval = None
+                    self._estimated_filter_stamp = None
             if self.wrench_received_at is None or (now - self.wrench_received_at) > 0.05:
                 ew = data.get('end_wrench')
-                if isinstance(ew, list) and len(ew) == 6 and all(
+                if data.get('wrench_estimate_available', True) and isinstance(ew, list) and len(ew) == 6 and all(
                     isinstance(x, (int, float)) and math.isfinite(float(x)) for x in ew
                 ):
-                    self._ingest_flange_wrench([float(x) for x in ew], now)
+                    with self._wrench_lock:
+                        self._receive_estimated_wrench(tuple(float(x) for x in ew), now, None)
 
     def _publish_mit(
-        self, position: Sequence[float], kp: Sequence[float], kd: Sequence[float],
+        self, position: Sequence[float], kp: Sequence[float] = AUTO_MIT_GAINS,
+        kd: Sequence[float] = AUTO_MIT_GAINS,
         velocity: Sequence[float] = (0.0,) * 6, torque: Sequence[float] = (0.0,) * 6,
     ) -> None:
         msg = self._mit_msg
-        msg.position = [max(-MIT_POSITION_LIMIT, min(MIT_POSITION_LIMIT, float(v))) for v in position[:6]]
-        msg.velocity = [float(v) for v in velocity[:6]]
-        msg.kp = [float(v) for v in kp[:6]]
-        msg.kd = [float(v) for v in kd[:6]]
-        msg.torque = [float(v) for v in torque[:6]]
+        msg.position[:] = [max(-MIT_POSITION_LIMIT, min(MIT_POSITION_LIMIT, float(v))) for v in position[:6]]
+        msg.velocity[:] = velocity[:6]
+        msg.kp[:] = kp[:6]
+        msg.kd[:] = kd[:6]
+        msg.torque[:] = torque[:6]
         self.mit_pub.publish(msg)
 
     def _publish_gripper(self, width_m: float, effort: float) -> None:
         msg = self._grip_msg
         msg.width = max(0.0, min(0.1, float(width_m)))
-        msg.effort = max(0.0, min(5.0, float(effort)))
+        msg.effort = max(0.0, min(MAX_GRIP_EFFORT, float(effort)))
         self.gripper_pub.publish(msg)
 
     def _ensure_driver_mit_mode(self, q_preload: Sequence[float]) -> None:
@@ -279,18 +389,44 @@ class InsertDashboardNode(Node):
             if self.mode_client.service_is_ready():
                 self.mode_client.call_async(SetMode.Request(mode='mit'))
 
+    def _sync_estimation_source(self) -> None:
+        if self._estimation_future is not None:
+            if not self._estimation_future.done():
+                return
+            try:
+                response = self._estimation_future.result()
+                if response is None or not response.success:
+                    self._log('ERROR', f'末端力估计开关失败：{getattr(response, "message", "no response")}')
+            except Exception as exc:
+                self._log('ERROR', f'末端力估计开关失败：{exc}')
+            self._estimation_future = None
+        wanted = self.wrench_source == 'estimated'
+        if wanted != self._estimation_requested and self.estimation_client.service_is_ready():
+            self._estimation_requested = wanted
+            self._estimation_future = self.estimation_client.call_async(SetBool.Request(data=wanted))
+
+    def _publish_last_target(self) -> None:
+        """Keep the last completed target alive while the next policy step computes."""
+        with self.lock:
+            self._sync_estimation_source()
+            if self.gripper_state in ('open', 'closed') and self.gripper_cmd_effort > 0.0:
+                self._publish_gripper(self.gripper_cmd_width_m, self.gripper_cmd_effort)
+            if self.mode == 'policy' and self.last_cmd_joints is not None:
+                self._ensure_driver_mit_mode(self.last_cmd_joints)
+                self._publish_mit(
+                    self.last_cmd_joints, AUTO_MIT_GAINS, AUTO_MIT_GAINS, self.last_cmd_velocity,
+                )
+
     def _tick(self) -> None:
         now = time.monotonic()
         with self.lock:
-            if self.gripper_state in ('open', 'closed') and self.gripper_cmd_effort > 0.0:
-                self._publish_gripper(self.gripper_cmd_width_m, self.gripper_cmd_effort)
             if self.joint_positions is None:
                 return
             q_meas = self.joint_positions
 
             if self.mode == 'drag':
                 self.last_cmd_joints = q_meas
-                self.servo_expected_joints = np.array(q_meas[:6], dtype=np.float64)
+                self.last_cmd_velocity = (0.0,) * 6
                 self._ensure_driver_mit_mode(q_meas)
                 self._publish_mit(q_meas, (0.0,) * 6, (0.0,) * 6)
                 return
@@ -298,54 +434,87 @@ class InsertDashboardNode(Node):
             if self.mode == 'hold':
                 target_q = self.hold_joints if self.hold_joints is not None else q_meas
                 self.last_cmd_joints = target_q
+                self.last_cmd_velocity = (0.0,) * 6
                 self._ensure_driver_mit_mode(target_q)
-                self._publish_mit(target_q, self.policy_kp, self.policy_kd)
+                self._publish_mit(target_q)
                 return
 
-            if self.mode == 'policy':
-                if self.goal is None:
-                    self.mode = 'drag'
-                    self.status_message = '未记录孔中目标位置，已退回零力拖动'
-                    return
-                try:
-                    self._ensure_driver_mit_mode(q_meas)
-                    wrench_t = self.wrench_filter.tip_wrench(tip_offset_m=self.tip_offset_m)
-                    step_res = self.policy.step(
-                        q_meas,
-                        self.goal,
-                        wrench_t,
-                        tip_offset_m=self.tip_offset_m,
-                        gravity_model=self.gravity_model,
-                    )
-                    self.last_cmd_joints = step_res.q_cmd
-                    self._publish_mit(step_res.q_cmd, self.policy_kp, self.policy_kd)
-                    self.policy_rate.mark(now)
-                    self.last_step_result = step_res
-                    self.last_error = ''
+            if self.mode != 'policy':
+                return
+            if self.goal is None:
+                self.mode = 'drag'
+                self.status_message = '未记录孔中目标位置，已退回零力拖动'
+                return
+            with self._wrench_lock:
+                wrench_t = self.wrench_filter.tip_wrench(tip_offset_m=self.tip_offset_m)
+            goal, offset = self.goal, tuple(self.tip_offset_m)
+            controller_kind = self.active_controller
+            generation = self._policy_generation
+            prev_tick = self._last_policy_tick_at
+            self._last_policy_tick_at = now
+            step_dt = (
+                POLICY_PERIOD_S
+                if prev_tick is None
+                else min(0.06, max(0.005, now - prev_tick))
+            )
+            # Serialize GRU state/reset, but allow feedback and HTTP state access
+            # during inference/IK. Release the model lock before committing state.
+            self._policy_lock.acquire()
 
-                    xy_err_m = float(np.linalg.norm(step_res.p_ht[:2]))
-                    z_ht_m = float(step_res.p_ht[2])
-                    rot_err_deg = math.degrees(float(np.linalg.norm(quat_rotvec(step_res.q_ht))))
-                    self.reached_goal_steps = (
-                        self.reached_goal_steps + 1 if (z_ht_m <= 0.0002 and xy_err_m <= 0.003) else 0
-                    )
-                    if self.reached_goal_steps >= 5:
-                        self.reached_goal = True
+        error = None
+        step_res = None
+        try:
+            if controller_kind == 'rule':
+                step_res = self.rule_policy.step(
+                    q_meas, goal, wrench_t, tip_offset_m=offset, gravity_model=self.gravity_model, dt=step_dt,
+                )
+            else:
+                step_res = self.policy.step(
+                    q_meas, goal, wrench_t, tip_offset_m=offset, gravity_model=self.gravity_model,
+                )
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            self._policy_lock.release()
 
-                    self.history.append({
-                        'step': step_res.step,
-                        'p_ht_mm': [float(v * 1000.0) for v in step_res.p_ht],
-                        'xy_err_mm': xy_err_m * 1000.0,
-                        'rot_err_deg': rot_err_deg,
-                        'force_norm_n': float(np.linalg.norm(step_res.wrench_t[:3])),
-                        'moment_norm_nm': float(np.linalg.norm(step_res.wrench_t[3:6])),
-                    })
-                except Exception as exc:
-                    self.last_error = str(exc)
-                    self.status_message = f'策略执行异常：{exc}'
-                    self._log('ERROR', self.status_message)
-                    self.hold_joints = q_meas
-                    self.mode = 'hold'
+        with self.lock:
+            if self.mode != 'policy' or generation != self._policy_generation:
+                return
+            if error is not None or step_res is None:
+                self.last_error = error or '策略执行异常'
+                self.status_message = f'策略执行异常：{self.last_error}'
+                self._log('ERROR', self.status_message)
+                self.hold_joints = q_meas
+                self.last_cmd_velocity = (0.0,) * 6
+                self.mode = 'hold'
+                return
+            self.last_cmd_joints = step_res.q_cmd
+            self.last_cmd_velocity = step_res.v_cmd
+            self._ensure_driver_mit_mode(step_res.q_cmd)
+            self._publish_mit(
+                step_res.q_cmd, AUTO_MIT_GAINS, AUTO_MIT_GAINS, step_res.v_cmd,
+            )
+            self.policy_rate.mark(now)
+            self.last_step_result = step_res
+            self.last_error = ''
+
+            xy_err_m = float(np.linalg.norm(step_res.p_ht[:2]))
+            z_ht_m = float(step_res.p_ht[2])
+            rot_err_deg = math.degrees(float(np.linalg.norm(quat_rotvec(step_res.q_ht))))
+            self.reached_goal_steps = (
+                self.reached_goal_steps + 1 if (z_ht_m <= 0.0002 and xy_err_m <= 0.003) else 0
+            )
+            if self.reached_goal_steps >= 5:
+                self.reached_goal = True
+
+            self.history.append({
+                'step': step_res.step,
+                'p_ht_mm': [float(v * 1000.0) for v in step_res.p_ht],
+                'xy_err_mm': xy_err_m * 1000.0,
+                'rot_err_deg': rot_err_deg,
+                'force_norm_n': float(np.linalg.norm(step_res.wrench_t[:3])),
+                'moment_norm_nm': float(np.linalg.norm(step_res.wrench_t[3:6])),
+            })
 
     def set_power(self, enable: bool, timeout: float = 3.5) -> dict[str, Any]:
         if not self.enable_client.service_is_ready():
@@ -362,6 +531,8 @@ class InsertDashboardNode(Node):
         if not future.done():
             raise RuntimeError('等待驱动使能响应超时')
         resp = future.result()
+        if resp is None:
+            raise RuntimeError('驱动使能响应为空')
         if not resp.enable_response:
             raise RuntimeError(resp.message or '使能/失能请求未通过')
         with self.lock:
@@ -377,21 +548,25 @@ class InsertDashboardNode(Node):
         act = action.strip().lower()
         with self.lock:
             if effort is not None:
-                self.gripper_effort = max(0.0, min(5.0, float(effort)))
+                self.gripper_effort = max(0.0, min(MAX_GRIP_EFFORT, float(effort)))
             if act == 'open':
                 if width_m is not None:
                     self.gripper_open_width_m = max(0.0, min(0.1, float(width_m)))
                 self.gripper_cmd_width_m = self.gripper_open_width_m
-                self.gripper_cmd_effort = max(0.5, self.gripper_effort)
+                self.gripper_cmd_effort = self.gripper_effort
                 self.gripper_state = 'open'
-                label = f'已打开夹爪（目标开度 {self.gripper_cmd_width_m * 1000:.1f} mm，力度 {self.gripper_cmd_effort:.1f}）'
+                label = f'已打开夹爪（目标开度 {self.gripper_cmd_width_m * 1000:.1f} mm，力度 {self.gripper_cmd_effort:.2f}）'
             elif act == 'close':
                 if width_m is not None:
                     self.gripper_close_width_m = max(0.0, min(0.1, float(width_m)))
                 self.gripper_cmd_width_m = self.gripper_close_width_m
-                self.gripper_cmd_effort = max(0.5, self.gripper_effort)
+                self.gripper_cmd_effort = self.gripper_effort
                 self.gripper_state = 'closed'
-                label = f'已闭合夹爪夹紧插头（目标开度 {self.gripper_cmd_width_m * 1000:.1f} mm，持续保持力度 {self.gripper_cmd_effort:.1f}）'
+                label = f'已闭合夹爪夹紧插头（目标开度 {self.gripper_cmd_width_m * 1000:.1f} mm，持续保持力度 {self.gripper_cmd_effort:.2f}）'
+            elif act == 'effort':
+                if self.gripper_state in ('open', 'closed'):
+                    self.gripper_cmd_effort = self.gripper_effort
+                label = f'已实时更新夹持力度：{self.gripper_effort:.2f} / {MAX_GRIP_EFFORT:.1f}'
             elif act == 'release':
                 self.gripper_cmd_width_m = float(
                     self.gripper_width_m if self.gripper_width_m is not None else self.gripper_cmd_width_m
@@ -401,13 +576,14 @@ class InsertDashboardNode(Node):
                 label = '已释放夹爪（零力）'
             elif act == 'set':
                 w = self.gripper_cmd_width_m if width_m is None else max(0.0, min(0.1, float(width_m)))
-                eff = self.gripper_effort if effort is None else max(0.0, min(5.0, float(effort)))
+                eff = self.gripper_effort if effort is None else max(0.0, min(MAX_GRIP_EFFORT, float(effort)))
                 self.gripper_cmd_width_m, self.gripper_cmd_effort = w, eff
                 self.gripper_state = 'released' if eff <= 0.0 else ('closed' if w <= 0.015 else 'open')
-                label = f'已设置夹爪（开度 {w * 1000:.1f} mm，力度 {eff:.1f}）'
+                label = f'已设置夹爪（开度 {w * 1000:.1f} mm，力度 {eff:.2f}）'
             else:
                 raise ValueError(f'未知的夹爪操作: {action}')
-            self._publish_gripper(self.gripper_cmd_width_m, self.gripper_cmd_effort)
+            if act != 'effort' or self.gripper_state in ('open', 'closed'):
+                self._publish_gripper(self.gripper_cmd_width_m, self.gripper_cmd_effort)
             self.status_message = label
         self._log('INFO', label)
         return {
@@ -440,16 +616,24 @@ class InsertDashboardNode(Node):
             tip_offset_m=self.tip_offset_m,
         )
 
-    def record_goal(self, tip_length_m: float | None = None, *, tip_offset_m: Sequence[float] | None = None) -> dict[str, Any]:
+    def record_goal(
+        self, tip_length_m: float | None = None, *, tip_offset_m: Sequence[float] | None = None,
+        joints: Sequence[float] | None = None,
+    ) -> dict[str, Any]:
         with self.lock:
-            if self.joint_positions is None:
+            if joints is None and self.joint_positions is None:
                 raise RuntimeError(f'尚未收到 {self.arm_namespace}/joint_states_feedback 关节反馈，无法记录位置')
             if tip_offset_m is not None or tip_length_m is not None:
                 self.tip_offset_m = normalize_tip_offset(tip_offset_m, tip_length_m)
                 self.tip_length_m = float(self.tip_offset_m[2])
-            q_now = tuple(float(v) for v in self.joint_positions[:6])
+            src_joints = joints if joints is not None else self.joint_positions
+            assert src_joints is not None
+            q_now = tuple(float(v) for v in src_joints[:6])
             self.goal = self._build_goal(q_now, time.time())
-            self.policy.reset()
+            with self._policy_lock:
+                self.policy.reset()
+                self.rule_policy.reset()
+            self._policy_generation += 1
             self.last_step_result = None
             self.reached_goal = False
             self.reached_goal_steps = 0
@@ -477,37 +661,75 @@ class InsertDashboardNode(Node):
         return {'ok': True, 'message': self.status_message}
 
     def tare_wrench(self) -> dict[str, Any]:
-        with self.lock:
+        with self.lock, self._wrench_lock:
             bias = self.wrench_filter.tare()
+            tip_w = self.wrench_filter.tip_wrench(tip_offset_m=self.tip_offset_m)
+            src_label = '力传感器 (paxini_driver)' if self.wrench_source == 'paxini' else '估计力 (MIT)'
             self.status_message = (
-                f'已完成末端力觉标零：bias = [{bias[0]:.2f}, {bias[1]:.2f}, {bias[2]:.2f}] N, '
+                f'已完成{src_label}当前位置重力消除/清零：bias = [{bias[0]:.2f}, {bias[1]:.2f}, {bias[2]:.2f}] N, '
                 f'[{bias[3]:.3f}, {bias[4]:.3f}, {bias[5]:.3f}] N·m'
             )
         self._log('INFO', self.status_message)
-        return {'ok': True, 'bias': [float(v) for v in bias], 'message': self.status_message}
+        return {
+            'ok': True,
+            'wrench_source': self.wrench_source,
+            'bias': [float(v) for v in bias],
+            'tip_wrench': [float(v) for v in tip_w],
+            'message': self.status_message,
+        }
 
-    def start_policy(self) -> dict[str, Any]:
+    def start_policy(self, controller: str = 'onnx') -> dict[str, Any]:
+        ctrl_kind = 'rule' if str(controller or 'onnx').strip().lower() in ('rule', 'rule_based', 'direct') else 'onnx'
         with self.lock:
             if self.goal is None:
                 raise RuntimeError('请先将插头放入孔中并点击“记录孔中位置”')
             if self.joint_positions is None:
                 raise RuntimeError(f'尚未收到 {self.arm_namespace}/joint_states_feedback 关节反馈')
+            p_bt, q_bt = forward_tip_pose(
+                self.joint_positions, tip_offset_m=self.tip_offset_m, gravity_model=self.gravity_model,
+            )
+            p_ht, _ = relative_pose_in_hole(p_bt, q_bt, self.goal.p_bh, self.goal.q_bh)
+            distance_m = float(np.linalg.norm(p_ht))
+            if ctrl_kind != 'rule' and distance_m > MAX_START_DISTANCE_M:
+                msg = (
+                    f'距离孔目标位置过远（{distance_m * 100.0:.2f} cm > {MAX_START_DISTANCE_M * 100.0:.0f} cm），'
+                    '拒绝执行策略；请先拖动插头靠近孔口 8 cm 以内'
+                )
+                self.last_error = msg
+                self.status_message = msg
+                self._log('ERROR', msg)
+                raise RuntimeError(msg)
             self.policy.reset()
-            self.wrench_filter.reset()
+            self.rule_policy.reset()
+            self.active_controller = ctrl_kind
             self.last_cmd_joints = tuple(float(v) for v in self.joint_positions[:6])
-            self.servo_expected_joints = np.array(self.joint_positions[:6], dtype=np.float64)
-            self._servo_updated_at = time.monotonic()
+            self.last_cmd_velocity = (0.0,) * 6
+            # Temporary gravity elimination at the current pose so the wrench reading starts at 0.
+            with self._wrench_lock:
+                bias = self.wrench_filter.tare()
             self.last_step_result = None
             self.policy_started_at = time.monotonic()
+            self._last_policy_tick_at = None
             self.reached_goal = False
             self.reached_goal_steps = 0
             self.last_error = ''
             self.history.clear()
             self._ensure_driver_mit_mode(self.joint_positions)
             self.mode = 'policy'
-            self.status_message = '正在执行 InsertAnything 插入策略（50 Hz 闭环控制中）'
+            src_label = 'paxini_driver 力传感器' if self.wrench_source == 'paxini' else '估计力'
+            ctrl_label = '规则直接插入（先水平+角度对准 → 垂直下压）' if ctrl_kind == 'rule' else 'InsertAnything ONNX 策略'
+            self.status_message = (
+                f'已完成当前位置重力消除（力示数归零，来源：{src_label}），正在执行 {ctrl_label}（50 Hz）'
+            )
         self._log('INFO', self.status_message)
-        return {'ok': True, 'mode': self.mode, 'message': self.status_message}
+        return {
+            'ok': True,
+            'mode': self.mode,
+            'controller': self.active_controller,
+            'wrench_source': self.wrench_source,
+            'bias': [float(v) for v in bias],
+            'message': self.status_message,
+        }
 
     def stop_policy(self, next_mode: str = 'drag') -> dict[str, Any]:
         target_mode = next_mode.strip().lower() if next_mode else 'drag'
@@ -520,6 +742,8 @@ class InsertDashboardNode(Node):
                 else None
             )
             self.mode = target_mode
+            self.last_cmd_velocity = (0.0,) * 6
+            self._policy_generation += 1
             label = {
                 'drag': '已停止策略并切回零力拖动模式',
                 'hold': '已停止策略并保持当前位置',
@@ -530,7 +754,19 @@ class InsertDashboardNode(Node):
         return {'ok': True, 'mode': self.mode, 'message': label}
 
     def update_parameters(self, body: dict[str, Any]) -> dict[str, Any]:
-        with self.lock:
+        with self.lock, self._wrench_lock:
+            if body.get('wrench_source') is not None:
+                source = normalize_wrench_source(body['wrench_source'])
+                if source != self.wrench_source and source == 'estimated' and self._latest_estimated_wrench:
+                    if self._latest_estimated_wrench[1] != self._estimated_filter_stamp:
+                        self.estimated_wrench_filter.reset()
+                        self._ingest_flange_wrench(
+                            *self._latest_estimated_wrench, sample_dt=self._latest_estimated_interval,
+                        )
+                self.wrench_source = source
+                self._sync_estimation_source()
+            self._policy_generation += 1
+
             new_offset: tuple[float, float, float] | None = None
             if body.get('tip_offset_m') is not None:
                 new_offset = normalize_tip_offset(body['tip_offset_m'])
@@ -551,41 +787,30 @@ class InsertDashboardNode(Node):
                 tau_val = float(body['filter_tau_s'])
                 if not math.isfinite(tau_val) or tau_val <= 0.0:
                     raise ValueError('filter_tau_s must be positive')
-                self.wrench_filter.tau = tau_val
+                for wf in self._wrench_filters.values():
+                    wf.tau = tau_val
             elif body.get('tau_1khz_s') is not None:
                 tau_1k = float(body['tau_1khz_s'])
-                self.wrench_filter.tau_1khz = tau_1k
-                self.wrench_filter.tau = equivalent_filter_tau(tau_1k)
-            if 'kp' in body:
-                kp_raw = body['kp']
-                if not isinstance(kp_raw, list) or len(kp_raw) != 6:
-                    raise ValueError('kp requires 6 values')
-                self.policy_kp = tuple(max(0.0, min(500.0, float(v))) for v in kp_raw)
-                if body.get('kd') is None:
-                    self.policy_kd = max_critical_kd(self.policy_kp, 'gripper', self.gravity_model)
-            if body.get('kd') is not None:
-                kd_raw = body['kd']
-                if not isinstance(kd_raw, list) or len(kd_raw) != 6:
-                    raise ValueError('kd requires 6 values')
-                auto_kd = max_critical_kd(self.policy_kp, 'gripper', self.gravity_model)
-                self.policy_kd = tuple(
-                    auto if float(v) < 0.0 else max(0.0, min(100.0, float(v)))
-                    for v, auto in zip(kd_raw, auto_kd)
-                )
+                if not math.isfinite(tau_1k) or tau_1k <= 0.0:
+                    raise ValueError('tau_1khz_s must be positive')
+                for wf in self._wrench_filters.values():
+                    wf.tau = tau_1k
             ox_cm, oy_cm, oz_cm = (v * 100.0 for v in self.tip_offset_m)
+            src_label = '力传感器 (paxini_driver)' if self.wrench_source == 'paxini' else '估计力 (MIT)'
             self.status_message = (
-                f'参数已更新：作用点偏移 = [{ox_cm:+.1f}, {oy_cm:+.1f}, {oz_cm:+.1f}] cm, '
-                f'200Hz 等效滤波 τ = {self.wrench_filter.tau * 1000:.2f} ms'
+                f'参数已更新：力来源 = {src_label}, 作用点偏移 = [{ox_cm:+.1f}, {oy_cm:+.1f}, {oz_cm:+.1f}] cm, '
+                f'按反馈采样间隔自动计算滤波系数，τ = {self.wrench_filter.tau * 1000:.2f} ms'
             )
         self._log('INFO', self.status_message)
         return {
             'ok': True,
+            'wrench_source': self.wrench_source,
             'tip_length_m': self.tip_length_m,
             'tip_offset_m': list(self.tip_offset_m),
             'tip_offset_cm': [v * 100.0 for v in self.tip_offset_m],
             'filter_tau_s': self.wrench_filter.tau,
-            'kp': list(self.policy_kp),
-            'kd': list(self.policy_kd),
+            'filter_alpha': self.wrench_filter.alpha,
+            'filter_sample_hz': 1.0 / self.wrench_filter.sample_dt if self.wrench_filter.sample_dt else None,
             'message': self.status_message,
         }
 
@@ -629,8 +854,35 @@ class InsertDashboardNode(Node):
                         'angle_error_deg': math.degrees(float(np.linalg.norm(rot_vec))),
                     }
 
-            wrench_t = self.wrench_filter.tip_wrench(tip_offset_m=self.tip_offset_m)
-            wrench_s = self.wrench_filter.filtered_s
+            with self._wrench_lock:
+                wrench_t = self.wrench_filter.tip_wrench(tip_offset_m=self.tip_offset_m)
+                wrench_s = self.wrench_filter.filtered_s
+                est_fresh = self.wrench_received_at is not None and (now - self.wrench_received_at) <= 1.0
+                pax_fresh = self.paxini_received_at is not None and (now - self.paxini_received_at) <= 1.0
+                pax_status_fresh = (
+                    self.paxini_status_received_at is not None and (now - self.paxini_status_received_at) <= 2.0
+                )
+                wrench_data = {
+                    'source': self.wrench_source,
+                    'available_sources': list(WRENCH_SOURCES),
+                    'estimated_fresh': est_fresh,
+                    'estimated_enabled': self.control_state.get('wrench_estimation_enabled'),
+                    'estimated_hz': round(self.estimated_wrench_rate.hz(now), 1),
+                    'paxini_fresh': pax_fresh,
+                    'paxini_hz': round(self.paxini_wrench_rate.hz(now), 1),
+                    'paxini_sensor_hz': self.paxini_status.get('rx_hz') if pax_status_fresh else None,
+                    'paxini_acquisition_mode': self.paxini_status.get('acquisition_mode') if pax_status_fresh else None,
+                    'paxini_connected': bool(self.paxini_status.get('connected')) if pax_status_fresh else pax_fresh,
+                    'sensor_s': [float(v) for v in wrench_s],
+                    'tip_t': [float(v) for v in wrench_t],
+                    'bias_s': [float(v) for v in self.wrench_filter.bias_s],
+                    'force_norm_n': float(np.linalg.norm(wrench_t[:3])),
+                    'moment_norm_nm': float(np.linalg.norm(wrench_t[3:6])),
+                    'filter_tau_ms': round(self.wrench_filter.tau * 1000.0, 2),
+                    'filter_tau_1khz_ms': round(self.wrench_filter.tau_1khz * 1000.0, 2),
+                    'filter_alpha': self.wrench_filter.alpha,
+                    'filter_sample_hz': 1.0 / self.wrench_filter.sample_dt if self.wrench_filter.sample_dt else None,
+                }
             sr = self.last_step_result
             step_dict = None if sr is None else {
                 'step': int(sr.step),
@@ -640,6 +892,7 @@ class InsertDashboardNode(Node):
                 'p_target_h_mm': [float(v * 1000.0) for v in sr.p_target_h],
                 'q_cmd_deg': [math.degrees(float(v)) for v in sr.q_cmd],
                 'latency_ms': float(sr.latency_ms),
+                'compute_ms': float(sr.compute_ms),
                 'task_fraction': float(sr.task_fraction),
             }
             elapsed_s = (
@@ -681,19 +934,14 @@ class InsertDashboardNode(Node):
                     'cmd_width_m': self.gripper_cmd_width_m,
                     'cmd_effort': self.gripper_cmd_effort,
                 },
-                'wrench': {
-                    'sensor_s': [float(v) for v in wrench_s],
-                    'tip_t': [float(v) for v in wrench_t],
-                    'bias_s': [float(v) for v in self.wrench_filter.bias_s],
-                    'force_norm_n': float(np.linalg.norm(wrench_t[:3])),
-                    'moment_norm_nm': float(np.linalg.norm(wrench_t[3:6])),
-                    'filter_tau_ms': round(self.wrench_filter.tau * 1000.0, 2),
-                    'filter_tau_1khz_ms': round(self.wrench_filter.tau_1khz * 1000.0, 2),
-                },
+                'wrench': wrench_data,
                 'policy': {
                     'mode': self.mode,
+                    'controller': self.active_controller,
+                    'rule_stage': self.rule_policy.stage if self.active_controller == 'rule' else None,
+                    'wrench_source': self.wrench_source,
                     'onnx_path': str(self.policy.onnx_path),
-                    'steps': int(self.policy.steps),
+                    'steps': int(self.rule_policy.steps if self.active_controller == 'rule' else self.policy.steps),
                     'elapsed_s': round(elapsed_s, 2),
                     'rate_hz': self.policy_rate.hz(now),
                     'reached_goal': self.reached_goal,
@@ -701,8 +949,6 @@ class InsertDashboardNode(Node):
                     'tip_length_m': self.tip_length_m,
                     'tip_offset_m': list(self.tip_offset_m),
                     'tip_offset_cm': [v * 100.0 for v in self.tip_offset_m],
-                    'kp': list(self.policy_kp),
-                    'kd': list(self.policy_kd),
                     'translation_scale_mm': self.policy.translation_limit_m * 1000.0,
                     'rotation_scale_deg': math.degrees(self.policy.rotation_limit_rad),
                     'last_step': step_dict,
@@ -785,13 +1031,22 @@ class _InsertDashboardHandler(BaseHTTPRequestHandler):
                 res = self.node.record_goal(
                     tip_length_m=None if tip_len is None else float(tip_len),
                     tip_offset_m=tip_off,
+                    joints=body.get('joints'),
                 )
             elif path in ('/api/goal/clear', '/api/clear_goal'):
                 res = self.node.clear_goal()
             elif path == '/api/wrench/tare':
                 res = self.node.tare_wrench()
+            elif path == '/api/wrench/source':
+                res = self.node.update_parameters({'wrench_source': body.get('source', body.get('wrench_source'))})
             elif path == '/api/policy/start':
-                res = self.node.start_policy()
+                if body.get('wrench_source') is not None:
+                    self.node.update_parameters({'wrench_source': body['wrench_source']})
+                res = self.node.start_policy(str(body.get('controller', 'onnx')))
+            elif path == '/api/rule/start':
+                if body.get('wrench_source') is not None:
+                    self.node.update_parameters({'wrench_source': body['wrench_source']})
+                res = self.node.start_policy('rule')
             elif path == '/api/policy/stop':
                 res = self.node.stop_policy(str(body.get('mode', 'drag')))
             elif path == '/api/parameters':
@@ -828,6 +1083,7 @@ def web_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument('--namespace', default='')
     parser.add_argument('--onnx', default=None)
     parser.add_argument('--tip-length', type=float, default=DEFAULT_TIP_LENGTH_M)
+    parser.add_argument('--wrench-source', default='paxini', choices=WRENCH_SOURCES)
     clean_argv = remove_ros_args(list(argv) if argv is not None else None)
     args = parser.parse_args(clean_argv[1:] if argv is None else clean_argv)
 
@@ -838,6 +1094,7 @@ def web_main(argv: Sequence[str] | None = None) -> int:
         namespace_override=args.namespace,
         onnx_path=args.onnx,
         tip_length_m=args.tip_length,
+        wrench_source=args.wrench_source,
     )
     server = create_http_server(node, host=args.host, port=args.port)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -845,11 +1102,14 @@ def web_main(argv: Sequence[str] | None = None) -> int:
         f'InsertAnything Dashboard ({node.can_label} -> {node.arm_namespace}) '
         f'listening on http://{args.host}:{server.server_port}/'
     )
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        executor.shutdown()
         server.shutdown()
         server.server_close()
         node.destroy_node()

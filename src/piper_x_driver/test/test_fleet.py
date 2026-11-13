@@ -117,7 +117,12 @@ def test_teaching_profile_matches_urdf_combined_terminal_mass_and_com(width):
     path = Path(get_package_share_directory('piper_description'))
     root: Any = ET.parse(path / 'urdf/piper_description_with_teach.urdf').getroot()
     links = {link.attrib['name']: link for link in root.findall('link')}
-    transforms = {'teach_base': (np.eye(3), np.zeros(3))}
+    mount = next(j for j in root.findall('joint') if j.attrib['name'] == 'joint6_to_teach_base')
+    mount_orig = mount.find('origin')
+    mount_rot = Rotation.from_euler(
+        'xyz', list(map(float, mount_orig.attrib['rpy'].split()))).as_matrix()
+    mount_xyz = np.array(list(map(float, mount_orig.attrib['xyz'].split())))
+    transforms = {'teach_base': (mount_rot, mount_xyz)}
     for joint in root.findall('joint'):
         if joint.find('parent').attrib['link'] != 'teach_base':
             continue
@@ -128,7 +133,9 @@ def test_teaching_profile_matches_urdf_combined_terminal_mass_and_com(width):
         axis = np.array(list(map(float, joint.find('axis').attrib['xyz'].split())))
         q = width / 2 if joint.attrib['name'] == 'joint7' else -width / 2
         transforms[joint.find('child').attrib['link']] = (
-            rotation, translation + rotation @ (q * axis))
+            mount_rot @ rotation,
+            mount_xyz + mount_rot @ (translation + rotation @ (q * axis)),
+        )
     mass, moment = 0.0, np.zeros(3)
     for name, (rotation, translation) in transforms.items():
         inertial = links[name].find('inertial')
@@ -212,3 +219,100 @@ def test_four_arm_launch_uses_shared_mapping_without_starting_hardware(fleet_pat
     assert [call.kwargs['parameters'] for call in node.call_args_list] == [
         [{'config_file': str(fleet_path), 'arm_id': f'arm_{index}'}]
         for index in range(1, 5)]
+
+
+def test_cpp_core_matches_python_dynamics_and_can_wire_protocol(capsys):
+    import piper_x_driver._core as cpp
+    import piper_x_driver.friction as f_mod
+    import piper_x_driver.gravity as g_mod
+    from piper_x_driver.gravity import damping_main, forward_kinematics, max_critical_kd
+    from piper_x_driver.protocol import MAX_GRAVITY_OFFSET, MIT_GAIN_SCALE
+
+    fleet = FleetConfig(default_config_path())
+    arm_cfg = fleet.arm('arm_3')
+    gm = fleet.gravity_model(arm_cfg)
+    fm = fleet.friction_model(arm_cfg)
+    eff = fleet.effectors[arm_cfg.end_effector]
+    assert gm is not None and fm is not None
+
+    rng = np.random.default_rng(42)
+    q = tuple(rng.uniform(-1.5, 1.5, size=6))
+    dq = tuple(rng.uniform(-0.8, 0.8, size=6))
+    err = tuple(rng.uniform(-0.08, 0.08, size=6))
+    sf = tuple(gm.joint(i).static_friction for i in range(1, 7))
+
+    try:
+        g_mod._cpp_core = None
+        f_mod._cpp_core = None
+        g_mod._gravity_torques_cached.cache_clear()
+        g_mod._joint_inertias_cached.cache_clear()
+        py_g = gm.torques(q, eff.mass_kg, eff.com_m)
+        py_f = fm.torques(q, dq, position_errors=err, gravity_torques=py_g, static_frictions=sf)
+        py_w = g_mod.end_effector_wrench(py_g, q, gravity_model=gm)
+        py_fk = forward_kinematics(q, (0.01, -0.02, 0.08))
+    finally:
+        g_mod._cpp_core = cpp
+        f_mod._cpp_core = cpp
+        g_mod._gravity_torques_cached.cache_clear()
+        g_mod._joint_inertias_cached.cache_clear()
+
+    assert gm.torques(q, eff.mass_kg, eff.com_m) == pytest.approx(py_g, abs=1e-12)
+    assert fm.torques(
+        q, dq, position_errors=err, gravity_torques=py_g, static_frictions=sf,
+    ) == pytest.approx(py_f, abs=1e-12)
+    assert g_mod.end_effector_wrench(py_g, q, gravity_model=gm) == pytest.approx(py_w, abs=1e-12)
+    assert forward_kinematics(q, (0.01, -0.02, 0.08)) == pytest.approx(py_fk, abs=1e-12)
+
+    frames = cpp.encode_mit_command(
+        (0.0, 0.72, -0.8, 0.0, 0.0, 0.0),
+        (0.0,) * 6,
+        (5.0, 5.0, 5.0, 1.0, 0.7, 0.7),
+        (0.5, 0.8, 0.8, 0.2, 0.2, 0.2),
+        (0.0,) * 6,
+        (0.0, 0.52, -0.8, 0.33, 0.0, 0.0),
+    )
+    assert [f['can_id'] for f in frames] == [0x15A, 0x15B, 0x15C, 0x15D, 0x15E, 0x15F]
+    assert all(len(f['data']) == 8 for f in frames)
+    assert max_critical_kd((15.0, 15.0, 15.0, 3.0, 2.0, 2.0), 'gripper') == (
+        4.56, 4.6, 2.22, 0.29, 0.24, 0.05)
+    desc_urdf = Path(get_package_share_directory('piper_description')) / 'urdf/piper_description.urdf'
+    urdf_root = ET.parse(desc_urdf).getroot()
+    T_urdf = np.eye(4)
+    for idx, qi in enumerate(q, 1):
+        j_el = next(el for el in urdf_root.findall('joint') if el.attrib['name'] == f'joint{idx}')
+        orig = j_el.find('origin')
+        Tj = np.eye(4)
+        Tj[:3, :3] = Rotation.from_euler('xyz', list(map(float, orig.attrib['rpy'].split()))).as_matrix()
+        Tj[:3, 3] = list(map(float, orig.attrib['xyz'].split()))
+        Tr = np.eye(4)
+        Tr[:3, :3] = Rotation.from_euler('z', qi).as_matrix()
+        T_urdf = T_urdf @ Tj @ Tr
+    assert forward_kinematics(q) == pytest.approx(T_urdf, abs=1e-12)
+    assert damping_main(['--kp', '60', '60', '60', '12', '8', '8']) == 0
+    assert 'kd: [9.25, 9.31, 4.51, 0.6, 0.49, 0.13]' in capsys.readouterr().out
+    assert len(MIT_GAIN_SCALE) == 6 and MAX_GRAVITY_OFFSET == 1.0
+
+
+def test_inverse_kinematics_matrix_rpy_and_calibrated_offsets():
+    from piper_x_driver import IkResult, forward_kinematics, inverse_kinematics
+    from piper_x_driver.gravity import ArmGravityModel, JointGravityModel
+
+    q_true = (0.3, 1.0, -1.3, -0.2, 0.45, 0.5)
+    tool_off = (0.01, -0.02, 0.16)
+    T_des = forward_kinematics(q_true, tool_offset_m=tool_off)
+    q_seed = (0.15, 0.85, -1.1, 0.0, 0.3, 0.2)
+
+    res = inverse_kinematics(T_des, q_seed, tool_offset_m=tool_off, return_result=True)
+    assert isinstance(res, IkResult) and res.converged
+    assert forward_kinematics(res.joints, tool_offset_m=tool_off) == pytest.approx(T_des, abs=1e-4)
+
+    rpy = Rotation.from_matrix(T_des[:3, :3]).as_euler('xyz')
+    pose_6d = (*T_des[:3, 3], *rpy)
+    q_6d = inverse_kinematics(pose_6d, q_seed, tool_offset_m=tool_off)
+    assert isinstance(q_6d, tuple) and len(q_6d) == 6
+    assert forward_kinematics(q_6d, tool_offset_m=tool_off) == pytest.approx(T_des, abs=1e-4)
+
+    gm = ArmGravityModel(joints={2: JointGravityModel(angle_offset=0.025), 5: JointGravityModel(angle_offset=-0.03)})
+    T_cal = gm.forward_kinematics(q_true, tool_offset_m=tool_off)
+    q_cal = gm.inverse_kinematics(T_cal, q_seed, tool_offset_m=tool_off)
+    assert gm.forward_kinematics(q_cal, tool_offset_m=tool_off) == pytest.approx(T_cal, abs=1e-4)

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from ament_index_python.packages import get_package_share_path
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -6,7 +8,21 @@ from launch.conditions import IfCondition
 from launch.substitutions import Command, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
-from piper_x_driver.configuration import default_config_path, FleetConfig
+import yaml
+
+
+_EFFECTOR_MODELS = {
+    'teaching_handle': 'piper_description_with_teach.urdf',
+    'gripper': 'piper_description.urdf',
+    'gripper_with_wrench': 'piper_description_with_wrench.urdf',
+}
+
+
+def _default_config_file() -> str:
+    try:
+        return str(get_package_share_path('piper_x_driver') / 'config/arms.yaml')
+    except Exception:
+        return ''
 
 
 def _follow(context):
@@ -14,12 +30,22 @@ def _follow(context):
     namespace = LaunchConfiguration('namespace')
     model = LaunchConfiguration('model').perform(context)
     if not model:
-        fleet = FleetConfig(LaunchConfiguration('config_file').perform(context))
+        cfg_path = LaunchConfiguration('config_file').perform(context)
+        if not cfg_path or not Path(cfg_path).is_file():
+            raise ValueError('Supply model:=... or a valid config_file:=...')
+        data = yaml.safe_load(Path(cfg_path).read_text(encoding='utf-8')) or {}
         selected = '/' + namespace.perform(context).strip('/')
-        arm = next((arm for arm in fleet.arms if arm.namespace == selected), None)
+        arm = next(
+            (a for a in (data.get('arms') or []) if a.get('namespace') == selected),
+            None,
+        )
         if arm is None:
             raise ValueError('Namespace not in fleet configuration; supply an explicit model')
-        model = str(share / 'urdf' / fleet.effectors[arm.end_effector].model)
+        inline_eff = (data.get('effectors') or {}).get(arm['end_effector'], {})
+        model_name = inline_eff.get('model') or _EFFECTOR_MODELS.get(arm['end_effector'])
+        if not model_name:
+            raise ValueError(f"Unknown end_effector: {arm['end_effector']}")
+        model = str(share / 'urdf' / model_name)
     tf_remaps = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
     description = ParameterValue(
         Command(['xacro ', model]), value_type=str)
@@ -44,7 +70,7 @@ def generate_launch_description():
     share = get_package_share_path('piper_description')
     return LaunchDescription([
         DeclareLaunchArgument('namespace', default_value='arm_1'),
-        DeclareLaunchArgument('config_file', default_value=str(default_config_path())),
+        DeclareLaunchArgument('config_file', default_value=_default_config_file()),
         DeclareLaunchArgument('model', default_value=''),
         DeclareLaunchArgument(
             'rvizconfig', default_value=str(share / 'rviz/piper_ctrl.rviz')),

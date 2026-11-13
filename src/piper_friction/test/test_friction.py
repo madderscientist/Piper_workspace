@@ -24,10 +24,9 @@ from piper_friction.model import (
     save_friction_model,
 )
 from piper_friction.web import FrictionWorkbenchNode, create_http_server
-from piper_x_driver.backend import Feedback
+from conftest import Feedback, MockDriverNode as DriverNode
 from piper_x_driver.configuration import default_config_path, FleetConfig
 from piper_x_driver.gravity import gravity_torques
-from piper_x_driver.node import DriverNode
 import pytest
 import rclpy
 from rclpy.executors import SingleThreadedExecutor

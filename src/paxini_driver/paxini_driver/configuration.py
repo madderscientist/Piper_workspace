@@ -1,4 +1,4 @@
-"""Shared sensor selection and calibration persistence; independent of ROS nodes."""
+"""传感器配置解析与标定参数原子持久化工具（独立于 ROS 节点）。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from ament_index_python.packages import PackageNotFoundError, get_package_share_
 
 
 def source_config_path(fallback: Optional[Path] = None) -> Path:
-    """Use an explicit path, source config for symlink installs, or installed share."""
+    """优先使用显式指定路径；默认在 symlink-install 下定位源码 config/px6d.yaml，否则回退到 share 目录。"""
     if fallback is not None:
         return Path(fallback)
     source = Path(__file__).resolve().parents[1] / "config" / "px6d.yaml"
@@ -69,9 +69,9 @@ def save_sensor_calibration_to_yaml(
     calibration_quality: Optional[dict[str, Any]] = None,
     config_path: Optional[Path] = None,
 ) -> Path:
-    """Persist shared poses and per-sensor calibration parameters in px6d.yaml."""
+    """将公共校准姿态或单臂标定结果写回 px6d.yaml，保留其余传感器与测量记录字段。"""
     target = source_config_path(config_path).resolve()
-    # Serialize independent arm updates and let reload readers see complete YAML.
+    # 通过文件排他锁串行化双臂并发写入，并用同目录临时文件 + os.replace 保证驱动 reload 时读到完整 YAML。
     with target.with_suffix(target.suffix + ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         raw = yaml.safe_load(target.read_text(encoding="utf-8")) or {}

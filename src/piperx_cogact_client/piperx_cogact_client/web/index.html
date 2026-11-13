@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PiPER-X · CogACT 控制台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>PiPER-X <span>CogACT 控制台</span></h1>
+      <span id="mode-badge" class="badge" data-mode="idle">空闲</span>
+    </div>
+    <div class="topbar-actions">
+      <button id="btn-simulator" type="button" class="btn-secondary">仿真窗口</button>
+      <button id="btn-stop-hold" type="button" class="btn-warn">暂停并保持姿态</button>
+      <button id="btn-stop" type="button" class="btn-danger">停止并释放 MIT</button>
+    </div>
+    <div id="status-msg" class="status-message" role="status">正在连接本地服务...</div>
+  </header>
+
+  <main class="container">
+    <section class="panel execution-panel" aria-labelledby="execution-title">
+      <div class="panel-header">
+        <h2 id="execution-title">推理执行</h2>
+        <span class="muted">MIT 控制</span>
+      </div>
+      <label class="instruction-field" for="inp-instruction">任务指令
+        <input id="inp-instruction" type="text" placeholder="输入任务指令">
+      </label>
+      <fieldset class="mode-selector">
+        <legend>执行模式</legend>
+        <div class="mode-options">
+          <label><input type="radio" name="execution-mode" value="step" checked><span>单步</span></label>
+          <label><input type="radio" name="execution-mode" value="batch"><span>整批</span></label>
+          <label><input type="radio" name="execution-mode" value="auto"><span>串行闭环</span></label>
+          <label><input type="radio" name="execution-mode" value="async"><span>异步重叠</span></label>
+        </div>
+      </fieldset>
+      <div class="execution-controls">
+        <div class="mode-fields">
+          <label data-for-modes="batch auto async" hidden>执行频率 (Hz)
+            <input id="inp-exec-hz" type="number" step="1" min="1" max="200">
+          </label>
+          <label data-for-modes="auto" hidden>轮间等待 (s)
+            <input id="inp-settle-s" type="number" step="0.1" min="0" max="60">
+          </label>
+          <label class="toggle" data-for-modes="batch" hidden><input id="inp-use-cached" type="checkbox">使用缓存批次</label>
+          <div class="mode-metric" data-for-modes="step"><span class="muted">已执行步数</span><output id="step-progress">0 / 0</output></div>
+          <div class="mode-metric" data-for-modes="batch" hidden><span class="muted">批次频率</span><output id="batch-rate-tag">30 Hz</output></div>
+          <div class="mode-metric" data-for-modes="auto" hidden><span class="muted">已完成</span><output id="auto-cycles-tag">0 轮</output></div>
+          <div class="mode-metric" data-for-modes="async" hidden><span class="muted">重叠状态</span><output id="async-tag">待命</output></div>
+        </div>
+        <div class="execution-actions">
+          <button id="btn-request" type="button" class="btn-secondary" data-for-modes="step">请求</button>
+          <button id="btn-execute" type="button" class="btn-primary">执行一步</button>
+        </div>
+      </div>
+      <details class="settings-details">
+        <summary>连接与执行设置</summary>
+        <div class="settings-grid">
+          <label>云端推理地址
+            <input id="inp-url" type="text" placeholder="http://10.209.224.190:8332">
+          </label>
+          <label>MIT 维持频率 (Hz)
+            <input id="inp-hold-hz" type="number" step="5" min="0" max="200">
+          </label>
+          <label class="toggle"><input id="inp-gripper" type="checkbox" checked>同步夹爪</label>
+          <button id="btn-save-settings" type="button" class="btn-secondary">应用参数</button>
+          <button id="btn-health" type="button" class="btn-secondary">检测云端</button>
+        </div>
+        <div id="health-text" class="muted" role="status"></div>
+      </details>
+    </section>
+
+    <section class="panel" aria-labelledby="monitor-title">
+      <div class="panel-header">
+        <h2 id="monitor-title">实时观测</h2>
+      </div>
+      <div id="camera-grid" class="camera-grid"></div>
+      <div id="arm-grid" class="arm-grid"></div>
+    </section>
+
+    <details class="panel">
+      <summary class="panel-summary"><span class="panel-title">预测动作与运行日志</span></summary>
+      <div class="bottom-grid panel-body">
+        <div class="subsection">
+          <h3>缓存批次 <span id="chunk-meta" class="muted"></span></h3>
+          <div id="chunk-table-wrap" class="table-wrap">暂无预测数据</div>
+        </div>
+        <div class="subsection">
+          <h3>运行日志</h3>
+          <div id="log-list" class="log-list"></div>
+        </div>
+      </div>
+    </details>
+
+    <details id="calib-panel" class="panel">
+      <summary class="panel-summary">
+        <span class="panel-title">标定与起始位</span>
+        <span id="calib-badge" class="badge">读取中</span>
+      </summary>
+      <div class="panel-body">
+        <div class="calib-meta">
+          <span>文件：<code id="calib-file">—</code></span>
+          <span>标定 ID：<code id="calib-id">—</code></span>
+          <span>最近保存：<span id="calib-time">未保存</span></span>
+        </div>
+        <div class="calib-grid">
+          <div class="subsection">
+            <h3>相机与双臂空间外参</h3>
+            <div class="row wrap">
+              <label>世界系原点定义
+                <select id="world-origin">
+                  <option value="dual_base_board">双基座+桌面标定板对齐 (+X前/+Y左/+Z上)</option>
+                  <option value="board_up">标定板中心原点 (+Z向上)</option>
+                  <option value="left_base">左臂基座 (left_base)</option>
+                  <option value="right_base">右臂基座 (right_base)</option>
+                </select>
+              </label>
+              <button type="button" class="btn-primary" data-calib="all">标定全部视角</button>
+              <button type="button" class="btn-secondary" data-calib="head">头相机</button>
+              <button type="button" class="btn-secondary" data-calib="left">左臂</button>
+              <button type="button" class="btn-secondary" data-calib="right">右臂</button>
+            </div>
+            <div class="row wrap compact-inputs">
+              <label>双基座中点 X (m)<input id="base-mid-x" type="number" step="0.01" value="0.06"></label>
+              <label>标定板高度 Z (m)<input id="board-z" type="number" step="0.01" value="0.75"></label>
+              <label>左臂 Flange→TCP XYZ (m)<input id="left-tcp-xyz" type="text" value="0, 0, 0"></label>
+              <label>左臂 RPY (deg)<input id="left-tcp-rpy" type="text" value="0, 0, 0"></label>
+              <label>右臂 Flange→TCP XYZ (m)<input id="right-tcp-xyz" type="text" value="0, 0, 0"></label>
+              <label>右臂 RPY (deg)<input id="right-tcp-rpy" type="text" value="0, 0, 0"></label>
+              <button id="btn-save-tcp" type="button" class="btn-secondary">保存坐标系与 TCP</button>
+            </div>
+            <div id="calib-transforms" class="mono-box"></div>
+            <div id="calib-overlays" class="overlay-strip"></div>
+          </div>
+
+          <div class="subsection">
+            <h3>工作起始位</h3>
+            <div class="row wrap">
+              <button id="btn-record-home" type="button" class="btn-primary">记录当前双臂位置</button>
+              <button id="btn-go-home" type="button" class="btn-secondary">MIT 平滑归位</button>
+            </div>
+            <div id="home-pose-box" class="mono-box">尚未落盘起始关节位置</div>
+          </div>
+        </div>
+      </div>
+    </details>
+
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
+

@@ -6,7 +6,7 @@ import pytest
 from piper_teaching.bilateral import (
     ArmSample, BilateralCoupling, TeachingConfig, TeachingFault, references,
 )
-from piper_x_driver.backend import FEEDBACK_FIELDS
+from piper_x_driver.protocol import FEEDBACK_FIELDS
 
 
 def samples(now=100.0):

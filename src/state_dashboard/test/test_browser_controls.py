@@ -9,8 +9,8 @@ import threading
 import time
 
 from ament_index_python.packages import get_package_share_directory
+from conftest import MockDriverNode as DriverNode
 from piper_x_driver.configuration import default_config_path, FleetConfig
-from piper_x_driver.node import DriverNode
 import pytest
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
@@ -26,10 +26,6 @@ import yaml
 def test_browser_mit_sliders_configuration_and_explicit_close(tmp_path, monkeypatch):
     from playwright.sync_api import sync_playwright, expect
 
-    def forbidden(*_):
-        raise AssertionError('Real SDK access forbidden in browser tests')
-
-    monkeypatch.setattr('piper_x_driver.backend.AgxArmFactory.create_arm', forbidden)
     path = tmp_path / 'arms.yaml'
     shutil.copyfile(default_config_path(), path)
     data = yaml.safe_load(path.read_text())
@@ -82,7 +78,7 @@ def test_browser_mit_sliders_configuration_and_explicit_close(tmp_path, monkeypa
                             page.wait_for_timeout(50)
                         raise AssertionError(json.dumps([
                             {'namespace': arm['namespace'], 'power': arm['status']['power_state'],
-                             'debug': arm['control']['debug_active']}
+                             'mode': arm['control']['mode']}
                             for arm in snapshot['arms']]))
 
                     page.goto(url)

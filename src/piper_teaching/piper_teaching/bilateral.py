@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import math
 
-from piper_x_driver.backend import feedback_problem
+from piper_x_driver.protocol import feedback_problem
 
 
 JOINT_NAMES = tuple(f'joint{i}' for i in range(1, 7)) + ('gripper',)

@@ -20,7 +20,7 @@
 
 原始模型保留在 `meshes/px6d75_original/`、`meshes/px6d75_arm_flange_original/`、`meshes/px6d75_gripper_flange_original/` 和 `meshes/gripper_base.STL`。两片打印法兰原 STL 均以毫米计：臂侧法兰上下翻转并绕 −Z 旋转 90° 后采用 `X=(z原−37.5)/1000`、`Y=(37.5−x原)/1000`、`Z=(7.5−y原)/1000`；夹爪侧法兰仍采用 `X=(x原−28.5)/1000`、`Y=(28.5−z原)/1000`、`Z=y原/1000`。
 
-完整整机模型为同级的 `urdf/piper_description_with_wrench.urdf`：以 `piper_description.urdf` 为基准保留机械臂部分，J6 模型零位沿原关节自身 Z 轴补偿 +45°，即新模型 J6=0 对应旧模型 J6=+45°；限位为 [−175°, +175°]，其余关节参数保持不变。通过 `joint6_to_arm_sensor_flange` 将新末端接到 `link6`，安装面位于 `link6` 的 Z=0。连接关节绕 Z 轴 −90°，相对原 +90° 安装旋转 180°，六个臂侧安装孔仍与 `link6` 对齐；此时传感器相对 `link6` 为 −135°，夹爪为 −45°，组件内部相对安装保持不变。独立末端模型仍为 `gripper_with_wrench.xacro`，原整机 `piper_description.urdf` 保持不变。可验证两个模型：
+完整整机模型为同级的 `urdf/piper_description_with_wrench.urdf`：以 PiPER-X `piper_description.urdf` 为基准保留机械臂部分，J6 模型零位沿原关节自身 Z 轴补偿 +45°，即新模型 J6=0 对应基准模型 J6=+45°；限位为 [−175°, +175°]，其余关节参数保持不变。通过 `joint6_to_arm_sensor_flange`（`rpy="0 0 0"`）将新末端接到 `link6`，安装面位于 `link6` 的 Z=0；此时在基准 PiPER-X `link6` 坐标系下，传感器（`wrench_sensor`）绕 Z 轴为 `0°`（与 `paxini_driver` 通道完全重合），夹爪底座（`gripper_base`）绕 Z 轴为 `+90°`（与标准 `piper_description.urdf` 及 `piper_description_with_teach.urdf` 完全对齐），组件内部相对安装保持不变。独立末端模型仍为 `gripper_with_wrench.xacro`。可验证两个模型：
 
 ```bash
 source ./setup_env.bash

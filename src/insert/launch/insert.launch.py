@@ -12,6 +12,7 @@ def _launch_nodes(context):
     namespace = LaunchConfiguration('namespace').perform(context)
     host = LaunchConfiguration('host').perform(context)
     port = LaunchConfiguration('port').perform(context)
+    wrench_source = LaunchConfiguration('wrench_source').perform(context)
     start_driver = LaunchConfiguration('start_driver').perform(context).lower() in ('1', 'true', 'yes')
 
     nodes = []
@@ -39,6 +40,7 @@ def _launch_nodes(context):
                 '--namespace', namespace,
                 '--host', host,
                 '--port', port,
+                '--wrench-source', wrench_source,
             ],
         )
     )
@@ -52,6 +54,7 @@ def generate_launch_description():
         DeclareLaunchArgument('namespace', default_value='/arm_4'),
         DeclareLaunchArgument('host', default_value='127.0.0.1'),
         DeclareLaunchArgument('port', default_value='8092'),
+        DeclareLaunchArgument('wrench_source', default_value='paxini'),
         DeclareLaunchArgument('start_driver', default_value='false'),
         OpaqueFunction(function=_launch_nodes),
     ])

@@ -12,7 +12,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/Enable.srv"
   "srv/SetMode.srv"
   "srv/ConfigureArm.srv"
-  "srv/DebugMit.srv"
   "srv/CalibrateEffector.srv"
   DEPENDENCIES std_msgs
 )

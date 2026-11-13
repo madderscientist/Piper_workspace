@@ -6,9 +6,9 @@ import threading
 import time
 
 from piper_x_interfaces.msg import CartesianCommand, GripperCommand, JointCommand, MitCommand
-from piper_x_interfaces.srv import CalibrateEffector, ConfigureArm, DebugMit, SetMode
+from piper_x_interfaces.srv import CalibrateEffector, ConfigureArm, SetMode
 from piper_x_driver.configuration import bounded
-from piper_x_driver.controller import LOWER, MODES, UPPER, vector
+from piper_x_driver.protocol import LOWER, MODES, UPPER, vector
 from std_srvs.srv import Trigger
 
 
@@ -65,8 +65,6 @@ def _call_service(client, request, timeout: float, action: str = ''):
         message = 'ROS response timed out; result unknown, do not retry automatically.'
         if action == 'calibrate':
             message += ' Zeroing may already have reached the device; inspect feedback.'
-        elif action.startswith('mit/'):
-            message += ' MIT sessions expire without heartbeats.'
         return ArmController._error(504, message)
     if future.cancelled() or future.exception() is not None:
         return ArmController._error(
@@ -75,20 +73,15 @@ def _call_service(client, request, timeout: float, action: str = ''):
     response = future.result()
     if not response.success:
         return ArmController._error(409, response.message)
-    result = {'success': True, 'message': response.message}
-    if isinstance(response, DebugMit.Response) and response.session:
-        result['session'] = response.session
-        result['position'] = list(response.position)
-    return 200, result
+    return 200, {'success': True, 'message': response.message}
 
 
 class ArmController:
     def __init__(
-        self, config_clients, debug_clients, calibration_clients,
+        self, config_clients, calibration_clients,
         mode_clients=None, command_publisher=None, timeout=2.0, log_callback=None,
     ):
         self.config_clients = config_clients
-        self.debug_clients = debug_clients
         self.calibration_clients = calibration_clients
         self.mode_clients = mode_clients
         self.command_publisher = command_publisher
@@ -179,30 +172,14 @@ class ArmController:
                     index, 'mit',
                     MitCommand(
                         position=arrays['position'], velocity=arrays['velocity'],
-                        kp=[bounded(v, 'kp', 0.0, 500.0) for v in arrays['kp']],
-                        kd=[bounded(v, 'kd', 0.0, 100.0) for v in arrays['kd']],
+                        kp=[float(v) if v < 0.0 else bounded(v, 'kp', 0.0, 500.0) for v in arrays['kp']],
+                        kd=[float(v) if v < 0.0 else bounded(v, 'kd', 0.0, 100.0) for v in arrays['kd']],
                         torque=arrays['torque'],
                     ),
                     '已发送自定义 MIT 指令（command/mit）',
                 )
             else:
-                operation = action.removeprefix('mit/')
-                fields = {
-                    'start': set(), 'target': {'session', 'position'}, 'stop': {'session'},
-                }
-                if operation not in fields or set(body) != fields[operation]:
-                    raise ValueError('Invalid MIT operation fields')
-                request = DebugMit.Request(action=operation)
-                if operation != 'start':
-                    session = body['session']
-                    if not isinstance(session, str) or not 1 <= len(session) <= 128:
-                        raise ValueError('Valid MIT session required')
-                    request.session = session
-                if operation == 'target':
-                    position = _finite_list(body['position'], 'Six numeric joint positions')
-                    vector(position, 'MIT position encoding', LOWER, UPPER)
-                    request.position = position
-                client = self.debug_clients[index]
+                raise ValueError(f'Unknown arm action {action}')
             with self._service_locks[index]:
                 status, result = _call_service(client, request, self.timeout, action)
             self._log(index, action, status, str(result.get('message', '')))

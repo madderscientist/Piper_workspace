@@ -34,11 +34,18 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 import math
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
+from ament_index_python.packages import get_package_share_directory
 import numpy as np
 import yaml
 
 from .terminal import RigidBody, terminal_body, terminal_for_model, terminal_profiles
+
+try:
+    from . import _core as _cpp_core
+except ImportError:
+    _cpp_core = None
 
 
 def _euler_xyz_matrix(rpy: tuple[float, float, float]) -> np.ndarray:
@@ -53,34 +60,45 @@ def _euler_xyz_matrix(rpy: tuple[float, float, float]) -> np.ndarray:
     ])
 
 
-_XYZ = np.array([
-    (0, 0, 0.123), (0, 0, 0), (0.28503, 0, 0),
-    (0.27364, 0, 0), (0.07466, 0, 0), (0, -0.035, 0),
-])
-_RPY: list[tuple[float, float, float]] = [
-    (0, 0, 3.1415926), (-1.5707963, -3.005806, -3.1415926),
-    (0, 0, 2.8380798), (0, 0, 0.0806342),
-    (-1.5707963, 1.5707963, 0), (1.5707963, 0, 0),
-]
+def default_arm_urdf_path() -> Path:
+    source_urdf = (
+        Path(__file__).resolve().parents[2]
+        / 'piper_description/urdf/piper_no_gripper_description.urdf'
+    )
+    if source_urdf.is_file():
+        return source_urdf
+    return Path(get_package_share_directory('piper_description')) / 'urdf/piper_no_gripper_description.urdf'
+
+
+def _load_arm_chain_from_urdf(urdf_path: Path):
+    root = ET.parse(urdf_path).getroot()
+    joints = {j.attrib['name']: j for j in root.findall('joint')}
+    links = {l.attrib['name']: l for l in root.findall('link')}
+    xyz_list, rpy_list, mass_list, com_list, inertia_list = [], [], [], [], []
+    for idx in range(1, 7):
+        j_orig = joints[f'joint{idx}'].find('origin')
+        xyz_list.append(tuple(float(v) for v in j_orig.attrib.get('xyz', '0 0 0').split()))
+        rpy_list.append(tuple(float(v) for v in j_orig.attrib.get('rpy', '0 0 0').split()))
+        inertial = links[f'link{idx}'].find('inertial')
+        i_orig = inertial.find('origin')
+        com_list.append(tuple(float(v) for v in (i_orig.attrib.get('xyz', '0 0 0') if i_orig is not None else '0 0 0').split()))
+        mass_list.append(float(inertial.find('mass').attrib['value']))
+        imat = inertial.find('inertia').attrib
+        ixx, ixy, ixz = float(imat['ixx']), float(imat['ixy']), float(imat['ixz'])
+        iyy, iyz, izz = float(imat['iyy']), float(imat['iyz']), float(imat['izz'])
+        inertia_list.append([[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]])
+    return np.array(xyz_list), rpy_list, mass_list, com_list, np.array(inertia_list)
+
+
+_XYZ, _RPY, _LINK_MASSES_6, _LINK_COMS_6, _LINK_INERTIAS = _load_arm_chain_from_urdf(
+    default_arm_urdf_path()
+)
 _ROTATIONS = np.array([_euler_xyz_matrix(r) for r in _RPY])
 _DEFAULT_TERMINAL = terminal_body('gripper')
-_MASS = np.array([0.71, 1.16, 0.67, 0.39, 0.35, 0.01655408133, _DEFAULT_TERMINAL.mass_kg])
-_COM = np.array([
-    (0.00053, -0.00039, -0.00315), (0.21856, -0.00859, 0.00227),
-    (0.2014, -0.00418, -0.00141), (0.059, -0.05831, 0.002),
-    (0.00005, -0.01282, -0.00429), (0.00134940815, 0, -0.00344975303),
-    _DEFAULT_TERMINAL.com_m,
-])
+_MASS = np.array([*_LINK_MASSES_6, _DEFAULT_TERMINAL.mass_kg])
+_COM = np.array([*_LINK_COMS_6, _DEFAULT_TERMINAL.com_m])
 _DESCENDANT = np.arange(7)[:, None] >= np.arange(6)[None, :]
 _GRAVITY = np.array([0.0, 0.0, -9.81])
-_LINK_INERTIAS = np.array([
-    [[0.00050027, 7.8e-07, -6.26e-06], [7.8e-07, 0.00040879, -4.62e-06], [-6.26e-06, -4.62e-06, 0.00045802]],
-    [[0.00111873, 0.00182162, 0.00019185], [0.00182162, 0.06763292, 7.71e-06], [0.00019185, 7.71e-06, 0.067559]],
-    [[0.00080618, -0.00263276, -1.58e-06], [-0.00263276, 0.01313367, 5.5e-07], [-1.58e-06, 5.5e-07, 0.01363321]],
-    [[0.00014613, 6.7e-07, 4.08e-06], [6.7e-07, 0.00017844, 6.2e-07], [4.08e-06, 6.2e-07, 0.00018914]],
-    [[0.00171172, -9.89e-06, -1e-07], [-9.89e-06, 0.00017936, 2.42e-06], [-1e-07, 2.42e-06, 0.00172318]],
-    [[0.00138626, -2.02e-06, -3e-08], [-2.02e-06, 0.00152112, 2.75e-06], [-3e-08, 2.75e-06, 0.00031152]],
-])
 _EFFECTOR_INERTIAS = {
     alias: terminal_body(key).inertia
     for key, profile in terminal_profiles().items()
@@ -110,6 +128,8 @@ def _max_critical_kd_cached(
     scales: tuple[float, ...],
     added_mass_kg: float,
 ) -> tuple[float, ...]:
+    if _cpp_core is not None:
+        return _cpp_core.max_critical_kd_raw(kp, end_effector, scales, added_mass_kg)
     inertias = _MAX_INERTIA.get(end_effector, _MAX_INERTIA['teaching_handle'])
     terminal = terminal_for_model(end_effector)
     if terminal is not None and terminal.payload_link is not None and added_mass_kg:
@@ -152,7 +172,90 @@ def link6_rotation_in_base(position: Sequence[float] | np.ndarray) -> np.ndarray
     """Return the SDK-compatible link6 rotation for measured joint angles (rad)."""
     if len(position) < 6:
         raise ValueError('Six joint positions are required')
+    if _cpp_core is not None:
+        return _cpp_core.link6_rotation_in_base(position[:6])
     return np.asarray(_fast_fk(position[:6], (0.0, 0.0, 0.0))[3][5], dtype=float)
+
+
+def forward_kinematics(
+    position: Sequence[float] | np.ndarray,
+    tool_offset_m: Sequence[float] | np.ndarray = (0.0, 0.0, 0.0),
+) -> np.ndarray:
+    """Return the 4x4 homogeneous transform T_base_tool for 6 joint angles (rad) and link6 offset (m)."""
+    if len(position) < 6:
+        raise ValueError('Six joint positions are required')
+    if len(tool_offset_m) < 3:
+        raise ValueError('Three tool offset coordinates are required')
+    _, _, centers, rots = _fast_fk(position[:6], tool_offset_m[:3])
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = np.asarray(rots[5], dtype=float)
+    transform[:3, 3] = np.asarray(centers[6], dtype=float)
+    return transform
+
+
+@dataclass(frozen=True)
+class IkResult:
+    joints: tuple[float, ...]
+    converged: bool
+    iterations: int
+    position_error_m: float
+    orientation_error_rad: float
+
+
+def inverse_kinematics(
+    target: Sequence[float] | np.ndarray,
+    q_seed: Sequence[float] | np.ndarray = (0.0, 0.8, -1.2, 0.0, 0.4, 0.0),
+    *,
+    tool_offset_m: Sequence[float] | np.ndarray = (0.0, 0.0, 0.0),
+    lower_limits: Sequence[float] | np.ndarray | None = None,
+    upper_limits: Sequence[float] | np.ndarray | None = None,
+    damping: float = 1e-3,
+    max_iters: int = 50,
+    pos_tol_m: float = 1e-4,
+    rot_tol_rad: float = 1e-3,
+    return_result: bool = False,
+) -> tuple[float, ...] | IkResult:
+    """Solve 6-DOF inverse kinematics for target 4x4 T_base_tool or 6D [x, y, z, roll, pitch, yaw].
+
+    Uses box-constrained active-set damped least-squares (task-priority position + nullspace orientation)
+    consistent with the URDF joint limits in piper_description.
+    """
+    arr = np.asarray(target, dtype=float)
+    if arr.shape == (4, 4):
+        p_des = arr[:3, 3]
+        r_des = arr[:3, :3]
+    elif arr.size == 6:
+        flat = arr.reshape(6)
+        p_des = flat[:3]
+        r_des = _euler_xyz_matrix((float(flat[3]), float(flat[4]), float(flat[5])))
+    else:
+        raise ValueError('target must be a 4x4 homogeneous matrix or 6-element [x, y, z, roll, pitch, yaw]')
+    if len(q_seed) < 6:
+        raise ValueError('q_seed requires six joint angles')
+    if len(tool_offset_m) < 3:
+        raise ValueError('tool_offset_m requires three coordinates')
+    if _cpp_core is None:
+        raise RuntimeError('piper_x_driver._core C++ extension is required for inverse_kinematics')
+    raw = _cpp_core.inverse_kinematics(
+        tuple(float(v) for v in p_des),
+        r_des.tolist(),
+        tuple(float(v) for v in q_seed[:6]),
+        tuple(float(v) for v in tool_offset_m[:3]),
+        None if lower_limits is None else tuple(float(v) for v in lower_limits[:6]),
+        None if upper_limits is None else tuple(float(v) for v in upper_limits[:6]),
+        float(damping),
+        int(max_iters),
+        float(pos_tol_m),
+        float(rot_tol_rad),
+    )
+    result = IkResult(
+        joints=tuple(float(v) for v in raw['joints']),
+        converged=bool(raw['converged']),
+        iterations=int(raw['iterations']),
+        position_error_m=float(raw['position_error_m']),
+        orientation_error_rad=float(raw['orientation_error_rad']),
+    )
+    return result if return_result else result.joints
 
 
 def _kinematics(position: tuple[float, ...], effector_com=None):
@@ -161,6 +264,8 @@ def _kinematics(position: tuple[float, ...], effector_com=None):
 
 
 def _fast_fk(position, effector_com=None):
+    if _cpp_core is not None:
+        return _cpp_core.fast_fk(position[:6], effector_com)
     r00, r01, r02 = 1.0, 0.0, 0.0
     r10, r11, r12 = 0.0, 1.0, 0.0
     r20, r21, r22 = 0.0, 0.0, 1.0
@@ -238,6 +343,10 @@ def joint_inertias(
 
 @lru_cache(maxsize=256)
 def _joint_inertias_cached(position, mass_kg, com_m, scales, eff_t):
+    if _cpp_core is not None:
+        return _cpp_core.joint_inertias(
+            position, 'teaching_handle', mass_kg, com_m, scales, eff_t,
+        )
     origins, axes, centers, rots = _fast_fk(position, com_m)
     masses = (*_MASS_T[:6], mass_kg)
     tensors = (*_LINK_I_T, eff_t)
@@ -279,6 +388,8 @@ def gravity_torques(
 
 @lru_cache(maxsize=256)
 def _gravity_torques_cached(position, mass_kg, com_m):
+    if _cpp_core is not None:
+        return _cpp_core.gravity_torques(position, mass_kg, com_m)
     origins, axes, centers, _ = _fast_fk(position, com_m)
     masses = (*_MASS_T[:6], float(mass_kg))
     out = [0.0] * 6
@@ -308,6 +419,8 @@ def geometric_jacobian(
         raise ValueError('Six joint positions are required')
     if frame not in ('gripper', 'base_link'):
         raise ValueError("frame must be 'gripper' or 'base_link'")
+    if _cpp_core is not None:
+        return _cpp_core.geometric_jacobian(position[:6], tool_offset_m, frame)
     origins, axes, centers, rots = _fast_fk(position[:6], tool_offset_m)
     ex, ey, ez = centers[6]
     jacobian = np.empty((6, 6), dtype=float)
@@ -415,6 +528,15 @@ def end_effector_wrench(
     )
     if not (t0 or t1 or t2 or t3 or t4 or t5):
         return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if _cpp_core is not None and damping > 0.0:
+        q_eff = (
+            position[:6]
+            if gravity_model is None
+            else tuple(float(position[i]) + gravity_model.joint(i + 1).angle_offset for i in range(6))
+        )
+        return _cpp_core.end_effector_wrench_raw(
+            (t0, t1, t2, t3, t4, t5), q_eff, tool_offset_m, float(damping), frame,
+        )
     if damping > 0.0:
         q_eff = (
             position[:6]
@@ -747,6 +869,58 @@ class ArmGravityModel:
             for i in range(6)
         )
         return geometric_jacobian(q_eff, tool_offset_m=tool_offset_m, frame=frame)
+
+    def forward_kinematics(
+        self,
+        position: Sequence[float] | np.ndarray,
+        tool_offset_m: Sequence[float] | np.ndarray = (0.0, 0.0, 0.0),
+    ) -> np.ndarray:
+        """Return 4x4 T_base_tool with calibrated joint angle offsets applied."""
+        if len(position) < 6:
+            raise ValueError('Six joint positions are required')
+        q_eff = tuple(
+            float(position[i]) + self.joint(i + 1).angle_offset
+            for i in range(6)
+        )
+        return forward_kinematics(q_eff, tool_offset_m=tool_offset_m)
+
+    def inverse_kinematics(
+        self,
+        target: Sequence[float] | np.ndarray,
+        q_seed: Sequence[float] | np.ndarray = (0.0, 0.8, -1.2, 0.0, 0.4, 0.0),
+        *,
+        tool_offset_m: Sequence[float] | np.ndarray = (0.0, 0.0, 0.0),
+        lower_limits: Sequence[float] | np.ndarray | None = None,
+        upper_limits: Sequence[float] | np.ndarray | None = None,
+        damping: float = 1e-3,
+        max_iters: int = 50,
+        pos_tol_m: float = 1e-4,
+        rot_tol_rad: float = 1e-3,
+        return_result: bool = False,
+    ) -> tuple[float, ...] | IkResult:
+        """Solve 6-DOF IK accounting for calibrated joint angle offsets."""
+        if len(q_seed) < 6:
+            raise ValueError('q_seed requires six joint angles')
+        offsets = tuple(self.joint(i + 1).angle_offset for i in range(6))
+        q_eff_seed = tuple(float(q_seed[i]) + offsets[i] for i in range(6))
+        lo_eff = None if lower_limits is None else tuple(float(lower_limits[i]) + offsets[i] for i in range(6))
+        hi_eff = None if upper_limits is None else tuple(float(upper_limits[i]) + offsets[i] for i in range(6))
+        res = inverse_kinematics(
+            target,
+            q_eff_seed,
+            tool_offset_m=tool_offset_m,
+            lower_limits=lo_eff,
+            upper_limits=hi_eff,
+            damping=damping,
+            max_iters=max_iters,
+            pos_tol_m=pos_tol_m,
+            rot_tol_rad=rot_tol_rad,
+            return_result=True,
+        )
+        assert isinstance(res, IkResult)
+        joints_raw = tuple(res.joints[i] - offsets[i] for i in range(6))
+        adjusted = replace(res, joints=joints_raw)
+        return adjusted if return_result else joints_raw
 
     def scaled_inertia_tensors(
         self,

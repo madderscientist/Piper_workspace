@@ -1,4 +1,4 @@
-"""Multi-pose zero-bias and tool-gravity calibration for PaXini PX6D sensors on PiPER-X."""
+"""PiPER-X 上帕西尼 PX6D 六维力传感器的多姿态常数零偏与下游工具重力标定求解。"""
 
 from __future__ import annotations
 
@@ -10,13 +10,11 @@ from typing import Any, Optional, Sequence, Tuple
 import numpy as np
 from piper_x_driver.gravity import link6_rotation_in_base
 
-from .protocol import WrenchSample
-
 GRAVITY_ACCEL = 9.81
 
 
 class WrenchStabilityWindow:
-    """Check raw wrench peak-to-peak ranges over a rolling time window."""
+    """在滑动时间窗口内检查六通道原始力的峰峰值波动，判定机械臂到位后读数是否已稳定。"""
 
     def __init__(self, duration_sec: float, ranges: Sequence[float]) -> None:
         self.duration_sec = float(duration_sec)
@@ -31,7 +29,7 @@ class WrenchStabilityWindow:
             self.reset()
         self.samples.append((now, tuple(wrench[:6])))
         cutoff = now - self.duration_sec
-        # Keep one sample at or just before the window boundary for full coverage.
+        # 保留窗口左边界处或稍早的一帧样本，保证时间跨度完整覆盖 duration_sec。
         while len(self.samples) > 2 and self.samples[1][0] <= cutoff:
             self.samples.popleft()
 
@@ -45,10 +43,10 @@ class WrenchStabilityWindow:
         return bool(np.all(np.ptp(positions, axis=0) <= self.ranges + 1e-12))
 
 
-# Real five-pose arm3 gravity data matches the SDK link6 axes on this assembly.
-# The display URDF joint chain is different and must not be used with SDK joint feedback.
+# 实测五姿态重力数据验证表明：传感器通道方向与 SDK 兼容的 link6 坐标轴一致；
+# 显示用 URDF 关节链与 SDK 关节反馈定义不同，不可用于此处重力投影。
 def sensor_rotation_in_base(q: Sequence[float] | np.ndarray) -> np.ndarray:
-    """Return the sensor channel rotation using the shared SDK-compatible kinematics."""
+    """按共享的 SDK 兼容正运动学返回基座系下传感器测量坐标系的旋转矩阵。"""
     return link6_rotation_in_base(q)
 
 
@@ -58,8 +56,7 @@ def _gravity_direction(q: tuple[float, ...]) -> tuple[float, ...]:
 
 
 def gravity_unit_in_sensor(q: Sequence[float] | np.ndarray) -> np.ndarray:
-    """Return unit downward gravity direction g_hat_S = R_BS(q)^T [0, 0, -1]^T in wrench_sensor frame."""
-    # Key on all measured angles and return independent storage to callers.
+    """返回传感器坐标系下的单位向下重力方向向量 g_hat_S = R_BS(q)^T [0, 0, -1]^T。"""
     return np.asarray(_gravity_direction(tuple(float(v) for v in q[:6])))
 
 
@@ -80,7 +77,7 @@ def tool_gravity_wrench(
     tool_mass_kg: float,
     tool_com_m: Sequence[float],
 ) -> Tuple[float, float, float, float, float, float]:
-    """Return 6-axis gravity wrench (fx, fy, fz, mx, my, mz) of downstream tool in sensor frame."""
+    """返回传感器下游工具（夹爪等）在当前姿态 q 下对传感器参考点产生的六维重力与重力矩。"""
     mass = float(tool_mass_kg)
     if mass <= 0.0 or len(q) < 6:
         return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -98,30 +95,9 @@ def tool_gravity_wrench(
     )
 
 
-def compensate_wrench(
-    raw: WrenchSample,
-    tare_offset: Sequence[float],
-    q: Optional[Sequence[float]] = None,
-    tool_mass_kg: float = 0.0,
-    tool_com_m: Sequence[float] = (0.0, 0.0, 0.0),
-) -> WrenchSample:
-    """Subtract calibrated zero-bias and (when joint angles q are available) tool gravity wrench."""
-    if q is not None and len(q) >= 6 and tool_mass_kg > 0.0:
-        gw = tool_gravity_wrench(q, tool_mass_kg, tool_com_m)
-        return WrenchSample(
-            raw.fx - (tare_offset[0] + gw[0]),
-            raw.fy - (tare_offset[1] + gw[1]),
-            raw.fz - (tare_offset[2] + gw[2]),
-            raw.mx - (tare_offset[3] + gw[3]),
-            raw.my - (tare_offset[4] + gw[4]),
-            raw.mz - (tare_offset[5] + gw[5]),
-        )
-    return raw.minus(tare_offset)
-
-
 @dataclass(frozen=True)
 class CalibrationResult:
-    """Solved sensor zero-bias and downstream tool gravity model."""
+    """多姿态最小二乘解算得到的传感器常数零偏、下游工具质量/质心及可辨识性指标。"""
 
     tare_offset: Tuple[float, float, float, float, float, float]
     tool_mass_kg: float
@@ -153,10 +129,10 @@ def solve_wrench_calibration(
     *,
     gravity_directions: Optional[Sequence[Sequence[float] | np.ndarray] | np.ndarray] = None,
 ) -> CalibrationResult:
-    """Fit f=b_f+W*g and t=b_t-[g]_x*p, with W=m*9.81 and p=W*CoM.
+    """联合拟合 F = b_F + W*d 与 M = b_M - [d]_x * p（W = m*9.81，p = W*c），分离常数零偏与工具重力。
 
-    Use mean gravity directions over each sample window when available; R(mean(q))
-    generally differs from mean(R(q)). Rank diagnostics expose unobservable parameters.
+    优先使用每个采样窗口内逐帧计算再取平均的重力方向 d，因为非线性旋转满足 R(mean(q)) != mean(R(q))；
+    同时输出设计矩阵秩，明确报告工具质量与质心在所给姿态集合下是否可辨识。
     """
     n = len(poses)
     if n == 0 or n != len(wrenches):
@@ -178,12 +154,10 @@ def solve_wrench_calibration(
     if force_rank == 4:
         x_f = np.linalg.lstsq(a_f, force.reshape(-1), rcond=None)[0]
         weight = max(0.0, float(x_f[3]))
-        # This is the exact constrained LS solution for W >= 0: at W=0,
-        # the optimal bias is the observed mean, not the unconstrained intercept.
+        # 带物理约束 W >= 0 的精确最小二乘解：若截断到 W=0，最优零偏退化为观测均值。
         f_bias = force.mean(axis=0) - weight * g.mean(axis=0)
     else:
-        # Constant orientation cannot separate mass and bias. Choose W=0 from
-        # the equivalent solution family and report mass_identifiable=False.
+        # 姿态重力方向缺乏变化时无法分离常数零偏与工具质量，取等价解族中的 W=0 并标记不可辨识。
         weight = 0.0
         f_bias = force.mean(axis=0)
     if weight > 0.0:

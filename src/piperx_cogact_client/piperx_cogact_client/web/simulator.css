@@ -1,0 +1,36 @@
+.simulator { height: 100dvh; min-height: 480px; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; }
+.sim-topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 24px; padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.sim-topbar h1 { font-size: 18px; }
+.sim-source { display: flex; gap: 16px; border: 0; padding: 0; margin: 0 0 0 auto; }
+.sim-source label { display: flex; align-items: center; gap: 6px; color: var(--text); white-space: nowrap; }
+.sim-source input { accent-color: var(--primary); }
+.sim-stage { position: relative; min-height: 0; overflow: hidden; }
+.sim-stage canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.sim-overlay { position: absolute; z-index: 1; top: 12px; left: 16px; right: 16px; display: flex; flex-wrap: wrap; gap: 8px 18px; pointer-events: none; font-size: 12px; }
+.sim-arm { display: inline-flex; align-items: center; gap: 6px; }
+.sim-arm::before { content: ""; width: 16px; height: 3px; background: currentColor; }
+.sim-left { color: #087f71; }
+.sim-right { color: #b96c2c; }
+#sim-status { color: var(--muted); overflow-wrap: anywhere; }
+.sim-footer { padding: 10px 16px; background: var(--panel); border-top: 1px solid var(--line); }
+.sim-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.icon-button { display: inline-grid; place-items: center; width: 36px; height: 36px; min-height: 36px; padding: 7px; flex-shrink: 0; }
+.icon-button svg { width: 19px; height: 19px; }
+.sim-request { display: inline-flex; align-items: center; gap: 6px; }
+.sim-request svg { width: 18px; height: 18px; }
+.sim-speed { display: flex; align-items: center; gap: 6px; margin-inline: 8px; }
+.sim-speed select { width: 76px; }
+.sim-view-tools { display: flex; gap: 8px; margin-left: auto; }
+.sim-timeline { display: grid; grid-template-columns: 64px minmax(0, 1fr) 80px; gap: 12px; align-items: center; margin-top: 10px; }
+.sim-timeline input { width: 100%; min-width: 0; accent-color: var(--primary); }
+.sim-timeline output { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+#sim-time { text-align: right; }
+@media (max-width: 600px) {
+  .sim-topbar { padding: 10px 12px; gap: 8px 14px; }
+  .sim-topbar h1 { flex: 1 1 200px; }
+  .sim-source { margin-left: 0; order: 2; }
+  .sim-footer { padding: 8px 10px; }
+  .sim-speed { margin-inline: 0; }
+  #sim-batch { flex-basis: calc(100% - 88px); }
+  .sim-timeline { grid-template-columns: 56px minmax(0, 1fr) 64px; gap: 8px; }
+}

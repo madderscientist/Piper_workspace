@@ -24,10 +24,9 @@ from piper_gravity.model import (
     save_gravity_model,
 )
 from piper_gravity.web import GravityWorkbenchNode, create_http_server, synthesize_demo_probe_samples
-from piper_x_driver.backend import Feedback
+from conftest import Feedback, MockDriverNode as DriverNode
 from piper_x_driver.configuration import default_config_path, FleetConfig
 from piper_x_driver.gravity import estimate_joint_torques
-from piper_x_driver.node import DriverNode
 from piper_x_driver.terminal import terminal_for_model
 import numpy as np
 import yaml

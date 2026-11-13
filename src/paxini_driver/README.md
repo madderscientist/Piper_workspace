@@ -45,7 +45,7 @@ ros2 launch paxini_driver px6d.launch.py arm:=arm_4
 
 ## 3. 驱动职责与接口
 
-驱动负责硬件通信，以及使用已有标定结果进行零偏和工具重力补偿。
+常驻驱动节点 `driver` 采用 C++（`rclcpp` + Linux 原生 `termios` / `SocketCAN`）实现，负责高频硬件通信，以及使用已有标定结果进行零偏和工具重力补偿；低频离线标定工具 `calibrate` 保持为独立 Python 客户端。
 驱动不控制机械臂，不采集多姿态标定点，不拟合参数，也不写标定配置。
 正常采集及重连成功不打印 INFO；通信异常及数据断流才报警，同一异常持续期间只报一次，
 恢复收到有效六维力后重置告警。`stream_timeout_sec` 默认 1 秒，仅用于断流告警。

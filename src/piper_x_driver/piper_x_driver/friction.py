@@ -7,6 +7,11 @@ from pathlib import Path
 
 import yaml
 
+try:
+    from . import _core as _cpp_core
+except ImportError:
+    _cpp_core = None
+
 
 def _interp_1d(x: float, xs: tuple[float, ...], ys: tuple[float, ...]) -> float:
     """Piecewise-linear 1D interpolation with endpoint clamping."""
@@ -220,6 +225,17 @@ class JointFrictionModel:
         Combines Stribeck + periodic ripple when moving with error/target-velocity
         breakaway stiction at rest so static friction deadband is overcome smoothly.
         """
+        if _cpp_core is not None:
+            h_packed = [(h.omega, h.a, h.b, h.c, h.d) for h in self.harmonics]
+            return _cpp_core.joint_friction_torque(
+                self.fc, self.fs, self.vs, self.delta, self.fv, self.v0, self.vr,
+                self.load_ratio, self.error_epsilon, self.velocity_epsilon,
+                h_packed, float(theta), float(velocity),
+                float(position_error), float(target_velocity),
+                float(gravity_torque), float(static_friction),
+                error_epsilon, velocity_epsilon,
+                bool(active_impedance), float(cogging_scale), float(friction_scale),
+            )
         theta_f = float(theta)
         mod_raw, cog_raw = self._mod_and_cogging(theta_f)
         eps_e = self.error_epsilon if error_epsilon is None else float(error_epsilon)

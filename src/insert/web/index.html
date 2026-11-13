@@ -69,8 +69,8 @@
             <input type="number" id="input-close-mm" min="0" max="100" step="0.5" value="0.0">
           </div>
           <div class="param-item">
-            <label for="input-grip-effort">夹持力度 (0..5)</label>
-            <input type="number" id="input-grip-effort" min="0.1" max="5.0" step="0.1" value="2.0">
+            <label for="input-grip-effort">夹持力度 <span id="grip-effort-val">2.00</span> / 2.0</label>
+            <input type="range" id="input-grip-effort" class="effort-slider" min="0.0" max="2.0" step="0.05" value="2.0">
           </div>
         </div>
 
@@ -147,12 +147,26 @@
           <span class="card-tag" id="policy-state-badge">策略：待机</span>
         </div>
         <p class="card-desc">
-          用手把拿着插头的末端从孔中拿起来（移出孔），然后点击“执行插入策略”启动 50 Hz 闭环力控插孔。
+          用手把拿着插头的末端从孔中拿起来（移出孔），选择力来源后点击“执行插入策略”（启动前会自动对当前位置进行临时重力消除，使当前力示数归零）。
         </p>
+
+        <div class="wrench-source-row">
+          <div class="param-item wrench-source-item">
+            <label for="select-wrench-source">力反馈来源 (Wrench Source)</label>
+            <select id="select-wrench-source">
+              <option value="paxini">力传感器 (paxini_driver · wrench_stamped)</option>
+              <option value="estimated">估计力 (MIT 关节阻抗估计 · end_wrench_stamped)</option>
+            </select>
+          </div>
+          <span class="card-tag" id="wrench-source-badge">力传感器：等待数据</span>
+        </div>
 
         <div class="policy-btn-row">
           <button type="button" class="btn btn-success btn-xl" id="btn-start-policy">
             ▶ 执行插入策略 (Execute Policy)
+          </button>
+          <button type="button" class="btn btn-primary btn-xl" id="btn-start-rule">
+            📐 规则直接插入 (对准→垂直下压)
           </button>
           <button type="button" class="btn btn-warning btn-lg" id="btn-stop-drag">
             ⏹ 停止并切回零力拖动
@@ -171,7 +185,7 @@
             <strong id="policy-steps-time">0 步 · 0.0 s</strong>
           </div>
           <div class="metric-card">
-            <span>策略频率 / 推理耗时</span>
+            <span>策略频率 / 推理与逆解耗时</span>
             <strong id="policy-rate-latency">0.0 Hz · — ms</strong>
           </div>
           <div class="metric-card">
@@ -299,14 +313,7 @@
         </table>
 
         <details class="params-details">
-          <summary>高级参数配置（MIT 阻抗刚度 kp 与事件日志）</summary>
-          <div class="adv-params-grid">
-            <div class="param-item">
-              <label for="input-kp-list">策略 MIT 刚度 kp (6 轴 Nm/rad)</label>
-              <input type="text" id="input-kp-list" value="45, 45, 45, 10, 6, 4">
-            </div>
-            <button type="button" class="btn btn-secondary" id="btn-save-params">应用参数</button>
-          </div>
+          <summary>运行事件日志</summary>
           <div class="log-list" id="log-list"></div>
         </details>
       </article>

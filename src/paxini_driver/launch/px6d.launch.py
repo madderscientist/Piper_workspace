@@ -13,9 +13,6 @@ _NODE_KEYS = (
     "expected_version",
     "baudrate",
     "can_channel",
-    "can_interface",
-    "can_bitrate",
-    "can_data_bitrate",
     "device_id",
     "model",
     "frame_id",
@@ -55,7 +52,10 @@ def _launch_nodes(context):
     single = len(selected) == 1
     nodes = []
     for entry in selected:
-        params = {k: entry[k] for k in _NODE_KEYS if k in entry}
+        params = {k: entry[k] for k in _NODE_KEYS if k in entry and entry[k] is not None}
+        for k in ("tare_offset", "tool_com_m"):
+            if k in params:
+                params[k] = [float(x) for x in params[k]]
         params["config_file"] = config_file or str(default_config_path())
         if iface:
             params["interface"] = iface

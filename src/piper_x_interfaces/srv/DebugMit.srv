@@ -1,8 +1,0 @@
-string action
-string session
-float64[6] position
----
-bool success
-string message
-string session
-float64[6] position

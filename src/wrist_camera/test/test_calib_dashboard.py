@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from .conftest import front_pose, render
-from piper_x_driver.gravity import _fast_fk
+from piper_x_driver.gravity import forward_kinematics
 from wrist_camera import transforms
 from wrist_camera.board import Board
 from wrist_camera.calib import CalibrationApp
@@ -60,8 +60,7 @@ def test_config_arm_selection_and_fk_agreement(board_cfg, cameras_cfg):
             select_arm_camera(cameras_cfg, bad_arm, bad_cam)
 
     q = (0.15, 0.85, -1.25, 0.35, -0.45, 0.55)
-    _, _, centers, rots = _fast_fk(q, (0.0, 0.0, GRIPPER_BASE_WITH_FLANGE_TOP_Z_M))
-    expected = transforms.rt_to_matrix(np.asarray(rots[5], float), centers[6])
+    expected = forward_kinematics(q, (0.0, 0.0, GRIPPER_BASE_WITH_FLANGE_TOP_Z_M))
     assert np.allclose(piper_fk(q, tool_offset_z_m=GRIPPER_BASE_WITH_FLANGE_TOP_Z_M), expected, atol=1e-12)
 
 

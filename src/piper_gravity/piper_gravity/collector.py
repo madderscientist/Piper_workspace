@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
-from piper_x_driver.backend import MIT_GAIN_SCALE, MIT_KD_LSB, MIT_KP_LSB
+from piper_x_driver.protocol import MIT_GAIN_SCALE, MIT_KD_LSB, MIT_KP_LSB
 from piper_x_driver.gravity import ArmGravityModel, gravity_torques, load_gravity_model, max_critical_kd
 from piper_x_interfaces.msg import ArmStatus, MitCommand
 from piper_x_interfaces.srv import ConfigureArm, Enable, SetMode
