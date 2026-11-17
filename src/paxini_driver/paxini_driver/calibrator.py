@@ -37,6 +37,7 @@ from .configuration import (
 JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
 CALIB_KP = (25.0, 25.0, 25.0, 8.0, 6.0, 4.0)
 CALIB_KD = (4.5, 4.5, 2.2, 0.3, 0.24, 0.06)
+CALIB_JOINT_SPEED_RAD_S = (0.4,) * 6
 MIT_POSITION_LIMIT = (
     12.5  # MIT 协议编码表示上限，并非额外附加的软件运动限位。
 )
@@ -65,6 +66,14 @@ class PoseCalibrator(Node):
         entry = resolve_sensor_configs(
             arm_id, str(config_path) if config_path else None
         )[0]
+        self.calib_joint_speed_rad_s = tuple(
+            float(v)
+            for v in entry.get("calib_joint_speed_rad_s", CALIB_JOINT_SPEED_RAD_S)
+        )
+        if len(self.calib_joint_speed_rad_s) != 6 or not all(
+            math.isfinite(v) and v > 0.0 for v in self.calib_joint_speed_rad_s
+        ):
+            raise ValueError("calib_joint_speed_rad_s 必须是六个有限正数，单位 rad/s")
         super().__init__("paxini_calibration_client", namespace=entry["namespace"])
         self.arm_id = entry["arm_id"]
         self.config_file = source_config_path(config_path)
@@ -217,12 +226,32 @@ class PoseCalibrator(Node):
         return True, "ok"
 
     def _command_pose(self, q_target: Sequence[float]) -> None:
-        """一次性下发六个关节的最终目标角，重置力稳定窗口，由底层机械臂驱动完成运动。"""
+        """按各关节速度上限同步插值，到达最终目标后重置力稳定窗口。"""
         if self._stop_event.is_set():
             raise RuntimeError("校准已停止")
+        q_start = self._wait_for_joints()
+        delta = [target - start for target, start in zip(q_target, q_start)]
+        duration = max(
+            abs(distance) / speed
+            for distance, speed in zip(delta, self.calib_joint_speed_rad_s)
+        )
+        started = time.monotonic()
+        elapsed = 0.0
+        while True:
+            if self._stop_event.is_set():
+                raise RuntimeError("校准已停止")
+            alpha = min(1.0, elapsed / duration) if duration > 0.0 else 1.0
+            self._publish_mit_cmd(
+                q_target
+                if alpha >= 1.0
+                else [start + alpha * distance for start, distance in zip(q_start, delta)]
+            )
+            if alpha >= 1.0:
+                break
+            time.sleep(min(0.005, duration - elapsed))
+            elapsed = time.monotonic() - started
         with self._lock:
             self._wrench_stability.reset()
-        self._publish_mit_cmd(q_target)
 
     def _wait_for_wrench_stability(self, q_target: Sequence[float]) -> None:
         while True:

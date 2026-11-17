@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from ament_index_python.packages import get_package_prefix
 import numpy as np
@@ -19,6 +20,7 @@ import pytest
 import rclpy
 import yaml
 from geometry_msgs.msg import WrenchStamped
+from paxini_driver import calibrator
 from paxini_driver.calibration import (
     WrenchStabilityWindow,
     sensor_rotation_in_base,
@@ -63,6 +65,66 @@ def test_wrench_stability_requires_full_window_and_detects_fluctuation():
     window.update(q, 1.8)
     assert window.is_stable(1.8)
     assert not window.is_stable(2.7)
+
+
+def test_calibration_pose_limits_each_joint_speed_and_resets_stability(monkeypatch):
+    clock = [0.0]
+    commands = []
+    initial = (0.3, -0.2, 0.1, -0.4, 0.5, 0.0)
+    target = (-0.1, 0.0, 0.1, 0.2, -0.3, 0.1)
+    speeds = (0.2, 0.1, 0.2, 0.15, 0.2, 0.05)
+    window = WrenchStabilityWindow(0.1, [1.0] * 6)
+
+    def sleep(duration):
+        clock[0] += duration
+        window.update([0.0] * 6, clock[0])
+
+    monkeypatch.setattr(
+        calibrator, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
+    )
+    client = SimpleNamespace(
+        _stop_event=threading.Event(),
+        _lock=threading.Lock(),
+        _wrench_stability=window,
+        calib_joint_speed_rad_s=speeds,
+        _wait_for_joints=lambda: initial,
+        _publish_mit_cmd=lambda q: commands.append((clock[0], tuple(q))),
+    )
+    for destination in (target, initial, initial):
+        start = client._wait_for_joints()
+        commands.clear()
+        calibrator.PoseCalibrator._command_pose(client, destination)
+        assert commands[0][1] == pytest.approx(start)
+        assert commands[-1][1] == pytest.approx(destination)
+        for (t0, q0), (t1, q1) in zip(commands, commands[1:]):
+            assert np.all(
+                np.abs(np.subtract(q1, q0)) <= np.array(speeds) * (t1 - t0) + 1e-12
+            )
+        assert not window.is_stable(clock[0])
+        client._wait_for_joints = lambda q=destination: q
+
+
+def test_calibration_pose_stops_without_jumping_to_target(monkeypatch):
+    stop = threading.Event()
+    commands = []
+
+    def sleep(duration):
+        stop.set()
+
+    monkeypatch.setattr(
+        calibrator, "time", SimpleNamespace(monotonic=lambda: 0.0, sleep=sleep)
+    )
+    client = SimpleNamespace(
+        _stop_event=stop,
+        _lock=threading.Lock(),
+        _wrench_stability=WrenchStabilityWindow(0.1, [1.0] * 6),
+        calib_joint_speed_rad_s=(0.2,) * 6,
+        _wait_for_joints=lambda: (0.0,) * 6,
+        _publish_mit_cmd=lambda q: commands.append(tuple(q)),
+    )
+    with pytest.raises(RuntimeError, match="校准已停止"):
+        calibrator.PoseCalibrator._command_pose(client, (1.0,) * 6)
+    assert commands and all(q == (0.0,) * 6 for q in commands)
 
 
 def test_real_arm3_calibration_matches_independent_sdk_pose():
@@ -121,6 +183,7 @@ def test_independent_calibrator_with_cpp_driver_pty_reloads_and_compensates(tmp_
                 "defaults": {
                     "calib_settle_sec": 0.1,
                     "calib_sample_sec": 0.05,
+                    "calib_joint_speed_rad_s": [0.8] * 6,
                     "calib_stability_range": [0.1] * 3 + [0.01] * 3,
                 },
                 "sensors": {
@@ -235,7 +298,7 @@ def test_independent_calibrator_with_cpp_driver_pty_reloads_and_compensates(tmp_
             time.sleep(0.005)
         assert state["q"] == pytest.approx(initial)
         assert all(
-            any(np.allclose(q, t) for t in [initial, *poses]) for q in state["commands"]
+            any(np.allclose(q, t) for q in state["commands"]) for t in [initial, *poses]
         )
         assert result["tare_offset"] == pytest.approx(bias, abs=0.03)
         assert result["tool_mass_kg"] == pytest.approx(mass, abs=0.005)
