@@ -206,7 +206,7 @@ double JointFrictionModel::torque(
   }
   const double env = envelope(velocity);
   double v0_eff = v0;
-  if (!active_impedance && v0 <= 0.005) {
+  if (!active_impedance) {
     v0_eff = std::max({
       v0,
       UNDAMPED_MIN_V0,

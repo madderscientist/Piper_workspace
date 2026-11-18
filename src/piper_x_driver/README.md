@@ -160,6 +160,15 @@ $$
   - **命令行工具**：可通过 `ros2 run piper_x_driver damping --kp 60 60 60 12 8 8 --effector teaching_handle` 直接算出 `kd: [9.25, 9.31, 4.51, 0.6, 0.49, 0.13]` 填入配置文件；
   - **运行时负数自动推导**：当上层 `MitCommand` 或配置文件将某轴 `kd` 传为负数（如 `-1.0`）时，驱动层 `Controller` 自动根据当前机械臂末端负载与 `kp` 推导出对应阻尼下发。
 
+### 2.1 任务空间末端笛卡尔 MIT 阻抗控制 (`command/cartesian_mit`)
+
+针对末端加装力传感器或长短可变工具的柔顺接触任务（不使用固件原生法兰位置模式 `0x152..0x154`），驱动在 `mode == 'mit'` 下同时监听 `command/mit` 与 `command/cartesian_mit`：
+
+- **双话题互斥接管与统一超时回退**：两者共享 `0.2 s` 看门狗计时窗口，最新收到哪一路目标即立即生效并清空另一路目标，无需切换驱动模式；超时未收到新目标时统一回退至当前实测姿态重力支撑。
+- **200 Hz 内环任意工具偏移解算**：当 `cartesian_mit_target` 生效时，`Controller::compute_cartesian_mit` 每个 `5 ms` 周期读取最新关节位置/速度反馈，按消息携带的实时 `tool_offset`（`link6` 系下 `[x, y, z] m`）计算正运动学与基座系 $6 \times 6$ 几何雅可比 $J(q, r_{\text{tool}})$，由三维位置误差与轴角姿态误差求得限幅后的任务空间力螺旋 $\mathcal{F}_{\text{tip}} = [f_b^T, m_b^T]^T$，映射为无交叉耦合的关节阻抗力矩 $\tau_{\text{cart}} = J(q, r_{\text{tool}})^T \mathcal{F}_{\text{tip}}$。
+- **20 kHz 电机载波守恒折合与全模态阻尼包络（`joint_kd < 0`）**：当 `joint_kd[i] < 0` 时，驱动按实时 $J(q, r_{\text{tool}})$ 与姿态惯量 $M(q)$ 求取诱导刚度矩阵 $K_q = J^T K_{\text{cart}} J$ 的舒尔补临界阻尼与质量归一化谱平方根阻尼包络作为电机硬件阻尼 `kd`，并将 $\tau_{\text{cart}}$ 守恒折合进整数量化步长的正载波刚度 $k_{p,\text{foc}, i} = m_i \cdot \text{MIT\_KP\_LSB}_i$（确保电机驱动器内部 ~20 kHz 位置/速度环激活且零量化漂移，跳过关节自适应刚度 $s_a$，静摩擦破除按完整关节弹簧总力矩驱动）。
+- **统一走关节 MIT CAN 通道下发**：折合生成的 `MitTarget` 进入同一 `send_mit` 流程，照常叠加标定重力补偿 $g(q)$ 与关节摩擦补偿 $f(q, \dot{q})$，最终编码为标准 `0x151 + 0x15A..0x15F` MIT CAN 报文批量下发。
+
 ---
 
 ## 3. 重力补偿及其分配机制
@@ -328,8 +337,8 @@ $$
 | JSON 键 | 内容与单位 |
 |---|---|
 | `configuration` | 当前臂 `id/name/namespace/can_port`、`end_effector`、`gravity_scale`、`friction_scale`、`gravity_config`、`friction_config`、`debug_kp/debug_kd`、`config_file`、当前 `effector` 详情及全部可选 `effectors` |
-| `mode`, `mit_ready` | 驱动内部模式（`standby/joint/point/linear/mit/drag/hold`）及外部 MIT 就绪标志（`ctrl_mode==1 && mode_feedback==6`） |
-| `mit_target` | 当前活动的外部 MIT 6 轴目标角（`rad`，无外部目标或回退重力补偿时为 `null`） |
+| `mode`, `mit_ready`, `cartesian_mit_active` | 驱动内部模式（`standby/joint/point/linear/mit/drag/hold`）、外部 MIT 就绪标志（`ctrl_mode==1 && mode_feedback==6`）及当前是否由 `command/cartesian_mit` 驱动 |
+| `mit_target` | 当前活动的外部关节 MIT 6 轴目标角（`rad`，笛卡尔 MIT 活动、无外部目标或回退重力补偿时为 `null`） |
 | `joint_lower`, `joint_upper` | 前端滑条推荐初始显示跨度（`rad`，非驱动命令限位） |
 | `gravity_torque`, `friction_torque` | 当前 6 轴重力补偿力矩 $g_i(q)$ 与旋转关节摩擦补偿力矩 $f_i(q,\dot{q})$（`Nm`） |
 | `gripper_friction`, `gripper_velocity`, `gripper_force` | 夹爪非周期摩擦与偏置补偿力（`N`）、`30 ms` 滑窗实测开合速度（`m/s`）、`0x2A8` 实测力 |
@@ -349,7 +358,8 @@ $$
 |---|---|---|---|
 | `command/joints` | [`JointCommand`](../piper_x_interfaces/msg/JointCommand.msg) | Reliable, Depth 10 | `position[6]`（`rad`）+ `speed_percent`（`1..100`）。`joint` 模式下发 `0x151` + `0x155..157`；`mit` 模式下仅更新 MIT 目标位置 `position[6]`（保留当前或预设 `kp/kd/velocity/torque`） |
 | `command/cartesian` | [`CartesianCommand`](../piper_x_interfaces/msg/CartesianCommand.msg) | Reliable, Depth 10 | `pose[6]`（`[x,y,z,roll,pitch,yaw]`，`m/rad`）+ `speed_percent`（`1..100`）；需先通过 `set_mode` 选择 `point`（MoveP）或 `linear`（MoveL），每次下发时驱动将 `0x151`（速度与模式）与 `0x152..154` 目标帧合并批量发送 |
-| `command/mit` | [`MitCommand`](../piper_x_interfaces/msg/MitCommand.msg) | Best-Effort, Depth 5 | 六轴关节侧 `position[6]`（`±12.5 rad`）、`velocity[6]`（`±45 rad/s`）、`kp[6]`（`0..500 Nm/rad`）、`kd[6]`（传入 `< 0` 如 `-1.0` 时由驱动自动推导最大临界阻尼）、`torque[6]`（额外前馈 `Nm`）；输入超时窗口 `0.2 s`，每周期驱动将 `0x151` MIT 保活帧与 `0x15A..15F` 六轴帧合并批量下发 |
+| `command/mit` | [`MitCommand`](../piper_x_interfaces/msg/MitCommand.msg) | Best-Effort, Depth 5 | 六轴关节侧 `position[6]`（`±12.5 rad`）、`velocity[6]`（`±45 rad/s`）、`kp[6]`（`0..500 Nm/rad`）、`kd[6]`（传入 `< 0` 如 `-1.0` 时由驱动自动推导最大临界阻尼）、`torque[6]`（额外前馈 `Nm`）；与 `command/cartesian_mit` 互斥接管，输入超时窗口 `0.2 s`，每周期驱动将 `0x151` MIT 保活帧与 `0x15A..15F` 六轴帧合并批量下发 |
+| `command/cartesian_mit` | [`CartesianMitCommand`](../piper_x_interfaces/msg/CartesianMitCommand.msg) | Best-Effort, Depth 5 | `base_link` 系目标位置 `position[3]`（`m`）、`link6` 目标姿态四元数 `quat_wxyz[4]`、`link6` 系实时工具偏移 `tool_offset[3]`（`m`）、笛卡尔刚度/阻尼 `kp[6]` / `kd[6]`、电机硬件关节阻尼 `joint_kd[6]`（`< 0` 自动按实时 `tool_offset` 推导全模态阻尼并激活 20 kHz 载波折合）及力/力矩上限 `max_force` / `max_torque`；与 `command/mit` 互斥接管，在驱动 200 Hz 内环解算后同样经 `0x151 + 0x15A..15F` MIT 报文下发 |
 | `command/gripper` | [`GripperCommand`](../piper_x_interfaces/msg/GripperCommand.msg) | Best-Effort, Depth 5 | 夹爪总开度 `width`（`0..0.1 m`）与力控参数 `effort`（`0..5`；配置了夹爪摩擦模型时自动叠加非周期摩擦补偿；`effort <= 0` 为释放或被动捏合摩擦辅助），下发 `0x159` |
 
 ### 6.3 提供的 ROS 2 服务

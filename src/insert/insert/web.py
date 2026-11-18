@@ -17,7 +17,7 @@ import numpy as np
 from piper_x_driver.configuration import ArmConfig, default_config_path, FleetConfig
 from piper_x_driver.protocol import MIT_POSITION_LIMIT, RateMeter
 from piper_x_driver.gravity import ArmGravityModel
-from piper_x_interfaces.msg import ArmStatus, GripperCommand, MitCommand
+from piper_x_interfaces.msg import ArmStatus, CartesianMitCommand, GripperCommand, MitCommand
 from piper_x_interfaces.srv import Enable, SetMode
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -30,6 +30,11 @@ from std_msgs.msg import String
 from std_srvs.srv import SetBool
 
 from .policy import (
+    CARTESIAN_AUTO_JOINT_KD,
+    CARTESIAN_MAX_FORCE_N,
+    CARTESIAN_MAX_TORQUE_NM,
+    CARTESIAN_TIP_KD,
+    CARTESIAN_TIP_KP,
     DEFAULT_TIP_LENGTH_M,
     PAXINI_SENSOR_OFFSET_M,
     POLICY_PERIOD_S,
@@ -44,6 +49,7 @@ from .policy import (
     quat_rotvec,
     quat_to_rpy_deg,
     relative_pose_in_hole,
+    tip_target_to_link6_mit,
 )
 
 JOINT_NAMES = tuple(f'joint{i}' for i in range(1, 7)) + ('gripper',)
@@ -141,6 +147,12 @@ class InsertDashboardNode(Node):
         self.hold_joints: tuple[float, ...] | None = None
         self.last_cmd_joints: tuple[float, ...] | None = None
         self.last_cmd_velocity: tuple[float, ...] = (0.0,) * 6
+        self.last_cart_target: tuple[np.ndarray, np.ndarray] | None = None
+        self.cartesian_kp: tuple[float, ...] = CARTESIAN_TIP_KP
+        self.cartesian_kd: tuple[float, ...] = CARTESIAN_TIP_KD
+        self.cartesian_joint_kd: tuple[float, ...] = CARTESIAN_AUTO_JOINT_KD
+        self.cartesian_max_force_n: float = CARTESIAN_MAX_FORCE_N
+        self.cartesian_max_torque_nm: float = CARTESIAN_MAX_TORQUE_NM
         self.last_step_result: PolicyStepResult | None = None
         self.policy_started_at: float | None = None
         self._last_policy_tick_at: float | None = None
@@ -199,6 +211,7 @@ class InsertDashboardNode(Node):
                                  callback_group=self._feedback_callbacks)
 
         self.mit_pub = self.create_publisher(MitCommand, f'{ns}/command/mit', 10)
+        self.cartesian_mit_pub = self.create_publisher(CartesianMitCommand, f'{ns}/command/cartesian_mit', 10)
         self.gripper_pub = self.create_publisher(GripperCommand, f'{ns}/command/gripper', 10)
         self.enable_client = self.create_client(Enable, f'{ns}/enable_srv', callback_group=self._feedback_callbacks)
         self.mode_client = self.create_client(SetMode, f'{ns}/set_mode', callback_group=self._feedback_callbacks)
@@ -207,6 +220,7 @@ class InsertDashboardNode(Node):
         self._estimation_requested = None
 
         self._mit_msg = MitCommand()
+        self._cart_mit_msg = CartesianMitCommand()
         self._grip_msg = GripperCommand()
         self._timer = self.create_timer(POLICY_PERIOD_S, self._tick)
         self._command_timer = self.create_timer(
@@ -377,15 +391,45 @@ class InsertDashboardNode(Node):
         msg.torque[:] = torque[:6]
         self.mit_pub.publish(msg)
 
+    def _publish_cartesian_mit(
+        self,
+        p_target_b: Sequence[float] | np.ndarray,
+        q_target_bt: Sequence[float] | np.ndarray,
+    ) -> None:
+        pos_b, q_link6, offset_link6 = tip_target_to_link6_mit(
+            p_target_b, q_target_bt, tip_offset_m=self.tip_offset_m,
+        )
+        msg = self._cart_mit_msg
+        msg.position[:] = pos_b
+        msg.quat_wxyz[:] = q_link6
+        msg.tool_offset[:] = offset_link6
+        msg.kp[:] = self.cartesian_kp
+        msg.kd[:] = self.cartesian_kd
+        msg.joint_kd[:] = self.cartesian_joint_kd
+        msg.max_force = float(self.cartesian_max_force_n)
+        msg.max_torque = float(self.cartesian_max_torque_nm)
+        self.cartesian_mit_pub.publish(msg)
+
+    def _publish_active_policy_command(self) -> None:
+        if self.active_controller == 'onnx' and self.last_cart_target is not None:
+            self._publish_cartesian_mit(*self.last_cart_target)
+            self._ensure_driver_mit_mode()
+        elif self.last_cmd_joints is not None:
+            self._ensure_driver_mit_mode(self.last_cmd_joints)
+            self._publish_mit(
+                self.last_cmd_joints, AUTO_MIT_GAINS, AUTO_MIT_GAINS, self.last_cmd_velocity,
+            )
+
     def _publish_gripper(self, width_m: float, effort: float) -> None:
         msg = self._grip_msg
         msg.width = max(0.0, min(0.1, float(width_m)))
         msg.effort = max(0.0, min(MAX_GRIP_EFFORT, float(effort)))
         self.gripper_pub.publish(msg)
 
-    def _ensure_driver_mit_mode(self, q_preload: Sequence[float]) -> None:
+    def _ensure_driver_mit_mode(self, q_preload: Sequence[float] | None = None) -> None:
         if str(self.control_state.get('mode', '')) != 'mit':
-            self._publish_mit(q_preload, (0.0,) * 6, (0.0,) * 6)
+            if q_preload is not None:
+                self._publish_mit(q_preload, (0.0,) * 6, (0.0,) * 6)
             if self.mode_client.service_is_ready():
                 self.mode_client.call_async(SetMode.Request(mode='mit'))
 
@@ -411,7 +455,9 @@ class InsertDashboardNode(Node):
             self._sync_estimation_source()
             if self.gripper_state in ('open', 'closed') and self.gripper_cmd_effort > 0.0:
                 self._publish_gripper(self.gripper_cmd_width_m, self.gripper_cmd_effort)
-            if self.mode == 'policy' and self.last_cmd_joints is not None:
+            if self.mode == 'policy':
+                self._publish_active_policy_command()
+            elif self.mode == 'move' and self.last_cmd_joints is not None:
                 self._ensure_driver_mit_mode(self.last_cmd_joints)
                 self._publish_mit(
                     self.last_cmd_joints, AUTO_MIT_GAINS, AUTO_MIT_GAINS, self.last_cmd_velocity,
@@ -425,6 +471,7 @@ class InsertDashboardNode(Node):
             q_meas = self.joint_positions
 
             if self.mode == 'drag':
+                self.last_cart_target = None
                 self.last_cmd_joints = q_meas
                 self.last_cmd_velocity = (0.0,) * 6
                 self._ensure_driver_mit_mode(q_meas)
@@ -432,6 +479,7 @@ class InsertDashboardNode(Node):
                 return
 
             if self.mode == 'hold':
+                self.last_cart_target = None
                 target_q = self.hold_joints if self.hold_joints is not None else q_meas
                 self.last_cmd_joints = target_q
                 self.last_cmd_velocity = (0.0,) * 6
@@ -471,6 +519,7 @@ class InsertDashboardNode(Node):
             else:
                 step_res = self.policy.step(
                     q_meas, goal, wrench_t, tip_offset_m=offset, gravity_model=self.gravity_model,
+                    solve_ik=False,
                 )
         except Exception as exc:
             error = str(exc)
@@ -484,16 +533,19 @@ class InsertDashboardNode(Node):
                 self.last_error = error or '策略执行异常'
                 self.status_message = f'策略执行异常：{self.last_error}'
                 self._log('ERROR', self.status_message)
+                self.last_cart_target = None
                 self.hold_joints = q_meas
                 self.last_cmd_velocity = (0.0,) * 6
                 self.mode = 'hold'
                 return
             self.last_cmd_joints = step_res.q_cmd
             self.last_cmd_velocity = step_res.v_cmd
-            self._ensure_driver_mit_mode(step_res.q_cmd)
-            self._publish_mit(
-                step_res.q_cmd, AUTO_MIT_GAINS, AUTO_MIT_GAINS, step_res.v_cmd,
+            self.last_cart_target = (
+                (step_res.p_target_b.copy(), step_res.q_target_bt.copy())
+                if controller_kind == 'onnx'
+                else None
             )
+            self._publish_active_policy_command()
             self.policy_rate.mark(now)
             self.last_step_result = step_res
             self.last_error = ''
@@ -598,6 +650,7 @@ class InsertDashboardNode(Node):
         with self.lock:
             self.mode = 'drag'
             self.hold_joints = None
+            self.last_cart_target = None
             if self.joint_positions is not None:
                 self._ensure_driver_mit_mode(self.joint_positions)
                 self._publish_mit(self.joint_positions, (0.0,) * 6, (0.0,) * 6)
@@ -704,6 +757,8 @@ class InsertDashboardNode(Node):
             self.active_controller = ctrl_kind
             self.last_cmd_joints = tuple(float(v) for v in self.joint_positions[:6])
             self.last_cmd_velocity = (0.0,) * 6
+            self.last_cart_target = (p_bt.copy(), q_bt.copy()) if ctrl_kind == 'onnx' else None
+            self._publish_active_policy_command()
             # Temporary gravity elimination at the current pose so the wrench reading starts at 0.
             with self._wrench_lock:
                 bias = self.wrench_filter.tare()
@@ -714,10 +769,13 @@ class InsertDashboardNode(Node):
             self.reached_goal_steps = 0
             self.last_error = ''
             self.history.clear()
-            self._ensure_driver_mit_mode(self.joint_positions)
             self.mode = 'policy'
             src_label = 'paxini_driver 力传感器' if self.wrench_source == 'paxini' else '估计力'
-            ctrl_label = '规则直接插入（先水平+角度对准 → 垂直下压）' if ctrl_kind == 'rule' else 'InsertAnything ONNX 策略'
+            ctrl_label = (
+                '规则直接插入（先水平+角度对准 → 垂直下压）'
+                if ctrl_kind == 'rule'
+                else 'InsertAnything ONNX 策略（200 Hz 末端笛卡尔阻抗）'
+            )
             self.status_message = (
                 f'已完成当前位置重力消除（力示数归零，来源：{src_label}），正在执行 {ctrl_label}（50 Hz）'
             )
@@ -742,6 +800,7 @@ class InsertDashboardNode(Node):
                 else None
             )
             self.mode = target_mode
+            self.last_cart_target = None
             self.last_cmd_velocity = (0.0,) * 6
             self._policy_generation += 1
             label = {
@@ -783,6 +842,14 @@ class InsertDashboardNode(Node):
                 self.tip_length_m = float(new_offset[2])
                 if self.goal is not None:
                     self.goal = self._build_goal(self.goal.joints, self.goal.recorded_at)
+                if self.last_cart_target is not None:
+                    if self.joint_positions is not None:
+                        p_bt, q_bt = forward_tip_pose(
+                            self.joint_positions, tip_offset_m=new_offset, gravity_model=self.gravity_model,
+                        )
+                        self.last_cart_target = (p_bt.copy(), q_bt.copy())
+                    else:
+                        self.last_cart_target = None
             if body.get('filter_tau_s') is not None:
                 tau_val = float(body['filter_tau_s'])
                 if not math.isfinite(tau_val) or tau_val <= 0.0:
@@ -795,6 +862,16 @@ class InsertDashboardNode(Node):
                     raise ValueError('tau_1khz_s must be positive')
                 for wf in self._wrench_filters.values():
                     wf.tau = tau_1k
+            if body.get('cartesian_kp') is not None:
+                kp_in = [float(v) for v in body['cartesian_kp']]
+                if len(kp_in) != 6 or any((not math.isfinite(v) or v < 0.0) for v in kp_in):
+                    raise ValueError('cartesian_kp requires 6 non-negative numbers')
+                self.cartesian_kp = tuple(kp_in)
+            if body.get('cartesian_kd') is not None:
+                kd_in = [float(v) for v in body['cartesian_kd']]
+                if len(kd_in) != 6 or any((not math.isfinite(v) or v < 0.0) for v in kd_in):
+                    raise ValueError('cartesian_kd requires 6 non-negative numbers')
+                self.cartesian_kd = tuple(kd_in)
             ox_cm, oy_cm, oz_cm = (v * 100.0 for v in self.tip_offset_m)
             src_label = '力传感器 (paxini_driver)' if self.wrench_source == 'paxini' else '估计力 (MIT)'
             self.status_message = (
@@ -811,6 +888,8 @@ class InsertDashboardNode(Node):
             'filter_tau_s': self.wrench_filter.tau,
             'filter_alpha': self.wrench_filter.alpha,
             'filter_sample_hz': 1.0 / self.wrench_filter.sample_dt if self.wrench_filter.sample_dt else None,
+            'cartesian_kp': list(self.cartesian_kp),
+            'cartesian_kd': list(self.cartesian_kd),
             'message': self.status_message,
         }
 
@@ -937,6 +1016,9 @@ class InsertDashboardNode(Node):
                 'wrench': wrench_data,
                 'policy': {
                     'mode': self.mode,
+                    'execution_mode': 'joint_mit' if self.active_controller == 'rule' else 'cartesian_mit',
+                    'cartesian_kp': list(self.cartesian_kp),
+                    'cartesian_kd': list(self.cartesian_kd),
                     'controller': self.active_controller,
                     'rule_stage': self.rule_policy.stage if self.active_controller == 'rule' else None,
                     'wrench_source': self.wrench_source,

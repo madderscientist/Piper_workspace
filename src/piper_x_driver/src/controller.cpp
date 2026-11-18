@@ -1,5 +1,7 @@
 #include "piper_x_driver/controller.hpp"
 
+#include <Eigen/Dense>
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -25,6 +27,14 @@ void check_finite_6(const Vec6 & v, const std::string & name) {
   for (double x : v) {
     if (!std::isfinite(x)) {
       throw std::invalid_argument(name + ": six finite values required");
+    }
+  }
+}
+
+void check_finite_3(const Vec3 & v, const std::string & name) {
+  for (double x : v) {
+    if (!std::isfinite(x)) {
+      throw std::invalid_argument(name + ": three finite values required");
     }
   }
 }
@@ -175,6 +185,7 @@ void Controller::reset_dynamics_state(bool clear_compensation) {
 void Controller::clear_power_state() {
   mode = "standby";
   mit_target.reset();
+  cartesian_mit_target.reset();
   mit_received.reset();
   gripper_received_.reset();
   reset_dynamics_state(true);
@@ -312,12 +323,15 @@ void Controller::set_mode(const std::string & next_mode, bool preload_mit) {
         arm_.mode("hold");
       }
       const double now = clock_();
-      if (preload_mit &&
-          (!mit_target.has_value() || !mit_received.has_value() || now - *mit_received > 0.2))
-      {
+      const bool has_fresh =
+        (mit_target.has_value() || cartesian_mit_target.has_value()) &&
+        mit_received.has_value() && (now - *mit_received <= 0.2);
+      if (preload_mit && !has_fresh) {
         mit(gravity_command(sample));
       }
-      if (!mit_target.has_value() || !mit_received.has_value() || clock_() - *mit_received > 0.2) {
+      if (!(mit_target.has_value() || cartesian_mit_target.has_value()) ||
+          !mit_received.has_value() || clock_() - *mit_received > 0.2)
+      {
         throw std::invalid_argument("Publish a fresh six-joint MIT target before entering MIT");
       }
       mit_started = clock_();
@@ -328,7 +342,10 @@ void Controller::set_mode(const std::string & next_mode, bool preload_mit) {
         (offset_ramp_s > 0.0) ? 0.0 : adaptive_stiffness_scale_val;
       gravity_updated = clock_();
       reset_dynamics_state(false);
-      send_mit(*mit_target, sample);
+      const MitTarget first_cmd = cartesian_mit_target.has_value()
+        ? compute_cartesian_mit(*cartesian_mit_target, sample)
+        : *mit_target;
+      send_mit(first_cmd, sample);
     }
   }
   arm_.mode(next_mode);
@@ -464,13 +481,199 @@ void Controller::mit(const MitTarget & raw_cmd) {
     command.torque[i] = std::clamp(command.torque[i], -t_max, t_max);
   }
   mit_target = command;
+  cartesian_mit_target.reset();
   const double now = clock_();
   mit_received = now;
   ros_cmd_rate.mark(now);
 }
 
+void Controller::cartesian_mit(const CartesianMitTarget & raw_cmd) {
+  check_finite_3(raw_cmd.position, "position");
+  check_finite_3(raw_cmd.tool_offset, "tool_offset");
+  check_finite_6(raw_cmd.kp, "kp");
+  check_finite_6(raw_cmd.kd, "kd");
+  check_finite_6(raw_cmd.joint_kd, "joint_kd");
+  if (!std::isfinite(raw_cmd.max_force) || raw_cmd.max_force < 0.0) {
+    throw std::invalid_argument("max_force must be finite and non-negative");
+  }
+  if (!std::isfinite(raw_cmd.max_torque) || raw_cmd.max_torque < 0.0) {
+    throw std::invalid_argument("max_torque must be finite and non-negative");
+  }
+  double q_norm2 = 0.0;
+  for (double c : raw_cmd.quat_wxyz) {
+    if (!std::isfinite(c)) {
+      throw std::invalid_argument("quat_wxyz: four finite values required");
+    }
+    q_norm2 += c * c;
+  }
+  const double q_norm = std::sqrt(q_norm2);
+  if (q_norm < 1e-9) {
+    throw std::invalid_argument("quat_wxyz must have non-zero norm");
+  }
+
+  CartesianMitTarget cmd = raw_cmd;
+  for (double & c : cmd.quat_wxyz) {
+    c /= q_norm;
+  }
+  for (int i = 0; i < 6; ++i) {
+    if (cmd.kp[i] < 0.0 || cmd.kd[i] < 0.0) {
+      throw std::invalid_argument("Cartesian MIT kp and kd must be non-negative");
+    }
+    if (cmd.joint_kd[i] >= 0.0) {
+      cmd.joint_kd[i] = std::clamp(cmd.joint_kd[i], 0.0, 100.0);
+    }
+  }
+  cartesian_mit_target = cmd;
+  mit_target.reset();
+  const double now = clock_();
+  mit_received = now;
+  ros_cmd_rate.mark(now);
+}
+
+MitTarget Controller::compute_cartesian_mit(
+  const CartesianMitTarget & cart, const Feedback & sample) const
+{
+  Vec6 q_meas{};
+  Vec6 q_eff{};
+  for (int i = 0; i < 6; ++i) {
+    q_meas[i] = (*sample.position)[i];
+    q_eff[i] = q_meas[i] +
+      (gravity_model.has_value() ? gravity_model->joint(i + 1).angle_offset : 0.0);
+  }
+  const Vec6 dq = sample.has_velocity_torque
+    ? sample.velocity
+    : Vec6{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+
+  const FkResult fk = fast_fk(q_eff, cart.tool_offset);
+  const Vec3 & p_curr = fk.centers[6];
+  Eigen::Matrix3d r_curr;
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      r_curr(r, c) = fk.rots[5][r][c];
+    }
+  }
+  const Eigen::Matrix3d r_des = Eigen::Quaterniond(
+    cart.quat_wxyz[0], cart.quat_wxyz[1], cart.quat_wxyz[2], cart.quat_wxyz[3]).toRotationMatrix();
+  Eigen::AngleAxisd aa(r_des * r_curr.transpose());
+  double rot_angle = aa.angle();
+  if (rot_angle > kPi) {
+    rot_angle -= 2.0 * kPi;
+  }
+  const Eigen::Vector3d e_r = aa.axis() * rot_angle;
+
+  Eigen::Matrix<double, 6, 6> j_mat;
+  for (int i = 0; i < 6; ++i) {
+    const Eigen::Vector3d z_i(fk.axes[i][0], fk.axes[i][1], fk.axes[i][2]);
+    const Eigen::Vector3d r_i(
+      p_curr[0] - fk.origins[i][0],
+      p_curr[1] - fk.origins[i][1],
+      p_curr[2] - fk.origins[i][2]);
+    j_mat.block<3, 1>(0, i) = z_i.cross(r_i);
+    j_mat.block<3, 1>(3, i) = z_i;
+  }
+  const Eigen::Matrix<double, 6, 1> twist =
+    j_mat * Eigen::Map<const Eigen::Matrix<double, 6, 1>>(dq.data());
+
+  Eigen::Matrix<double, 6, 1> wrench_b;
+  for (int k = 0; k < 3; ++k) {
+    double fk_val = cart.kp[k] * (cart.position[k] - p_curr[k]) - cart.kd[k] * twist(k);
+    if (cart.max_force > 0.0) {
+      fk_val = std::clamp(fk_val, -cart.max_force, cart.max_force);
+    }
+    wrench_b(k) = fk_val;
+
+    double mk_val = cart.kp[3 + k] * e_r(k) - cart.kd[3 + k] * twist(3 + k);
+    if (cart.max_torque > 0.0) {
+      mk_val = std::clamp(mk_val, -cart.max_torque, cart.max_torque);
+    }
+    wrench_b(3 + k) = mk_val;
+  }
+
+  MitTarget out;
+  out.position = q_meas;
+  out.kd = cart.joint_kd;
+
+  const Eigen::Matrix<double, 6, 1> tau_raw = j_mat.transpose() * wrench_b;
+  Vec6 tau_cart{};
+  for (int i = 0; i < 6; ++i) {
+    const double t_max = 8.0 * JOINT_TORQUE_B[i] * JOINT_TORQUE_C[i];
+    tau_cart[i] = std::clamp(tau_raw(i), -t_max, t_max);
+    out.torque[i] = tau_cart[i];
+  }
+
+  if (std::any_of(cart.joint_kd.begin(), cart.joint_kd.end(), [](double v) { return v < 0.0; })) {
+    constexpr double kReg = 1e-4;
+    constexpr double kModalZeta = 0.44;
+    static constexpr std::array<long, 6> kCarrierLsbMult = {{2, 2, 2, 6, 6, 6}};
+
+    const Eigen::Map<const Eigen::Matrix<double, 6, 1>> kp_vec(cart.kp.data());
+    const bool any_cart_kp = (kp_vec.maxCoeff() > 0.0);
+    Eigen::Matrix<double, 6, 6> k_q = j_mat.transpose() * kp_vec.asDiagonal() * j_mat;
+    k_q.diagonal().array() += kReg;
+    const Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt(k_q);
+    Vec6 k_schur{};
+    if (llt.info() == Eigen::Success) {
+      const Eigen::Matrix<double, 6, 6> c_q = llt.solve(Eigen::Matrix<double, 6, 6>::Identity());
+      for (int i = 0; i < 6; ++i) {
+        const double c_ii = c_q(i, i);
+        k_schur[i] = (c_ii > 1e-9) ? std::max(0.0, (1.0 / c_ii) - kReg) : 0.0;
+      }
+    }
+    const std::string eff_name = effector.has_value() ? effector->model : "teaching_handle";
+    const std::optional<double> eff_mass =
+      effector.has_value() ? std::optional<double>(effector->mass_kg) : std::nullopt;
+    const std::optional<Vec3> eff_com =
+      effector.has_value() ? std::optional<Vec3>(effector->com_m) : std::nullopt;
+    const Vec6 kd_schur = max_critical_kd(
+      k_schur, eff_name, gravity_model.has_value() ? &(*gravity_model) : nullptr);
+    const Vec6 inertias = gravity_model.has_value()
+      ? gravity_model->inertias(q_meas, eff_name, eff_mass, eff_com)
+      : joint_inertias(q_meas, eff_name, eff_mass, eff_com);
+
+    Eigen::Matrix<double, 6, 1> inv_sqrt_m;
+    for (int i = 0; i < 6; ++i) {
+      inv_sqrt_m(i) = 1.0 / std::sqrt(std::max(inertias[i], 1e-6));
+    }
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(
+      inv_sqrt_m.asDiagonal() * k_q * inv_sqrt_m.asDiagonal());
+    Vec6 kd_modal{};
+    if (eig.info() == Eigen::Success) {
+      const auto & vals = eig.eigenvalues();
+      const auto & vecs = eig.eigenvectors();
+      for (int i = 0; i < 6; ++i) {
+        double sqrt_a_ii = 0.0;
+        for (int m = 0; m < 6; ++m) {
+          sqrt_a_ii += vecs(i, m) * vecs(i, m) * std::sqrt(std::max(vals(m), 0.0));
+        }
+        kd_modal[i] = 2.0 * kModalZeta * inertias[i] * sqrt_a_ii;
+      }
+    }
+
+    for (int i = 0; i < 6; ++i) {
+      if (cart.joint_kd[i] < 0.0) {
+        out.kd[i] = std::clamp(
+          std::max({2.0 * MIT_KD_LSB[i], kd_schur[i], kd_modal[i]}), 0.0, 100.0);
+        if (any_cart_kp) {
+          // Fold Cartesian spring torque into an exact quantized positive kp carrier so the
+          // motor ESC 20 kHz position & velocity loops remain active with zero quantization drift.
+          const double kp_foc = static_cast<double>(kCarrierLsbMult[i]) * MIT_KP_LSB[i];
+          const double dq_fold = std::clamp(
+            tau_cart[i] / kp_foc,
+            std::max(-0.8, -11.5 - q_meas[i]),
+            std::min(0.8, 11.5 - q_meas[i]));
+          out.kp[i] = kp_foc;
+          out.position[i] = q_meas[i] + dq_fold;
+          out.torque[i] = tau_cart[i] - kp_foc * dq_fold;
+        }
+      }
+    }
+  }
+  return out;
+}
+
 void Controller::release_mit() {
   mit_target.reset();
+  cartesian_mit_target.reset();
   mit_received.reset();
 }
 
@@ -651,9 +854,11 @@ void Controller::send_mit(
     target_velocities[i] =
       (std::abs(command.velocity[i]) > 1e-9) ? command.velocity[i] : step_target_vel[i];
   }
+  const bool is_cart_mit = cartesian_mit_target.has_value();
   const Vec6 base_kd = resolve_kd(command.kp, command.kd);
-  const auto [effective_kp, resolved_kd] =
-    resolve_adaptive_gains(command.kp, base_kd, position_errors);
+  const auto [effective_kp, resolved_kd] = is_cart_mit
+    ? std::pair<Vec6, Vec6>{command.kp, base_kd}
+    : resolve_adaptive_gains(command.kp, base_kd, position_errors);
   applied_kp = effective_kp;
   applied_kd = resolved_kd;
 
@@ -680,8 +885,18 @@ void Controller::send_mit(
   for (int i = 0; i < 6; ++i) {
     active_imp[i] =
       (resolved_kd[i] >= MIT_KD_LSB[i]) && (std::lrint(effective_kp[i] / MIT_KP_LSB[i]) > 0);
-    stiction_errors[i] = active_imp[i] ? position_errors[i] : 0.0;
-    stiction_target_vels[i] = active_imp[i] ? target_velocities[i] : 0.0;
+    if (!active_imp[i]) {
+      stiction_errors[i] = 0.0;
+      stiction_target_vels[i] = 0.0;
+    } else if (is_cart_mit) {
+      const double ref_kp = std::max(effective_kp[i], kp[i]);
+      const double total_spring_tau = effective_kp[i] * position_errors[i] + command.torque[i];
+      stiction_errors[i] = total_spring_tau / std::max(ref_kp, 1e-6);
+      stiction_target_vels[i] = 0.0;
+    } else {
+      stiction_errors[i] = position_errors[i];
+      stiction_target_vels[i] = target_velocities[i];
+    }
   }
   const Vec6 raw_friction = friction_model.has_value()
     ? friction_model->torques(
@@ -755,7 +970,7 @@ void Controller::send_mit(
     gripper_received_.has_value() && (0.0 <= now - *gripper_received_) &&
     (now - *gripper_received_ <= 0.2);
   if (!external_grip_active) {
-    if (!mit_target.has_value()) {
+    if (!mit_target.has_value() && !cartesian_mit_target.has_value()) {
       apply_gripper((*sample.position)[6], 0.0, sample, false);
     } else if (gripper_assist_active_) {
       arm_.grip((*sample.position)[6], 0.0);
@@ -808,11 +1023,15 @@ Feedback Controller::watchdog(bool compute_wrench) {
       sample = healthy();
       const double now = clock_();
       MitTarget command;
-      if (mit_target.has_value() && mit_received.has_value() && now - *mit_received <= 0.2) {
+      const bool fresh_rx = mit_received.has_value() && (now - *mit_received <= 0.2);
+      if (fresh_rx && cartesian_mit_target.has_value()) {
+        command = compute_cartesian_mit(*cartesian_mit_target, *sample);
+      } else if (fresh_rx && mit_target.has_value()) {
         command = *mit_target;
       } else {
-        if (mit_target.has_value()) {
+        if (mit_target.has_value() || cartesian_mit_target.has_value()) {
           mit_target.reset();
+          cartesian_mit_target.reset();
           arm_.grip((*sample->position)[6], 0.0);
         }
         command = gravity_command(*sample);

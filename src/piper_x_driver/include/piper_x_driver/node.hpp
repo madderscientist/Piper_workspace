@@ -19,6 +19,7 @@
 
 #include "piper_x_interfaces/msg/arm_status.hpp"
 #include "piper_x_interfaces/msg/cartesian_command.hpp"
+#include "piper_x_interfaces/msg/cartesian_mit_command.hpp"
 #include "piper_x_interfaces/msg/gripper_command.hpp"
 #include "piper_x_interfaces/msg/joint_command.hpp"
 #include "piper_x_interfaces/msg/mit_command.hpp"
@@ -85,6 +86,7 @@ private:
   void on_joints_cmd(const piper_x_interfaces::msg::JointCommand::SharedPtr msg);
   void on_cartesian_cmd(const piper_x_interfaces::msg::CartesianCommand::SharedPtr msg);
   void on_mit_cmd(const piper_x_interfaces::msg::MitCommand::SharedPtr msg);
+  void on_cartesian_mit_cmd(const piper_x_interfaces::msg::CartesianMitCommand::SharedPtr msg);
   void on_gripper_cmd(const piper_x_interfaces::msg::GripperCommand::SharedPtr msg);
 
   void handle_enable(
@@ -158,6 +160,7 @@ private:
   rclcpp::Subscription<piper_x_interfaces::msg::JointCommand>::SharedPtr joints_sub_;
   rclcpp::Subscription<piper_x_interfaces::msg::CartesianCommand>::SharedPtr cartesian_sub_;
   rclcpp::Subscription<piper_x_interfaces::msg::MitCommand>::SharedPtr mit_sub_;
+  rclcpp::Subscription<piper_x_interfaces::msg::CartesianMitCommand>::SharedPtr cartesian_mit_sub_;
   rclcpp::Subscription<piper_x_interfaces::msg::GripperCommand>::SharedPtr gripper_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr teaching_sub_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr teaching_start_client_;

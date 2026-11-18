@@ -259,7 +259,7 @@ class JointFrictionModel:
         # 2. 零速平滑门控 tanh(|dq| / v0)：静止时为 0 防止齿槽补偿在零速自激，一旦运动迅速升至 1
         v0_eff = (
             self.v0
-            if active_impedance or self.v0 > 0.005
+            if active_impedance
             else max(self.v0, UNDAMPED_MIN_V0, (max(self.fs, self.fc) + abs(mod_raw)) / UNDAMPED_MAX_ZERO_SLOPE)
         )
         tanh_v = math.tanh(velocity / v0_eff)

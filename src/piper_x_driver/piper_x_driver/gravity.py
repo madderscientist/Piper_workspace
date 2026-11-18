@@ -36,7 +36,10 @@ import math
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from ament_index_python.packages import get_package_share_directory
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:
+    get_package_share_directory = None  # type: ignore[assignment]
 import numpy as np
 import yaml
 
@@ -67,7 +70,9 @@ def default_arm_urdf_path() -> Path:
     )
     if source_urdf.is_file():
         return source_urdf
-    return Path(get_package_share_directory('piper_description')) / 'urdf/piper_no_gripper_description.urdf'
+    if get_package_share_directory is not None:
+        return Path(get_package_share_directory('piper_description')) / 'urdf/piper_no_gripper_description.urdf'
+    raise FileNotFoundError('Cannot locate piper_description/urdf/piper_no_gripper_description.urdf')
 
 
 def _load_arm_chain_from_urdf(urdf_path: Path):
@@ -75,10 +80,15 @@ def _load_arm_chain_from_urdf(urdf_path: Path):
     joints = {j.attrib['name']: j for j in root.findall('joint')}
     links = {l.attrib['name']: l for l in root.findall('link')}
     xyz_list, rpy_list, mass_list, com_list, inertia_list = [], [], [], [], []
+    lower_list, upper_list = [], []
     for idx in range(1, 7):
-        j_orig = joints[f'joint{idx}'].find('origin')
+        j_el = joints[f'joint{idx}']
+        j_orig = j_el.find('origin')
         xyz_list.append(tuple(float(v) for v in j_orig.attrib.get('xyz', '0 0 0').split()))
         rpy_list.append(tuple(float(v) for v in j_orig.attrib.get('rpy', '0 0 0').split()))
+        lim_el = j_el.find('limit')
+        lower_list.append(float(lim_el.attrib.get('lower', -12.5)) if lim_el is not None else -12.5)
+        upper_list.append(float(lim_el.attrib.get('upper', 12.5)) if lim_el is not None else 12.5)
         inertial = links[f'link{idx}'].find('inertial')
         i_orig = inertial.find('origin')
         com_list.append(tuple(float(v) for v in (i_orig.attrib.get('xyz', '0 0 0') if i_orig is not None else '0 0 0').split()))
@@ -87,10 +97,13 @@ def _load_arm_chain_from_urdf(urdf_path: Path):
         ixx, ixy, ixz = float(imat['ixx']), float(imat['ixy']), float(imat['ixz'])
         iyy, iyz, izz = float(imat['iyy']), float(imat['iyz']), float(imat['izz'])
         inertia_list.append([[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]])
-    return np.array(xyz_list), rpy_list, mass_list, com_list, np.array(inertia_list)
+    return (
+        np.array(xyz_list), rpy_list, mass_list, com_list, np.array(inertia_list),
+        tuple(lower_list), tuple(upper_list),
+    )
 
 
-_XYZ, _RPY, _LINK_MASSES_6, _LINK_COMS_6, _LINK_INERTIAS = _load_arm_chain_from_urdf(
+_XYZ, _RPY, _LINK_MASSES_6, _LINK_COMS_6, _LINK_INERTIAS, _JOINT_LOWER_6, _JOINT_UPPER_6 = _load_arm_chain_from_urdf(
     default_arm_urdf_path()
 )
 _ROTATIONS = np.array([_euler_xyz_matrix(r) for r in _RPY])
@@ -202,6 +215,159 @@ class IkResult:
     orientation_error_rad: float
 
 
+def _rotation_error_world_py(r_des: np.ndarray, r_curr: np.ndarray) -> np.ndarray:
+    r_err = r_des @ r_curr.T
+    tr = float(r_err[0, 0] + r_err[1, 1] + r_err[2, 2])
+    cos_a = max(-1.0, min(1.0, 0.5 * (tr - 1.0)))
+    rx = float(r_err[2, 1] - r_err[1, 2])
+    ry = float(r_err[0, 2] - r_err[2, 0])
+    rz = float(r_err[1, 0] - r_err[0, 1])
+    v = np.array([rx, ry, rz], dtype=float)
+    v_norm = float(np.linalg.norm(v))
+    if v_norm > 1e-12:
+        angle = math.atan2(0.5 * v_norm, cos_a)
+        return v * (angle / v_norm)
+    if cos_a > 0.0:
+        return np.zeros(3, dtype=float)
+    plus = r_err + np.eye(3, dtype=float)
+    col = plus[:, int(np.argmax(np.linalg.norm(plus, axis=0)))]
+    c_norm = float(np.linalg.norm(col))
+    return (math.pi / c_norm) * col if c_norm > 1e-12 else np.zeros(3, dtype=float)
+
+
+def _inv_sym3_damped_py(mat: np.ndarray, lam2: float) -> np.ndarray:
+    return np.linalg.inv(mat + lam2 * np.eye(3, dtype=float))
+
+
+def _inverse_kinematics_py(
+    p_des: np.ndarray,
+    r_des: np.ndarray,
+    q_seed: Sequence[float] | np.ndarray,
+    tool_offset_m: Sequence[float] | np.ndarray,
+    lower_limits: Sequence[float] | np.ndarray | None,
+    upper_limits: Sequence[float] | np.ndarray | None,
+    damping: float,
+    max_iters: int,
+    pos_tol_m: float,
+    rot_tol_rad: float,
+) -> IkResult:
+    lo = np.asarray(_JOINT_LOWER_6 if lower_limits is None else lower_limits[:6], dtype=float)
+    hi = np.asarray(_JOINT_UPPER_6 if upper_limits is None else upper_limits[:6], dtype=float)
+    q = np.clip(np.asarray(q_seed[:6], dtype=float), lo, hi)
+    offset = tuple(float(v) for v in tool_offset_m[:3])
+    lam2_p = max(float(damping) * float(damping), 1e-12)
+    lam2_r = max(lam2_p, 1e-4)
+    iters_cap = max(1, int(max_iters))
+    iter_used = 0
+    jac = np.empty((6, 6), dtype=float)
+
+    for _ in range(iters_cap):
+        origins, axes, centers, rots = _fast_fk(q, offset)
+        tip = np.asarray(centers[6], dtype=float)
+        r_curr = np.asarray(rots[5], dtype=float)
+        ep = p_des - tip
+        er = _rotation_error_world_py(r_des, r_curr)
+        pos_err = float(np.linalg.norm(ep))
+        rot_err = float(np.linalg.norm(er))
+        if pos_err <= pos_tol_m and rot_err <= rot_tol_rad:
+            return IkResult(tuple(float(v) for v in q), True, iter_used, pos_err, rot_err)
+        iter_used += 1
+
+        z_axes = np.asarray(axes[:6], dtype=float)
+        jac[:3] = np.cross(z_axes, tip - np.asarray(origins[:6], dtype=float)).T
+        jac[3:] = z_axes.T
+
+        free_j = [True] * 6
+        dq = np.zeros(6, dtype=float)
+        seen_masks = 0
+
+        for _sub in range(12):
+            free_idx = [i for i in range(6) if free_j[i]]
+            dq_pinned = np.where(free_j, 0.0, dq)
+            ep_rem = ep - jac[:3] @ dq_pinned
+            er_rem = er - jac[3:] @ dq_pinned
+            dq_target = dq_pinned.copy()
+
+            if free_idx:
+                jv = jac[:3, free_idx]
+                jw = jac[3:, free_idx]
+                w_p_dual = _inv_sym3_damped_py(jv @ jv.T, lam2_p)
+                pv = jv.T @ w_p_dual
+                w_p = w_p_dual @ ep_rem
+                dq_p = jv.T @ w_p
+                jw_pv = jw @ pv
+                jw_null = jw - jw_pv @ jv
+                w_rot = _inv_sym3_damped_py(jw_null @ jw_null.T, lam2_r) @ (er_rem - jw @ dq_p)
+                dq_r = jw_null.T @ w_rot
+                dq_f = dq_p + (dq_r - pv @ (jv @ dq_r))
+                dq_target[free_idx] = dq_f
+            else:
+                w_p = ep_rem / lam2_p
+                w_rot = er_rem / lam2_r
+                jw_pv = np.zeros((3, 3), dtype=float)
+
+            d = dq_target - dq
+            best_idx = -1
+            best_alpha = 1.0
+            for idx in free_idx:
+                q_cand = q[idx] + dq_target[idx]
+                if q_cand < lo[idx]:
+                    alpha = (lo[idx] - (q[idx] + dq[idx])) / d[idx] if d[idx] < -1e-15 else 0.0
+                    if alpha < best_alpha:
+                        best_alpha = max(0.0, float(alpha))
+                        best_idx = idx
+                elif q_cand > hi[idx]:
+                    alpha = (hi[idx] - (q[idx] + dq[idx])) / d[idx] if d[idx] > 1e-15 else 0.0
+                    if alpha < best_alpha:
+                        best_alpha = max(0.0, float(alpha))
+                        best_idx = idx
+
+            if best_idx >= 0:
+                dq = dq + best_alpha * d
+                dq[best_idx] = (lo[best_idx] if d[best_idx] < 0.0 else hi[best_idx]) - q[best_idx]
+                free_j[best_idx] = False
+                continue
+
+            dq = dq_target
+            mask = sum((1 << i) for i in range(6) if free_j[i])
+            if mask == 0x3F or ((seen_masks >> mask) & 1) != 0:
+                break
+            seen_masks |= (1 << mask)
+            release_idx = -1
+            best_inward = 1e-9
+            for i in range(6):
+                if free_j[i]:
+                    continue
+                jv_i = jac[:3, i]
+                jw_null_i = jac[3:, i] - jw_pv @ jv_i
+                drive = float(np.dot(jv_i, w_p) + np.dot(jw_null_i, w_rot))
+                at_lo = abs((q[i] + dq[i]) - lo[i]) <= abs((q[i] + dq[i]) - hi[i])
+                inward = drive if at_lo else -drive
+                if inward > best_inward:
+                    best_inward = inward
+                    release_idx = i
+            if release_idx < 0:
+                break
+            free_j[release_idx] = True
+
+        q_new = np.clip(q + dq, lo, hi)
+        step_norm2 = float(np.dot(q_new - q, q_new - q))
+        q = q_new
+        if step_norm2 < 1e-12:
+            break
+
+    _, _, centers_f, rots_f = _fast_fk(q, offset)
+    pos_err = float(np.linalg.norm(p_des - np.asarray(centers_f[6], dtype=float)))
+    rot_err = float(np.linalg.norm(_rotation_error_world_py(r_des, np.asarray(rots_f[5], dtype=float))))
+    return IkResult(
+        tuple(float(v) for v in q),
+        pos_err <= pos_tol_m and rot_err <= rot_tol_rad,
+        iter_used,
+        pos_err,
+        rot_err,
+    )
+
+
 def inverse_kinematics(
     target: Sequence[float] | np.ndarray,
     q_seed: Sequence[float] | np.ndarray = (0.0, 0.8, -1.2, 0.0, 0.4, 0.0),
@@ -235,7 +401,11 @@ def inverse_kinematics(
     if len(tool_offset_m) < 3:
         raise ValueError('tool_offset_m requires three coordinates')
     if _cpp_core is None:
-        raise RuntimeError('piper_x_driver._core C++ extension is required for inverse_kinematics')
+        result = _inverse_kinematics_py(
+            p_des, r_des, q_seed, tool_offset_m, lower_limits, upper_limits,
+            damping, max_iters, pos_tol_m, rot_tol_rad,
+        )
+        return result if return_result else result.joints
     raw = _cpp_core.inverse_kinematics(
         tuple(float(v) for v in p_des),
         r_des.tolist(),

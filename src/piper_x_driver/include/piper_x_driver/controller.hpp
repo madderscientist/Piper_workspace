@@ -118,6 +118,7 @@ public:
   void joints(const Vec6 & position, uint8_t speed_percent);
   void cartesian(const Vec6 & pose, uint8_t speed_percent);
   void mit(const MitTarget & command);
+  void cartesian_mit(const CartesianMitTarget & command);
   void release_mit();
   void gripper(double width, double effort);
 
@@ -135,6 +136,7 @@ public:
   // Public observable state
   std::string mode{"standby"};
   std::optional<MitTarget> mit_target;
+  std::optional<CartesianMitTarget> cartesian_mit_target;
   std::optional<double> mit_received;
   std::optional<Effector> effector;
   std::optional<ArmGravityModel> gravity_model;
@@ -184,6 +186,8 @@ private:
   Vec6 update_acceleration(const Feedback & sample, const MitTarget & command, double now);
   Vec6 update_target_velocity(const Vec6 & target_position, double elapsed);
   MitTarget gravity_command(const Feedback & sample) const;
+  MitTarget compute_cartesian_mit(
+    const CartesianMitTarget & cart, const Feedback & sample) const;
   void update_wrench_estimate(
     const MitTarget & command,
     const Feedback & sample,

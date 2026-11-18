@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from ament_index_python.packages import get_package_share_directory
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:
+    get_package_share_directory = None  # type: ignore[assignment]
 import numpy as np
 import yaml
 

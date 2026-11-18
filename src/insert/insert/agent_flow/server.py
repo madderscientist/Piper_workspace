@@ -987,6 +987,7 @@ class AgentInsertNode(InsertDashboardNode):
             self._move_q_target = q_target
             self._move_prev_joints = q_curr
             self._move_progress = 0.0
+            self.last_cart_target = None
             self.last_cmd_joints = q_curr
             self.last_cmd_velocity = (0.0,) * 6
             self._ensure_driver_mit_mode(q_curr)
@@ -1008,17 +1009,6 @@ class AgentInsertNode(InsertDashboardNode):
         with self.lock:
             self._tip_trace.clear()
         return super().start_policy(controller)
-
-    def _publish_last_target(self) -> None:
-        with self.lock:
-            self._sync_estimation_source()
-            if self.gripper_state in ('open', 'closed') and self.gripper_cmd_effort > 0.0:
-                self._publish_gripper(self.gripper_cmd_width_m, self.gripper_cmd_effort)
-            if self.mode in ('policy', 'move') and self.last_cmd_joints is not None:
-                self._ensure_driver_mit_mode(self.last_cmd_joints)
-                self._publish_mit(
-                    self.last_cmd_joints, AUTO_MIT_GAINS, AUTO_MIT_GAINS, self.last_cmd_velocity,
-                )
 
     def _tick(self) -> None:
         now = time.monotonic()
@@ -1043,6 +1033,7 @@ class AgentInsertNode(InsertDashboardNode):
                         recent_pts = np.stack([pt for _, pt in self._tip_trace], axis=0)
                         span_m = float(np.max(np.linalg.norm(recent_pts - p_bt, axis=1)))
                         if span_m <= 0.0005:
+                            self.last_cart_target = None
                             self.hold_joints = tuple(float(v) for v in self.joint_positions[:6])
                             self.last_cmd_velocity = (0.0,) * 6
                             self.mode = 'hold'

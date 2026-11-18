@@ -7,6 +7,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArmStatus.msg"
   "msg/JointCommand.msg"
   "msg/CartesianCommand.msg"
+  "msg/CartesianMitCommand.msg"
   "msg/MitCommand.msg"
   "msg/GripperCommand.msg"
   "srv/Enable.srv"

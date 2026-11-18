@@ -8,7 +8,10 @@ from pathlib import Path
 import re
 import tempfile
 
-from ament_index_python.packages import get_package_share_directory
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:
+    get_package_share_directory = None  # type: ignore[assignment]
 import yaml
 
 from .friction import ArmFrictionModel, load_friction_model
@@ -61,7 +64,15 @@ class ArmConfig:
 
 
 def default_config_path() -> Path:
-    return Path(get_package_share_directory('piper_x_driver')) / 'config/arms.yaml'
+    source_cfg = Path(__file__).resolve().parent.parent / 'config/arms.yaml'
+    if get_package_share_directory is not None:
+        try:
+            return Path(get_package_share_directory('piper_x_driver')) / 'config/arms.yaml'
+        except Exception:
+            pass
+    if source_cfg.is_file():
+        return source_cfg
+    raise FileNotFoundError('Cannot locate piper_x_driver/config/arms.yaml')
 
 
 def bounded(value, name: str, lower: float, upper: float) -> float:

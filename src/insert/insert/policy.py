@@ -15,7 +15,10 @@ from piper_x_driver.gravity import (
     forward_kinematics,
     geometric_jacobian,
     inverse_kinematics,
+    joint_inertias,
+    max_critical_kd,
 )
+from piper_x_driver.protocol import MIT_KD_LSB, MIT_KP_LSB
 
 POLICY_PERIOD_S = 0.02
 ACTION_TRANSLATION_SCALE_M = 0.001
@@ -50,6 +53,18 @@ DEFAULT_TIP_LENGTH_M = 0.195
 DEFAULT_TIP_OFFSET_M: tuple[float, float, float] = (0.0, 0.0, DEFAULT_TIP_LENGTH_M)
 # PX6D-75A measurement center along +Z_link6/+Z_gripper: 7.5 mm arm flange + 12.0 mm half sensor height
 PAXINI_SENSOR_OFFSET_M: tuple[float, float, float] = (0.0, 0.0, 0.0195)
+
+# Decoupled tip-space Cartesian impedance folded into 20 kHz motor FOC carrier:
+# - CARTESIAN_TIP_KP provides firm lateral/axial drive (650 N/m, 4.8 N*m/rad) to slide off rim contacts without sticking
+# - CARTESIAN_TIP_KD stays well below the two-hop CAN feedback delay limit
+# - CARTESIAN_AUTO_JOINT_KD (-1) activates C++ 20 kHz FOC position-folding + Schur/modal damping at live tool_offset
+CARTESIAN_TIP_KP: tuple[float, ...] = (650.0, 650.0, 650.0, 4.8, 4.8, 4.8)
+CARTESIAN_TIP_KD: tuple[float, ...] = (8.0, 8.0, 8.0, 0.05, 0.05, 0.05)
+CARTESIAN_AUTO_JOINT_KD: tuple[float, ...] = (-1.0, -1.0, -1.0, -1.0, -1.0, -1.0)
+CARTESIAN_CARRIER_LSB_MULT: tuple[int, ...] = (2, 2, 2, 6, 6, 6)
+CARTESIAN_MODAL_ZETA = 0.44
+CARTESIAN_MAX_FORCE_N = 40.0
+CARTESIAN_MAX_TORQUE_NM = 3.0
 
 _Q_T_FROM_GRIPPER = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
 _R_LINK6_TO_T = np.diag([-1.0, 1.0, -1.0])
@@ -228,6 +243,65 @@ def normalize_tip_offset(
 def _gripper_offset_to_link6(offset_gripper: tuple[float, float, float]) -> tuple[float, float, float]:
     gx, gy, gz = offset_gripper
     return (-float(gx), -float(gy), float(gz))
+
+
+def tip_target_to_link6_mit(
+    p_target_b: Sequence[float] | np.ndarray,
+    q_target_bt: Sequence[float] | np.ndarray,
+    *,
+    tip_length_m: float | None = None,
+    tip_offset_m: Sequence[float] | np.ndarray | None = None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float], tuple[float, float, float]]:
+    """Convert tip target (p_BT, q_BT) and gripper offset into piper_x_driver CartesianMitCommand link6 convention."""
+    pos_b = np.asarray(p_target_b, dtype=np.float64).reshape(3)
+    q_link6 = mat_to_quat(quat_to_mat(q_target_bt) @ _R_LINK6_TO_T)
+    offset_link6 = _gripper_offset_to_link6(normalize_tip_offset(tip_offset_m, tip_length_m))
+    return (
+        (float(pos_b[0]), float(pos_b[1]), float(pos_b[2])),
+        (float(q_link6[0]), float(q_link6[1]), float(q_link6[2]), float(q_link6[3])),
+        offset_link6,
+    )
+
+
+def resolve_cartesian_joint_kd(
+    position: Sequence[float] | np.ndarray,
+    cartesian_kp: Sequence[float] | np.ndarray = CARTESIAN_TIP_KP,
+    joint_kd: Sequence[float] | np.ndarray = CARTESIAN_AUTO_JOINT_KD,
+    *,
+    tip_length_m: float | None = None,
+    tip_offset_m: Sequence[float] | np.ndarray | None = None,
+    end_effector: str = 'gripper_with_wrench',
+    gravity_model: ArmGravityModel | None = None,
+) -> np.ndarray:
+    """Resolve 20 kHz motor joint_kd, deriving negative entries from Schur-complement stiffness at live tool_offset."""
+    kd_arr = np.asarray(joint_kd, dtype=np.float64).reshape(6).copy()
+    neg_mask = kd_arr < 0.0
+    if not np.any(neg_mask):
+        return np.clip(kd_arr, 0.0, 100.0)
+    offset_link6 = _gripper_offset_to_link6(normalize_tip_offset(tip_offset_m, tip_length_m))
+    j_b = (
+        geometric_jacobian(position, tool_offset_m=offset_link6, frame='base_link')
+        if gravity_model is None
+        else gravity_model.jacobian(position, tool_offset_m=offset_link6, frame='base_link')
+    )
+    kp_arr = np.asarray(cartesian_kp, dtype=np.float64).reshape(6)
+    reg = 1e-4
+    k_q = j_b.T @ (kp_arr[:, None] * j_b) + reg * _EYE6
+    c_diag = np.diag(np.linalg.inv(k_q))
+    k_schur = np.where(c_diag > 1e-9, np.maximum(0.0, (1.0 / c_diag) - reg), 0.0)
+    eff = gravity_model.effector_model if (gravity_model is not None and gravity_model.effector_model) else end_effector
+    kd_schur = np.asarray(max_critical_kd(k_schur, eff, gravity_model), dtype=np.float64)
+    inertias = np.asarray(
+        joint_inertias(position, eff) if gravity_model is None else gravity_model.inertias(position, eff),
+        dtype=np.float64,
+    )
+    inv_sqrt_m = 1.0 / np.sqrt(np.maximum(inertias, 1e-6))
+    eigvals, eigvecs = np.linalg.eigh((inv_sqrt_m[:, None] * k_q) * inv_sqrt_m[None, :])
+    sqrt_a_diag = np.sum((eigvecs ** 2) * np.sqrt(np.maximum(eigvals, 0.0))[None, :], axis=1)
+    kd_modal = 2.0 * CARTESIAN_MODAL_ZETA * inertias * sqrt_a_diag
+    auto_kd = np.maximum(2.0 * np.asarray(MIT_KD_LSB, dtype=np.float64), np.maximum(kd_schur, kd_modal))
+    kd_arr[neg_mask] = auto_kd[neg_mask]
+    return np.clip(kd_arr, 0.0, 100.0)
 
 
 def forward_tip_pose(
@@ -552,6 +626,7 @@ class InsertAnythingPolicy:
         gravity_model: ArmGravityModel | None = None, goal_pos_h: Sequence[float] = (0.0, 0.0, 0.0),
         goal_quat_h: Sequence[float] = (1.0, 0.0, 0.0, 0.0),
         accumulate_target: bool = False,
+        solve_ik: bool = True,
     ) -> PolicyStepResult:
         start = time.perf_counter_ns()
         offset_gripper = (
@@ -602,22 +677,25 @@ class InsertAnythingPolicy:
             else self.cmd_joints
         )
         p_target_b, q_target_bt = hole_target_to_base(p_cand_h, q_cand_ht, goal.p_bh, goal.q_bh)
-        q_sol = solve_tip_ik(q_seed, p_target_b, q_target_bt, tip_offset_m=offset_gripper, gravity_model=gravity_model)
-
         task_fraction = 1.0
-        if accumulate_target and self.max_joint_step_rad > 0.0:
-            max_dq = float(np.max(np.abs(np.asarray(q_sol) - np.asarray(q_seed))))
-            if max_dq > self.max_joint_step_rad:
-                task_fraction = float(self.max_joint_step_rad / max_dq)
-                p_target_h = base_p_h + task_fraction * (p_cand_h - base_p_h)
-                dr_step = quat_rotvec(quat_mul(q_cand_ht, quat_inv(base_q_ht))) * task_fraction
-                q_target_ht = canonical_quat(quat_mul(rotvec_quat(dr_step), base_q_ht))
-                p_target_b, q_target_bt = hole_target_to_base(p_target_h, q_target_ht, goal.p_bh, goal.q_bh)
-                q_cmd = solve_tip_ik(q_seed, p_target_b, q_target_bt, tip_offset_m=offset_gripper, gravity_model=gravity_model)
+        if not solve_ik:
+            p_target_h, q_target_ht = p_cand_h, q_cand_ht
+            q_cmd = tuple(float(v) for v in q_meas[:6])
+        else:
+            q_sol = solve_tip_ik(q_seed, p_target_b, q_target_bt, tip_offset_m=offset_gripper, gravity_model=gravity_model)
+            if accumulate_target and self.max_joint_step_rad > 0.0:
+                max_dq = float(np.max(np.abs(np.asarray(q_sol) - np.asarray(q_seed))))
+                if max_dq > self.max_joint_step_rad:
+                    task_fraction = float(self.max_joint_step_rad / max_dq)
+                    p_target_h = base_p_h + task_fraction * (p_cand_h - base_p_h)
+                    dr_step = quat_rotvec(quat_mul(q_cand_ht, quat_inv(base_q_ht))) * task_fraction
+                    q_target_ht = canonical_quat(quat_mul(rotvec_quat(dr_step), base_q_ht))
+                    p_target_b, q_target_bt = hole_target_to_base(p_target_h, q_target_ht, goal.p_bh, goal.q_bh)
+                    q_cmd = solve_tip_ik(q_seed, p_target_b, q_target_bt, tip_offset_m=offset_gripper, gravity_model=gravity_model)
+                else:
+                    p_target_h, q_target_ht, q_cmd = p_cand_h, q_cand_ht, q_sol
             else:
                 p_target_h, q_target_ht, q_cmd = p_cand_h, q_cand_ht, q_sol
-        else:
-            p_target_h, q_target_ht, q_cmd = p_cand_h, q_cand_ht, q_sol
 
         self.cmd_p_h = p_target_h.copy()
         self.cmd_q_ht = q_target_ht.copy()

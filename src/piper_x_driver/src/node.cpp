@@ -176,6 +176,9 @@ DriverNode::DriverNode(
   mit_sub_ = this->create_subscription<piper_x_interfaces::msg::MitCommand>(
     "command/mit", realtime_qos,
     std::bind(&DriverNode::on_mit_cmd, this, std::placeholders::_1));
+  cartesian_mit_sub_ = this->create_subscription<piper_x_interfaces::msg::CartesianMitCommand>(
+    "command/cartesian_mit", realtime_qos,
+    std::bind(&DriverNode::on_cartesian_mit_cmd, this, std::placeholders::_1));
   gripper_sub_ = this->create_subscription<piper_x_interfaces::msg::GripperCommand>(
     "command/gripper", realtime_qos,
     std::bind(&DriverNode::on_gripper_cmd, this, std::placeholders::_1));
@@ -409,6 +412,29 @@ void DriverNode::on_mit_cmd(const piper_x_interfaces::msg::MitCommand::SharedPtr
   }
 }
 
+void DriverNode::on_cartesian_mit_cmd(
+  const piper_x_interfaces::msg::CartesianMitCommand::SharedPtr msg)
+{
+  try {
+    if (calibration_active_) {
+      throw std::invalid_argument("Effector calibration in progress; commands rejected");
+    }
+    CartesianMitTarget t;
+    t.position = msg->position;
+    t.quat_wxyz = msg->quat_wxyz;
+    t.tool_offset = msg->tool_offset;
+    t.kp = msg->kp;
+    t.kd = msg->kd;
+    t.joint_kd = msg->joint_kd;
+    t.max_force = msg->max_force;
+    t.max_torque = msg->max_torque;
+    control_->cartesian_mit(t);
+    last_error_.clear();
+  } catch (const std::exception & error) {
+    set_error(error.what());
+  }
+}
+
 void DriverNode::on_gripper_cmd(const piper_x_interfaces::msg::GripperCommand::SharedPtr msg) {
   try {
     if (calibration_active_) {
@@ -480,15 +506,18 @@ void DriverNode::publish_control_state(const Feedback * sample) {
   const bool w_avail = wrench_estimate_available();
   const auto block_reason = calibration_block_reason(
     sample != nullptr ? std::optional<Feedback>(*sample) : std::nullopt);
-  const bool mit_target_live =
-    control_->mode == "mit" && control_->mit_target.has_value() &&
-    control_->mit_received.has_value() && (ctrl_now - *control_->mit_received <= 0.2);
+  const bool mit_fresh =
+    control_->mode == "mit" && control_->mit_received.has_value() &&
+    (ctrl_now - *control_->mit_received <= 0.2);
+  const bool mit_target_live = mit_fresh && control_->mit_target.has_value();
+  const bool cart_mit_live = mit_fresh && control_->cartesian_mit_target.has_value();
 
   std::string & out = control_msg_.data;
   out.clear();
   out += public_config_prefix_;
   out += "\"mode\": \""; out += json_escape(control_->mode); out += "\", ";
   out += "\"mit_ready\": "; out += ((control_->mode == "mit" && control_->mit_ready) ? "true" : "false"); out += ", ";
+  out += "\"cartesian_mit_active\": "; out += (cart_mit_live ? "true" : "false"); out += ", ";
   out += "\"mit_target\": ";
   if (mit_target_live) append_json_vec6(out, control_->mit_target->position); else out += "null";
   out += ", \"joint_lower\": "; append_json_vec6(out, SLIDER_LOWER);

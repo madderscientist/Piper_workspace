@@ -13,12 +13,15 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import WrenchStamped
 from piper_x_driver.gravity import _fast_fk, end_effector_wrench, geometric_jacobian
-from piper_x_interfaces.msg import GripperCommand, MitCommand
+from piper_x_interfaces.msg import CartesianMitCommand, GripperCommand, MitCommand
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
 
 from insert.policy import (
+    CARTESIAN_AUTO_JOINT_KD,
+    CARTESIAN_TIP_KD,
+    CARTESIAN_TIP_KP,
     DEFAULT_TIP_LENGTH_M,
     DEFAULT_TIP_OFFSET_M,
     JOINT_LOWER,
@@ -297,8 +300,10 @@ def test_dashboard_can4_gripper_record_and_policy_workflow():
 
         helper = rclpy.create_node('test_insert_helper')
         received_mit: list[MitCommand] = []
+        received_cart_mit: list[CartesianMitCommand] = []
         received_grip: list[GripperCommand] = []
         helper.create_subscription(MitCommand, '/arm_4/command/mit', received_mit.append, 10)
+        helper.create_subscription(CartesianMitCommand, '/arm_4/command/cartesian_mit', received_cart_mit.append, 10)
         helper.create_subscription(GripperCommand, '/arm_4/command/gripper', received_grip.append, 10)
 
         server = create_http_server(node, host='127.0.0.1', port=0)
@@ -428,10 +433,21 @@ def test_dashboard_can4_gripper_record_and_policy_workflow():
         with urlopen(base_url + '/api/status', timeout=2.0) as resp:
             status = json.loads(resp.read().decode('utf-8'))
         assert status['policy']['mode'] == 'policy' and status['policy']['steps'] == 1
+        assert status['policy']['execution_mode'] == 'cartesian_mit'
         assert status['arm']['hole_relative']['p_ht_mm'][2] == pytest.approx(12.0, abs=0.2)
-        assert list(received_mit[-1].kp) == [-1.0] * 6
-        assert list(received_mit[-1].kd) == [-1.0] * 6
+        assert received_cart_mit
+        assert list(received_cart_mit[-1].kp) == pytest.approx(list(CARTESIAN_TIP_KP))
+        assert list(received_cart_mit[-1].kd) == pytest.approx(list(CARTESIAN_TIP_KD))
+        assert list(received_cart_mit[-1].joint_kd) == pytest.approx(list(CARTESIAN_AUTO_JOINT_KD))
+        assert list(received_cart_mit[-1].tool_offset) == pytest.approx([0.0, 0.0, 0.195])
         assert status['policy']['last_step']['p_target_h_mm'][2] < status['arm']['hole_relative']['p_ht_mm'][2]
+
+        # Dynamic tool_offset update refreshes live Cartesian target tool_offset immediately
+        post('/api/parameters', {'tip_offset_cm': [1.2, -0.8, 22.0]})
+        node._publish_last_target()
+        for _ in range(5):
+            rclpy.spin_once(helper, timeout_sec=0.01)
+        assert list(received_cart_mit[-1].tool_offset) == pytest.approx([-0.012, 0.008, 0.220])
 
         res_stop = post('/api/policy/stop', {'mode': 'drag'})
         assert res_stop['mode'] == 'drag'

@@ -29,6 +29,7 @@ setup(
             'insert = insert.web:web_main',
             'agent_web = insert.agent_flow.server:agent_web_main',
             'agent = insert.agent_flow.server:agent_web_main',
+            'sim = insert.sim_mujoco:main',
         ],
     },
 )

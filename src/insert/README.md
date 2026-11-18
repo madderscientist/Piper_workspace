@@ -52,3 +52,19 @@ ros2 launch insert agent.launch.py port:=8093
 3. **板块 2 · 双图 Agent 识别**：前端提供两段式可编辑 Prompt，单次调用 `gpt-6.1-sol (max)` 同时识别两张外部相机图，输出 `arm_4` 坐标系下孔口位置、插入朝向、对齐增量并绘制三维重投影标记图。
 4. **板块 3 · 初步移动**：平滑控制插头姿态对齐孔轴，并将插头末端移至孔口正前方 `0.5 cm` 处悬停锁位。
 5. **板块 4 · 执行插入**：与原 `insert` 一致选择 `Rule-based` 或 `Policy-based` 完成 50 Hz 闭环力控插入。
+
+## 4. 带腕部六维力传感器的整臂 MuJoCo 仿真 (`insert.sim_mujoco`)
+
+基于 `piper_description_with_wrench.urdf`（含臂侧法兰、PX6D-75A 传感器、夹爪侧法兰、双指夹爪与夹持插头碰撞体）搭建的 1 kHz 物理仿真环境，在 `mjlab` 环境（Python 3.11 + MuJoCo 3.6）下运行：
+
+```bash
+# 运行多组执行对照实验（关节 MIT PD vs 200 Hz 尖端笛卡尔阻抗、单点清零 vs 姿态解析重力补偿、规则策略）
+PYTHONPATH=src/piper_x_driver:src/insert ~/micromamba/envs/mjlab/bin/python -m insert.sim_mujoco --compare
+
+# 启动交互式 Viser 3D 网页可视化（默认 http://127.0.0.1:8095）
+PYTHONPATH=src/piper_x_driver:src/insert ~/micromamba/envs/mjlab/bin/python -m insert.sim_mujoco --viser --impedance cartesian_tip
+
+# 单回合运行并保存渲染快照
+PYTHONPATH=src/piper_x_driver:src/insert ~/micromamba/envs/mjlab/bin/python -m insert.sim_mujoco \
+  --shape hexagon --impedance cartesian_tip --snapshot /tmp/piper_sim.png
+```
