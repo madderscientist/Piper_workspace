@@ -30,10 +30,6 @@ from std_msgs.msg import String
 from std_srvs.srv import SetBool
 
 from .policy import (
-    CARTESIAN_AUTO_JOINT_KD,
-    CARTESIAN_MAX_FORCE_N,
-    CARTESIAN_MAX_TORQUE_NM,
-    CARTESIAN_TIP_KD,
     CARTESIAN_TIP_KP,
     DEFAULT_TIP_LENGTH_M,
     PAXINI_SENSOR_OFFSET_M,
@@ -149,10 +145,6 @@ class InsertDashboardNode(Node):
         self.last_cmd_velocity: tuple[float, ...] = (0.0,) * 6
         self.last_cart_target: tuple[np.ndarray, np.ndarray] | None = None
         self.cartesian_kp: tuple[float, ...] = CARTESIAN_TIP_KP
-        self.cartesian_kd: tuple[float, ...] = CARTESIAN_TIP_KD
-        self.cartesian_joint_kd: tuple[float, ...] = CARTESIAN_AUTO_JOINT_KD
-        self.cartesian_max_force_n: float = CARTESIAN_MAX_FORCE_N
-        self.cartesian_max_torque_nm: float = CARTESIAN_MAX_TORQUE_NM
         self.last_step_result: PolicyStepResult | None = None
         self.policy_started_at: float | None = None
         self._last_policy_tick_at: float | None = None
@@ -404,10 +396,6 @@ class InsertDashboardNode(Node):
         msg.quat_wxyz[:] = q_link6
         msg.tool_offset[:] = offset_link6
         msg.kp[:] = self.cartesian_kp
-        msg.kd[:] = self.cartesian_kd
-        msg.joint_kd[:] = self.cartesian_joint_kd
-        msg.max_force = float(self.cartesian_max_force_n)
-        msg.max_torque = float(self.cartesian_max_torque_nm)
         self.cartesian_mit_pub.publish(msg)
 
     def _publish_active_policy_command(self) -> None:
@@ -867,11 +855,6 @@ class InsertDashboardNode(Node):
                 if len(kp_in) != 6 or any((not math.isfinite(v) or v < 0.0) for v in kp_in):
                     raise ValueError('cartesian_kp requires 6 non-negative numbers')
                 self.cartesian_kp = tuple(kp_in)
-            if body.get('cartesian_kd') is not None:
-                kd_in = [float(v) for v in body['cartesian_kd']]
-                if len(kd_in) != 6 or any((not math.isfinite(v) or v < 0.0) for v in kd_in):
-                    raise ValueError('cartesian_kd requires 6 non-negative numbers')
-                self.cartesian_kd = tuple(kd_in)
             ox_cm, oy_cm, oz_cm = (v * 100.0 for v in self.tip_offset_m)
             src_label = '力传感器 (paxini_driver)' if self.wrench_source == 'paxini' else '估计力 (MIT)'
             self.status_message = (
@@ -889,7 +872,6 @@ class InsertDashboardNode(Node):
             'filter_alpha': self.wrench_filter.alpha,
             'filter_sample_hz': 1.0 / self.wrench_filter.sample_dt if self.wrench_filter.sample_dt else None,
             'cartesian_kp': list(self.cartesian_kp),
-            'cartesian_kd': list(self.cartesian_kd),
             'message': self.status_message,
         }
 
@@ -1018,7 +1000,6 @@ class InsertDashboardNode(Node):
                     'mode': self.mode,
                     'execution_mode': 'joint_mit' if self.active_controller == 'rule' else 'cartesian_mit',
                     'cartesian_kp': list(self.cartesian_kp),
-                    'cartesian_kd': list(self.cartesian_kd),
                     'controller': self.active_controller,
                     'rule_stage': self.rule_policy.stage if self.active_controller == 'rule' else None,
                     'wrench_source': self.wrench_source,

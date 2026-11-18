@@ -491,14 +491,6 @@ void Controller::cartesian_mit(const CartesianMitTarget & raw_cmd) {
   check_finite_3(raw_cmd.position, "position");
   check_finite_3(raw_cmd.tool_offset, "tool_offset");
   check_finite_6(raw_cmd.kp, "kp");
-  check_finite_6(raw_cmd.kd, "kd");
-  check_finite_6(raw_cmd.joint_kd, "joint_kd");
-  if (!std::isfinite(raw_cmd.max_force) || raw_cmd.max_force < 0.0) {
-    throw std::invalid_argument("max_force must be finite and non-negative");
-  }
-  if (!std::isfinite(raw_cmd.max_torque) || raw_cmd.max_torque < 0.0) {
-    throw std::invalid_argument("max_torque must be finite and non-negative");
-  }
   double q_norm2 = 0.0;
   for (double c : raw_cmd.quat_wxyz) {
     if (!std::isfinite(c)) {
@@ -516,11 +508,8 @@ void Controller::cartesian_mit(const CartesianMitTarget & raw_cmd) {
     c /= q_norm;
   }
   for (int i = 0; i < 6; ++i) {
-    if (cmd.kp[i] < 0.0 || cmd.kd[i] < 0.0) {
-      throw std::invalid_argument("Cartesian MIT kp and kd must be non-negative");
-    }
-    if (cmd.joint_kd[i] >= 0.0) {
-      cmd.joint_kd[i] = std::clamp(cmd.joint_kd[i], 0.0, 100.0);
+    if (cmd.kp[i] < 0.0) {
+      throw std::invalid_argument("Cartesian MIT kp must be non-negative");
     }
   }
   cartesian_mit_target = cmd;
@@ -540,6 +529,14 @@ MitTarget Controller::compute_cartesian_mit(
     q_eff[i] = q_meas[i] +
       (gravity_model.has_value() ? gravity_model->joint(i + 1).angle_offset : 0.0);
   }
+  MitTarget out;
+  out.position = q_meas;
+
+  const Eigen::Map<const Eigen::Matrix<double, 6, 1>> kp_vec(cart.kp.data());
+  if (kp_vec.maxCoeff() <= 0.0) {
+    return out;
+  }
+
   const Vec6 dq = sample.has_velocity_torque
     ? sample.velocity
     : Vec6{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
@@ -571,102 +568,97 @@ MitTarget Controller::compute_cartesian_mit(
     j_mat.block<3, 1>(0, i) = z_i.cross(r_i);
     j_mat.block<3, 1>(3, i) = z_i;
   }
+
+  constexpr double kReg = 1e-4;
+  constexpr double kTaskZeta = 0.28;
+  constexpr double kMaxTaskRate = 55.0;
+  constexpr double kModalZeta = 0.44;
+  static constexpr std::array<long, 6> kCarrierLsbMult = {{2, 2, 2, 6, 6, 6}};
+
+  const std::string eff_name = effector.has_value() ? effector->model : "teaching_handle";
+  const std::optional<double> eff_mass =
+    effector.has_value() ? std::optional<double>(effector->mass_kg) : std::nullopt;
+  const std::optional<Vec3> eff_com =
+    effector.has_value() ? std::optional<Vec3>(effector->com_m) : std::nullopt;
+  const Vec6 inertias = gravity_model.has_value()
+    ? gravity_model->inertias(q_meas, eff_name, eff_mass, eff_com)
+    : joint_inertias(q_meas, eff_name, eff_mass, eff_com);
+
+  Eigen::Matrix<double, 6, 1> inv_m;
+  Eigen::Matrix<double, 6, 1> inv_sqrt_m;
+  for (int i = 0; i < 6; ++i) {
+    const double m_i = std::max(inertias[i], 1e-6);
+    inv_m(i) = 1.0 / m_i;
+    inv_sqrt_m(i) = 1.0 / std::sqrt(m_i);
+  }
+
+  // SO(3)-invariant harmonic-mean operational-space inertia (m_iso = 3 / tr(J_v M^-1 J_v^T))
+  const Eigen::Matrix<double, 6, 1> inv_lam = j_mat.cwiseProduct(j_mat) * inv_m;
+  const double m_iso = 3.0 / std::max(inv_lam.head<3>().sum(), 1e-6);
+  const double i_iso = 3.0 / std::max(inv_lam.tail<3>().sum(), 1e-6);
   const Eigen::Matrix<double, 6, 1> twist =
     j_mat * Eigen::Map<const Eigen::Matrix<double, 6, 1>>(dq.data());
 
   Eigen::Matrix<double, 6, 1> wrench_b;
-  for (int k = 0; k < 3; ++k) {
-    double fk_val = cart.kp[k] * (cart.position[k] - p_curr[k]) - cart.kd[k] * twist(k);
-    if (cart.max_force > 0.0) {
-      fk_val = std::clamp(fk_val, -cart.max_force, cart.max_force);
-    }
-    wrench_b(k) = fk_val;
-
-    double mk_val = cart.kp[3 + k] * e_r(k) - cart.kd[3 + k] * twist(3 + k);
-    if (cart.max_torque > 0.0) {
-      mk_val = std::clamp(mk_val, -cart.max_torque, cart.max_torque);
-    }
-    wrench_b(3 + k) = mk_val;
+  for (int a = 0; a < 6; ++a) {
+    const double err_a = (a < 3) ? (cart.position[a] - p_curr[a]) : e_r(a - 3);
+    const double lam_iso = (a < 3) ? m_iso : i_iso;
+    const double lam_axis = 1.0 / std::max(inv_lam(a), 1e-6);
+    const double kd_task_a = std::min(
+      2.0 * kTaskZeta * std::sqrt(lam_iso * cart.kp[a]),
+      kMaxTaskRate * lam_axis);
+    wrench_b(a) = cart.kp[a] * err_a - kd_task_a * twist(a);
   }
-
-  MitTarget out;
-  out.position = q_meas;
-  out.kd = cart.joint_kd;
 
   const Eigen::Matrix<double, 6, 1> tau_raw = j_mat.transpose() * wrench_b;
   Vec6 tau_cart{};
   for (int i = 0; i < 6; ++i) {
     const double t_max = 8.0 * JOINT_TORQUE_B[i] * JOINT_TORQUE_C[i];
     tau_cart[i] = std::clamp(tau_raw(i), -t_max, t_max);
-    out.torque[i] = tau_cart[i];
   }
 
-  if (std::any_of(cart.joint_kd.begin(), cart.joint_kd.end(), [](double v) { return v < 0.0; })) {
-    constexpr double kReg = 1e-4;
-    constexpr double kModalZeta = 0.44;
-    static constexpr std::array<long, 6> kCarrierLsbMult = {{2, 2, 2, 6, 6, 6}};
-
-    const Eigen::Map<const Eigen::Matrix<double, 6, 1>> kp_vec(cart.kp.data());
-    const bool any_cart_kp = (kp_vec.maxCoeff() > 0.0);
-    Eigen::Matrix<double, 6, 6> k_q = j_mat.transpose() * kp_vec.asDiagonal() * j_mat;
-    k_q.diagonal().array() += kReg;
-    const Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt(k_q);
-    Vec6 k_schur{};
-    if (llt.info() == Eigen::Success) {
-      const Eigen::Matrix<double, 6, 6> c_q = llt.solve(Eigen::Matrix<double, 6, 6>::Identity());
-      for (int i = 0; i < 6; ++i) {
-        const double c_ii = c_q(i, i);
-        k_schur[i] = (c_ii > 1e-9) ? std::max(0.0, (1.0 / c_ii) - kReg) : 0.0;
-      }
-    }
-    const std::string eff_name = effector.has_value() ? effector->model : "teaching_handle";
-    const std::optional<double> eff_mass =
-      effector.has_value() ? std::optional<double>(effector->mass_kg) : std::nullopt;
-    const std::optional<Vec3> eff_com =
-      effector.has_value() ? std::optional<Vec3>(effector->com_m) : std::nullopt;
-    const Vec6 kd_schur = max_critical_kd(
-      k_schur, eff_name, gravity_model.has_value() ? &(*gravity_model) : nullptr);
-    const Vec6 inertias = gravity_model.has_value()
-      ? gravity_model->inertias(q_meas, eff_name, eff_mass, eff_com)
-      : joint_inertias(q_meas, eff_name, eff_mass, eff_com);
-
-    Eigen::Matrix<double, 6, 1> inv_sqrt_m;
+  Eigen::Matrix<double, 6, 6> k_q = j_mat.transpose() * kp_vec.asDiagonal() * j_mat;
+  k_q.diagonal().array() += kReg;
+  const Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt(k_q);
+  Vec6 k_schur{};
+  if (llt.info() == Eigen::Success) {
+    const Eigen::Matrix<double, 6, 6> c_q = llt.solve(Eigen::Matrix<double, 6, 6>::Identity());
     for (int i = 0; i < 6; ++i) {
-      inv_sqrt_m(i) = 1.0 / std::sqrt(std::max(inertias[i], 1e-6));
+      const double c_ii = c_q(i, i);
+      k_schur[i] = (c_ii > 1e-9) ? std::max(0.0, (1.0 / c_ii) - kReg) : 0.0;
     }
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(
-      inv_sqrt_m.asDiagonal() * k_q * inv_sqrt_m.asDiagonal());
-    Vec6 kd_modal{};
-    if (eig.info() == Eigen::Success) {
-      const auto & vals = eig.eigenvalues();
-      const auto & vecs = eig.eigenvectors();
-      for (int i = 0; i < 6; ++i) {
-        double sqrt_a_ii = 0.0;
-        for (int m = 0; m < 6; ++m) {
-          sqrt_a_ii += vecs(i, m) * vecs(i, m) * std::sqrt(std::max(vals(m), 0.0));
-        }
-        kd_modal[i] = 2.0 * kModalZeta * inertias[i] * sqrt_a_ii;
-      }
-    }
+  }
+  const Vec6 kd_schur = max_critical_kd(
+    k_schur, eff_name, gravity_model.has_value() ? &(*gravity_model) : nullptr);
 
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(
+    inv_sqrt_m.asDiagonal() * k_q * inv_sqrt_m.asDiagonal());
+  Vec6 kd_modal{};
+  if (eig.info() == Eigen::Success) {
+    const auto & vals = eig.eigenvalues();
+    const auto & vecs = eig.eigenvectors();
     for (int i = 0; i < 6; ++i) {
-      if (cart.joint_kd[i] < 0.0) {
-        out.kd[i] = std::clamp(
-          std::max({2.0 * MIT_KD_LSB[i], kd_schur[i], kd_modal[i]}), 0.0, 100.0);
-        if (any_cart_kp) {
-          // Fold Cartesian spring torque into an exact quantized positive kp carrier so the
-          // motor ESC 20 kHz position & velocity loops remain active with zero quantization drift.
-          const double kp_foc = static_cast<double>(kCarrierLsbMult[i]) * MIT_KP_LSB[i];
-          const double dq_fold = std::clamp(
-            tau_cart[i] / kp_foc,
-            std::max(-0.8, -11.5 - q_meas[i]),
-            std::min(0.8, 11.5 - q_meas[i]));
-          out.kp[i] = kp_foc;
-          out.position[i] = q_meas[i] + dq_fold;
-          out.torque[i] = tau_cart[i] - kp_foc * dq_fold;
-        }
+      double sqrt_a_ii = 0.0;
+      for (int m = 0; m < 6; ++m) {
+        sqrt_a_ii += vecs(i, m) * vecs(i, m) * std::sqrt(std::max(vals(m), 0.0));
       }
+      kd_modal[i] = 2.0 * kModalZeta * inertias[i] * sqrt_a_ii;
     }
+  }
+
+  for (int i = 0; i < 6; ++i) {
+    out.kd[i] = std::clamp(
+      std::max({2.0 * MIT_KD_LSB[i], kd_schur[i], kd_modal[i]}), 0.0, 100.0);
+    // Fold Cartesian spring torque into an exact quantized positive kp carrier so the
+    // motor ESC 20 kHz position & velocity loops remain active with zero quantization drift.
+    const double kp_foc = static_cast<double>(kCarrierLsbMult[i]) * MIT_KP_LSB[i];
+    const double dq_fold = std::clamp(
+      tau_cart[i] / kp_foc,
+      std::max(-0.8, -11.5 - q_meas[i]),
+      std::min(0.8, 11.5 - q_meas[i]));
+    out.kp[i] = kp_foc;
+    out.position[i] = q_meas[i] + dq_fold;
+    out.torque[i] = tau_cart[i] - kp_foc * dq_fold;
   }
   return out;
 }

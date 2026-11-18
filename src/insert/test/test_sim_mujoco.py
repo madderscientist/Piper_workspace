@@ -27,7 +27,7 @@ def test_wrench_urdf_fk_and_paxini_sensor_zero_moment_transport():
         assert sim.data.site_xpos[sim.ft_site_id] == pytest.approx(t_ft_sdk[:3, 3], abs=1e-7)
         assert sim.data.site_xmat[sim.ft_site_id].reshape(3, 3) == pytest.approx(t_ft_sdk[:3, :3], abs=1e-7)
 
-    # 2. Verify dynamic downstream gravity elimination and pure-force zero-moment transport at the 19.5 cm tip
+    # 2. Verify dynamic downstream gravity elimination and pure-force zero-moment transport at the default 22 cm tip
     sim.reset_episode(initial_offset_h=(0.0, 0.0, 0.025), tare_at_start=False)
     plug_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, 'grasped_plug')
     f_t_applied = np.array([4.0, -3.0, 5.0], dtype=np.float64)
@@ -64,7 +64,7 @@ def test_joint_mit_tilt_divergence_vs_cartesian_tip_impedance_convergence():
 
     # Same actor.onnx + same URDF arm & PX6D-75A sensor with 200 Hz decoupled tip Cartesian impedance
     # and 10 ms CAN feedback delay inserts cleanly without oscillation across variable tool offsets
-    for tip_off in ((0.0, 0.0, 0.195), (0.010, -0.006, 0.150)):
+    for tip_off in ((0.0, 0.0, 0.220), (0.010, -0.006, 0.150)):
         sim_cart = PiperWrenchInsertSim(
             scene_cfg=SimSceneConfig(shape='hexagon', clearance_m=0.0005, tip_offset_m=tip_off),
             impedance_mode='cartesian_tip',

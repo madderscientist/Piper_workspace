@@ -19,8 +19,6 @@ from std_msgs.msg import String
 from std_srvs.srv import SetBool
 
 from insert.policy import (
-    CARTESIAN_AUTO_JOINT_KD,
-    CARTESIAN_TIP_KD,
     CARTESIAN_TIP_KP,
     DEFAULT_TIP_LENGTH_M,
     DEFAULT_TIP_OFFSET_M,
@@ -160,8 +158,8 @@ def test_transforms_wrench_and_onnx_policy_convergence():
     onnx_file = default_onnx_path()
     assert onnx_file.is_file() and onnx_file.parent.name == 'insert'
 
-    assert DEFAULT_TIP_LENGTH_M == pytest.approx(0.195)
-    assert DEFAULT_TIP_OFFSET_M == pytest.approx((0.0, 0.0, 0.195))
+    assert DEFAULT_TIP_LENGTH_M == pytest.approx(0.22)
+    assert DEFAULT_TIP_OFFSET_M == pytest.approx((0.0, 0.0, 0.22))
     assert WRENCH_FILTER_TAU_S == TRAIN_WRENCH_FILTER_TAU_S
 
     p_ht = np.array([0.004, -0.003, 0.015], dtype=np.float64)
@@ -394,15 +392,15 @@ def test_dashboard_can4_gripper_record_and_policy_workflow():
         assert received_grip[-1].effort == pytest.approx(0.8)
         assert received_mit and list(received_mit[-1].kp) == [0.0] * 6
 
-        res_goal = post('/api/goal/record', {'tip_offset_cm': [0.0, 0.0, 19.5]})
+        res_goal = post('/api/goal/record', {'tip_offset_cm': [0.0, 0.0, 22.0]})
         assert res_goal['ok'] is True
         assert res_goal['goal']['joints_rad'] == pytest.approx(q_inserted)
-        assert res_goal['goal']['tip_offset_cm'] == pytest.approx([0.0, 0.0, 19.5])
+        assert res_goal['goal']['tip_offset_cm'] == pytest.approx([0.0, 0.0, 22.0])
 
         p_bh = np.array(res_goal['goal']['position_m'])
         q_bh = np.array(res_goal['goal']['quaternion_wxyz'])
         p_too_far = p_bh + rotate(q_bh, [0.0, 0.0, 0.095])
-        q_too_far = solve_tip_ik(q_inserted, p_too_far, q_bh, tip_length_m=0.195, max_iters=12)
+        q_too_far = solve_tip_ik(q_inserted, p_too_far, q_bh, tip_length_m=0.22, max_iters=12)
         node._on_joints(JointState(name=list(JOINT_NAMES), position=[*q_too_far, 0.012]))
         with pytest.raises( Exception ):
             post('/api/policy/start', {})
@@ -413,7 +411,7 @@ def test_dashboard_can4_gripper_record_and_policy_workflow():
         post('/api/policy/stop', {'mode': 'drag'})
 
         p_lifted = p_bh + rotate(q_bh, [0.002, -0.001, 0.012])
-        q_lifted = solve_tip_ik(q_inserted, p_lifted, q_bh, tip_length_m=0.195, max_iters=8)
+        q_lifted = solve_tip_ik(q_inserted, p_lifted, q_bh, tip_length_m=0.22, max_iters=8)
         node._on_joints(JointState(name=list(JOINT_NAMES), position=[*q_lifted, 0.012]))
 
         res_start = post('/api/policy/start', {})
@@ -437,17 +435,15 @@ def test_dashboard_can4_gripper_record_and_policy_workflow():
         assert status['arm']['hole_relative']['p_ht_mm'][2] == pytest.approx(12.0, abs=0.2)
         assert received_cart_mit
         assert list(received_cart_mit[-1].kp) == pytest.approx(list(CARTESIAN_TIP_KP))
-        assert list(received_cart_mit[-1].kd) == pytest.approx(list(CARTESIAN_TIP_KD))
-        assert list(received_cart_mit[-1].joint_kd) == pytest.approx(list(CARTESIAN_AUTO_JOINT_KD))
-        assert list(received_cart_mit[-1].tool_offset) == pytest.approx([0.0, 0.0, 0.195])
+        assert list(received_cart_mit[-1].tool_offset) == pytest.approx([0.0, 0.0, 0.22])
         assert status['policy']['last_step']['p_target_h_mm'][2] < status['arm']['hole_relative']['p_ht_mm'][2]
 
         # Dynamic tool_offset update refreshes live Cartesian target tool_offset immediately
-        post('/api/parameters', {'tip_offset_cm': [1.2, -0.8, 22.0]})
+        post('/api/parameters', {'tip_offset_cm': [1.2, -0.8, 18.5]})
         node._publish_last_target()
         for _ in range(5):
             rclpy.spin_once(helper, timeout_sec=0.01)
-        assert list(received_cart_mit[-1].tool_offset) == pytest.approx([-0.012, 0.008, 0.220])
+        assert list(received_cart_mit[-1].tool_offset) == pytest.approx([-0.012, 0.008, 0.185])
 
         res_stop = post('/api/policy/stop', {'mode': 'drag'})
         assert res_stop['mode'] == 'drag'

@@ -475,13 +475,13 @@ TEST(PiperXDriverCppTest, ControllerAdaptiveStiffnessStictionGripperAndWrenchLaw
     EXPECT_DOUBLE_EQ(arm.mit_out_->torque[joint], ctrl.gravity[joint] + ctrl.friction[joint]);
   }
 
-  // Task-space Cartesian MIT zeroes joint kp, preserves gravity/friction, and maps J_tip^T F_tip
+  // Task-space Cartesian MIT folds J_tip^T F_tip into 20 kHz FOC carrier and auto-derives damping from live tool_offset
   const Vec6 q_now{{arm.pos_[0], arm.pos_[1], arm.pos_[2], arm.pos_[3], arm.pos_[4], arm.pos_[5]}};
   Vec6 q_eff_now = q_now;
   for (int i = 0; i < 6; ++i) {
     q_eff_now[i] += g_model.joint(i + 1).angle_offset;
   }
-  const Vec3 tool_off{{0.0, 0.0, 0.195}};
+  const Vec3 tool_off{{0.0, 0.0, 0.220}};
   const FkResult fk_now = fast_fk(q_eff_now, tool_off);
   const Mat6 jac_b = g_model.jacobian(q_now, tool_off, "base_link");
   CartesianMitTarget cart_cmd;
@@ -497,11 +497,7 @@ TEST(PiperXDriverCppTest, ControllerAdaptiveStiffnessStictionGripperAndWrenchLaw
     cart_cmd.quat_wxyz = {{(rc[2][1] - rc[1][2]) / s, 0.25 * s, (rc[0][1] + rc[1][0]) / s, (rc[0][2] + rc[2][0]) / s}};
   }
   cart_cmd.tool_offset = tool_off;
-  cart_cmd.kp = {{800.0, 800.0, 800.0, 6.0, 6.0, 6.0}};
-  cart_cmd.kd = {{56.0, 56.0, 56.0, 0.30, 0.30, 0.30}};
-  cart_cmd.joint_kd = {{0.15, 0.15, 0.10, 0.02, 0.015, 0.01}};
-  cart_cmd.max_force = 40.0;
-  cart_cmd.max_torque = 3.0;
+  cart_cmd.kp = {{650.0, 650.0, 650.0, 4.8, 4.8, 4.8}};
   ctrl.cartesian_mit(cart_cmd);
   EXPECT_FALSE(ctrl.mit_target.has_value());
   EXPECT_TRUE(ctrl.cartesian_mit_target.has_value());
@@ -509,20 +505,8 @@ TEST(PiperXDriverCppTest, ControllerAdaptiveStiffnessStictionGripperAndWrenchLaw
   arm.status_.mode_feedback = 6;
   ctrl.watchdog(false);
   ASSERT_TRUE(arm.mit_out_.has_value());
-  EXPECT_EQ(arm.mit_out_->kp, Vec6{});
-  EXPECT_EQ(arm.mit_out_->kd, cart_cmd.joint_kd);
-  EXPECT_EQ(arm.mit_out_->gravity_offset, Vec6{});
-  const Vec3 expected_fb{{800.0 * 0.005, 800.0 * (-0.004), 800.0 * (-0.010)}};
-  for (size_t j = 0; j < 6; ++j) {
-    const double expected_imp =
-      jac_b[0][j] * expected_fb[0] + jac_b[1][j] * expected_fb[1] + jac_b[2][j] * expected_fb[2];
-    EXPECT_NEAR(arm.mit_out_->torque[j], expected_imp + ctrl.gravity[j] + ctrl.friction[j], 1e-6);
-  }
-  // Negative joint_kd activates 20 kHz FOC position-folding + Schur/modal damping at live tool_offset
-  cart_cmd.joint_kd = {{-1.0, -1.0, -1.0, -1.0, -1.0, -1.0}};
-  ctrl.cartesian_mit(cart_cmd);
-  ctrl.watchdog(false);
   const Vec6 auto_kd_long = arm.mit_out_->kd;
+  const Vec3 expected_fb{{650.0 * 0.005, 650.0 * (-0.004), 650.0 * (-0.010)}};
   for (size_t j = 0; j < 6; ++j) {
     EXPECT_GT(arm.mit_out_->kp[j], 0.0);
     EXPECT_GT(auto_kd_long[j], 0.0);
@@ -537,6 +521,12 @@ TEST(PiperXDriverCppTest, ControllerAdaptiveStiffnessStictionGripperAndWrenchLaw
   ctrl.watchdog(false);
   const Vec6 auto_kd_short = arm.mit_out_->kd;
   EXPECT_NE(auto_kd_short, auto_kd_long);
+  // Zero Cartesian kp cleanly collapses to pure gravity + friction compensation
+  cart_cmd.kp = {{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+  ctrl.cartesian_mit(cart_cmd);
+  ctrl.watchdog(false);
+  EXPECT_EQ(arm.mit_out_->kp, Vec6{});
+  EXPECT_EQ(arm.mit_out_->kd, Vec6{});
   // Joint MIT command cleanly supersedes Cartesian MIT
   ctrl.mit(zero_gain_command);
   EXPECT_FALSE(ctrl.cartesian_mit_target.has_value());

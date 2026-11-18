@@ -424,10 +424,6 @@ void DriverNode::on_cartesian_mit_cmd(
     t.quat_wxyz = msg->quat_wxyz;
     t.tool_offset = msg->tool_offset;
     t.kp = msg->kp;
-    t.kd = msg->kd;
-    t.joint_kd = msg->joint_kd;
-    t.max_force = msg->max_force;
-    t.max_torque = msg->max_torque;
     control_->cartesian_mit(t);
     last_error_.clear();
   } catch (const std::exception & error) {

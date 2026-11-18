@@ -56,7 +56,7 @@
         </div>
 
         <details class="compact-details" open>
-          <summary>夹爪开度 / 力度与插头末端作用点（默认 Z +19.5 cm）</summary>
+          <summary>夹爪开度 / 力度与插头尖端偏移（相对于 J6 法兰中心，夹爪系 +X左 / +Y上 / +Z前，默认 Z +22.0 cm）</summary>
           <div class="params-grid-4" style="margin-top:6px;">
             <div class="param-item">
               <label>当前实测开度</label>
@@ -77,16 +77,16 @@
           </div>
           <div class="params-grid-4" style="margin-top:6px;">
             <div class="param-item">
-              <label for="input-tip-x-cm">作用点 X (cm)</label>
+              <label for="input-tip-x-cm">法兰→尖端 X 左 (cm)</label>
               <input type="number" id="input-tip-x-cm" step="0.1" value="0.0">
             </div>
             <div class="param-item">
-              <label for="input-tip-y-cm">作用点 Y (cm)</label>
+              <label for="input-tip-y-cm">法兰→尖端 Y 上 (cm)</label>
               <input type="number" id="input-tip-y-cm" step="0.1" value="0.0">
             </div>
             <div class="param-item">
-              <label for="input-tip-z-cm">作用点 Z (cm)</label>
-              <input type="number" id="input-tip-z-cm" step="0.1" value="19.5">
+              <label for="input-tip-z-cm">法兰→尖端 Z 前 (cm)</label>
+              <input type="number" id="input-tip-z-cm" step="0.1" value="22.0">
             </div>
             <div class="param-item param-action">
               <button type="button" class="btn btn-secondary full-width" id="btn-apply-tip-offset">更新作用点</button>

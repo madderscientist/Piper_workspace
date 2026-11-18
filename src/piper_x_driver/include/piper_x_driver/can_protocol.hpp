@@ -98,10 +98,6 @@ struct CartesianMitTarget {
   std::array<double, 4> quat_wxyz{{1.0, 0.0, 0.0, 0.0}};
   Vec3 tool_offset{{0.0, 0.0, 0.0}};
   Vec6 kp{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
-  Vec6 kd{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
-  Vec6 joint_kd{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
-  double max_force{0.0};
-  double max_torque{0.0};
 };
 
 struct Feedback {

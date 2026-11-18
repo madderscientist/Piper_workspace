@@ -21,11 +21,7 @@ from piper_x_driver.gravity import ArmGravityModel, geometric_jacobian
 from piper_x_driver.protocol import MAX_GRAVITY_OFFSET, MIT_KD_LSB, MIT_KP_LSB, MIT_POSITION_LIMIT
 
 from .policy import (
-    CARTESIAN_AUTO_JOINT_KD,
     CARTESIAN_CARRIER_LSB_MULT,
-    CARTESIAN_MAX_FORCE_N,
-    CARTESIAN_MAX_TORQUE_NM,
-    CARTESIAN_TIP_KD,
     CARTESIAN_TIP_KP,
     DEFAULT_TIP_OFFSET_M,
     PAXINI_SENSOR_OFFSET_M,
@@ -46,7 +42,7 @@ from .policy import (
     quat_rotvec,
     quat_to_mat,
     relative_pose_in_hole,
-    resolve_cartesian_joint_kd,
+    resolve_cartesian_damping,
     rotate,
     rotvec_quat,
     solve_tip_ik,
@@ -482,8 +478,6 @@ class PiperWrenchInsertSim:
         arm_gravity_mode: str = 'matched',
         impedance_mode: str = 'cartesian_tip',
         cartesian_kp: Sequence[float] = CARTESIAN_TIP_KP,
-        cartesian_kd: Sequence[float] = CARTESIAN_TIP_KD,
-        cartesian_joint_kd: Sequence[float] = CARTESIAN_AUTO_JOINT_KD,
         inner_control_hz: int = 200,
         can_delay_substeps: int = 0,
     ) -> None:
@@ -501,8 +495,6 @@ class PiperWrenchInsertSim:
         self.arm_gravity_mode = arm_gravity_mode  # 'matched' (true MJ gravity) or 'driver_yaml' (arms.yaml gravity_model)
         self.impedance_mode = impedance_mode  # 'cartesian_tip' (J_tip^T F_tip) or 'joint_mit' (IK + joint PD)
         self.cartesian_kp = np.asarray(cartesian_kp, dtype=np.float64).reshape(6)
-        self.cartesian_kd = np.asarray(cartesian_kd, dtype=np.float64).reshape(6)
-        self.cartesian_joint_kd = np.asarray(cartesian_joint_kd, dtype=np.float64).reshape(6)
         self.inner_control_hz = max(50, int(inner_control_hz))
         self.can_delay_substeps = max(0, int(can_delay_substeps))
         self.base_kp = np.asarray(kp_override if kp_override is not None else self.arm_cfg.kp, dtype=np.float64)
@@ -543,8 +535,8 @@ class PiperWrenchInsertSim:
         self._latched_cart_tau = np.zeros(6, dtype=np.float64)
         self._latched_foc_kp = np.zeros(6, dtype=np.float64)
         self._latched_foc_pos = np.array(self.q_inserted, dtype=np.float64)
-        self._latched_joint_kd = resolve_cartesian_joint_kd(
-            self.q_inserted, self.cartesian_kp, self.cartesian_joint_kd,
+        _, self._latched_joint_kd = resolve_cartesian_damping(
+            self.q_inserted, self.cartesian_kp,
             tip_offset_m=self.scene_cfg.tip_offset_m, gravity_model=self.gravity_model,
         )
         self._fb_delay_buf: deque[tuple[np.ndarray, np.ndarray]] = deque(
@@ -693,30 +685,18 @@ class PiperWrenchInsertSim:
                 )
                 e_p = self.cmd_p_b - p_bt
                 e_r = quat_rotvec(quat_mul(self.cmd_q_bt, quat_inv(q_bt)))
-                f_b = np.clip(
-                    self.cartesian_kp[:3] * e_p - self.cartesian_kd[:3] * (j_b[:3] @ dq_meas),
-                    -CARTESIAN_MAX_FORCE_N, CARTESIAN_MAX_FORCE_N,
-                )
-                m_b = np.clip(
-                    self.cartesian_kp[3:6] * e_r - self.cartesian_kd[3:6] * (j_b[3:6] @ dq_meas),
-                    -CARTESIAN_MAX_TORQUE_NM, CARTESIAN_MAX_TORQUE_NM,
-                )
-                tau_cart = j_b.T @ np.concatenate([f_b, m_b])
-                self._latched_joint_kd = resolve_cartesian_joint_kd(
-                    q_meas, self.cartesian_kp, self.cartesian_joint_kd,
+                task_kd, self._latched_joint_kd = resolve_cartesian_damping(
+                    q_meas, self.cartesian_kp,
                     tip_offset_m=offset_gripper, gravity_model=self.gravity_model,
                 )
-                auto_mask = (self.cartesian_joint_kd < 0.0) & np.any(self.cartesian_kp > 0.0)
-                kp_foc = np.where(
-                    auto_mask,
-                    np.asarray(CARTESIAN_CARRIER_LSB_MULT, dtype=np.float64) * np.asarray(MIT_KP_LSB, dtype=np.float64),
-                    0.0,
-                )
-                dq_fold = np.where(
-                    kp_foc > 0.0,
-                    np.clip(tau_cart / np.maximum(kp_foc, 1e-9), -0.8, 0.8),
-                    0.0,
-                )
+                wrench_b = self.cartesian_kp * np.concatenate([e_p, e_r]) - task_kd * (j_b @ dq_meas)
+                tau_cart = j_b.T @ wrench_b
+                if np.any(self.cartesian_kp > 0.0):
+                    kp_foc = np.asarray(CARTESIAN_CARRIER_LSB_MULT, dtype=np.float64) * np.asarray(MIT_KP_LSB, dtype=np.float64)
+                    dq_fold = np.clip(tau_cart / kp_foc, -0.8, 0.8)
+                else:
+                    kp_foc = np.zeros(6, dtype=np.float64)
+                    dq_fold = np.zeros(6, dtype=np.float64)
                 self._latched_foc_kp = kp_foc
                 self._latched_foc_pos = q_meas + dq_fold
                 self._latched_cart_tau = tau_cart - kp_foc * dq_fold

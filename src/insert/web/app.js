@@ -38,7 +38,7 @@
   function readTipOffsetCm() {
     return ['input-tip-x-cm', 'input-tip-y-cm', 'input-tip-z-cm'].map((id, i) => {
       const v = Number.parseFloat($(id).value);
-      return Number.isFinite(v) ? v : (i === 2 ? 19.5 : 0.0);
+      return Number.isFinite(v) ? v : (i === 2 ? 22.0 : 0.0);
     });
   }
 
