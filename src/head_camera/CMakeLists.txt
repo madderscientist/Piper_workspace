@@ -35,7 +35,8 @@ install(FILES README.md DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_head_camera test/test_head_camera.cpp test/test_web.cpp)
+  ament_add_gtest(test_head_camera test/test_head_camera.cpp test/test_web.cpp
+    ENV PIPER_CONFIG_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../../config/examples)
   target_link_libraries(test_head_camera head_camera_core)
   # The real recording library must also use the test-only device functions.
   target_link_options(test_head_camera PRIVATE -Wl,--export-dynamic)

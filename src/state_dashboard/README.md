@@ -9,14 +9,14 @@
 
 ```bash
 # 终端 1：启动四臂驱动
-ros2 launch piper_x_driver four_arms.launch.py
+ros2 launch piper_x_driver all_arms.launch.py
 
 # 终端 2：启动 Dashboard（默认监听 http://127.0.0.1:8089/）
 ros2 run state_dashboard state_dashboard --port 8089
 ```
 
 通过 SSH 远程访问时将 `8089` 端口转发到本地：`ssh -N -L 8089:127.0.0.1:8089 user@robot-host`。
-若使用自定义配置文件，驱动和 Dashboard 需指定同一份 `--config /absolute/path/arms.yaml`。
+若使用自定义臂配置目录，驱动和 Dashboard 需指定同一个目录（Dashboard 用 `--config /absolute/path/arms`）。
 
 ## 2. 功能与操作
 

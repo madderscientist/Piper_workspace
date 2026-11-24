@@ -14,20 +14,25 @@ from launch import LaunchContext
 import yaml
 
 from piper_x_driver.configuration import default_config_path, FleetConfig
-from piper_x_driver.gravity import _GRAVITY, _MASS, _kinematics, gravity_torques
+from piper_x_driver.gravity import (
+    _GRAVITY, _MASS, _kinematics, ArmGravityModel, gravity_torques, JointGravityModel,
+    save_gravity_model,
+)
 from piper_x_driver.terminal import terminal_body, terminal_for_model
 
 
 @pytest.fixture
 def fleet_path(tmp_path):
-    target = tmp_path / 'arms.yaml'
-    source = default_config_path().resolve()
-    data = yaml.safe_load(source.read_text())
-    for arm in data['arms']:
-        for field in ('friction_config', 'gravity_config'):
-            arm[field] = str((source.parent / arm[field]).resolve(strict=True))
-    target.write_text(yaml.safe_dump(data))
+    target = tmp_path / 'arms'
+    shutil.copytree(default_config_path(), target)
     return target
+
+
+def edit_arm(fleet_path, arm_id, **values):
+    path = fleet_path / f'{arm_id}.yaml'
+    data = yaml.safe_load(path.read_text())
+    data.update(values)
+    path.write_text(yaml.safe_dump(data, allow_unicode=True))
 
 
 def test_hardware_mapping_and_defaults(fleet_path):
@@ -42,9 +47,9 @@ def test_hardware_mapping_and_defaults(fleet_path):
     assert all(arm.s_a == 2.0 for arm in fleet.arms)
     assert all(0 < arm.friction_scale <= 1 for arm in fleet.arms)
     assert all(arm.friction_config.endswith(f'{arm.id}_friction.yaml') for arm in fleet.arms)
-    assert all(fleet.friction_model(arm) is not None for arm in fleet.arms)
     assert all(arm.gravity_config.endswith(f'{arm.id}_gravity.yaml') for arm in fleet.arms)
-    assert all(fleet.gravity_model(arm) is not None for arm in fleet.arms)
+    # Missing calibration files mean uncalibrated arms rather than a load error.
+    assert all(fleet.friction_model(arm) is None for arm in fleet.arms)
     for key, profile in fleet.effectors.items():
         body = terminal_body(key)
         assert profile.mass_kg == pytest.approx(body.mass_kg)
@@ -53,34 +58,31 @@ def test_hardware_mapping_and_defaults(fleet_path):
         assert term is not None and term.model == profile.model
 
 
-def test_relative_model_paths_survive_symlink_loading_and_save(fleet_path, monkeypatch):
-    data = yaml.safe_load(fleet_path.read_text())
-    for arm in data['arms']:
-        for field in ('friction_config', 'gravity_config'):
-            target = fleet_path.parent / Path(arm[field]).name
-            shutil.copyfile(arm[field], target)
-            arm[field] = target.name
-    fleet_path.write_text(yaml.safe_dump(data))
-    installed = fleet_path.parent / 'install'
-    installed.mkdir()
-    link = installed / 'arms.yaml'
-    link.symlink_to(fleet_path)
-    monkeypatch.chdir(installed)
+def test_arm_files_define_arms_and_relative_calibration_paths(fleet_path, monkeypatch):
+    for arm_id in ('arm_1', 'arm_3'):
+        (fleet_path / f'{arm_id}.yaml').unlink()
+    edit_arm(fleet_path, 'arm_2', can_port='can0')
+    edit_arm(fleet_path, 'arm_4', can_port='can1')
+    raw = yaml.safe_load((fleet_path / 'arm_4.yaml').read_text())
+    save_gravity_model(
+        ArmGravityModel(arm_id='arm_4', joints={2: JointGravityModel(angle_offset=0.025)}),
+        fleet_path / raw['gravity_config'])
+    monkeypatch.chdir(fleet_path.parent.parent)
 
-    fleet = FleetConfig(link)
-    assert all(
-        Path(getattr(arm, field)).is_absolute()
-        and Path(getattr(arm, field)).is_file()
-        for arm in fleet.arms for field in ('friction_config', 'gravity_config')
-    )
-    updated = fleet.save_arm(fleet.arms[0], 'gripper', 0.5)
-    assert updated.arm('arm_1').gravity_scale == 0.5
-    saved = yaml.safe_load(fleet_path.read_text())
-    assert [
-        (arm['friction_config'], arm['gravity_config']) for arm in saved['arms']
-    ] == [
-        (arm['friction_config'], arm['gravity_config']) for arm in data['arms']
-    ]
+    fleet = FleetConfig(fleet_path)
+    assert [(arm.id, arm.can_port) for arm in fleet.arms] == [('arm_2', 'can0'), ('arm_4', 'can1')]
+    assert fleet.gravity_model('arm_4').joint(2).angle_offset == pytest.approx(0.025)
+    assert Path(fleet.arm('arm_4').gravity_config).is_absolute()
+    updated = fleet.save_arm(fleet.arm('arm_4'), 'gripper', 0.5)
+    assert updated.arm('arm_4').gravity_scale == 0.5
+    saved = yaml.safe_load((fleet_path / 'arm_4.yaml').read_text())
+    assert saved == {**raw, 'end_effector': 'gripper', 'gravity_scale': 0.5}
+    (fleet_path / raw['friction_config']).write_text('not: [a, friction, model')
+    assert FleetConfig(fleet_path).friction_model('arm_4') is None
+    for path in fleet_path.glob('*.yaml'):
+        path.unlink()
+    with pytest.raises(ValueError, match='No arm configuration'):
+        FleetConfig(fleet_path)
 
 
 @pytest.mark.parametrize('field,value', [
@@ -92,41 +94,33 @@ def test_relative_model_paths_survive_symlink_loading_and_save(fleet_path, monke
     ('can_port', '../can0'), ('namespace', '/bad name'),
     ('kp', [-1.0] * 6), ('kd', [101.0] * 6), ('s_a', -0.1),
     ('debug_kp', [-1.0] * 6), ('debug_kd', [101.0] * 6),
-    ('friction_config', '/nonexistent/friction.yaml'),
 ])
 def test_invalid_configuration_is_rejected(fleet_path, field, value):
-    data = yaml.safe_load(fleet_path.read_text())
-    data['arms'][0][field] = value
-    fleet_path.write_text(yaml.safe_dump(data))
-    with pytest.raises(ValueError):
+    edit_arm(fleet_path, 'arm_1', **{field: value})
+    with pytest.raises(ValueError, match='arm_1.yaml'):
         FleetConfig(fleet_path)
 
 
 @pytest.mark.parametrize('field', ['can_port', 'id', 'namespace'])
 def test_duplicate_identity_is_rejected(fleet_path, field):
-    data = yaml.safe_load(fleet_path.read_text())
-    data['arms'][1][field] = data['arms'][0][field]
-    fleet_path.write_text(yaml.safe_dump(data))
+    first = yaml.safe_load((fleet_path / 'arm_1.yaml').read_text())
+    edit_arm(fleet_path, 'arm_2', **{field: first[field]})
     with pytest.raises(ValueError, match='Duplicate'):
         FleetConfig(fleet_path)
 
 
-def test_concurrent_updates_preserve_other_arms_and_resolve_install_symlink(fleet_path):
-    link = fleet_path.parent / 'installed.yaml'
-    link.symlink_to(fleet_path)
-    initial = FleetConfig(link)
+def test_concurrent_updates_preserve_other_arms(fleet_path):
+    initial = FleetConfig(fleet_path)
 
     def save(index):
         return initial.save_arm(initial.arms[index], 'gripper', index / 4)
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         list(executor.map(save, range(4)))
-    assert link.is_symlink()
-    updated = FleetConfig(link)
+    updated = FleetConfig(fleet_path)
     assert [arm.gravity_scale for arm in updated.arms] == [0, 0.25, 0.5, 0.75]
     assert all(arm.end_effector == 'gripper' for arm in updated.arms)
-    assert 'effectors' not in yaml.safe_load(fleet_path.read_text())
-    assert not list(fleet_path.parent.glob('.arms-*'))
+    assert not list(fleet_path.glob('.*.tmp'))
 
 
 def test_stale_writer_and_failed_write_never_replace_configuration(fleet_path, monkeypatch):
@@ -135,7 +129,7 @@ def test_stale_writer_and_failed_write_never_replace_configuration(fleet_path, m
     with pytest.raises(ValueError, match='changed externally'):
         fleet.save_arm(fleet.arms[0], 'gripper', 0.6)
     current = FleetConfig(fleet_path)
-    before = fleet_path.read_bytes()
+    before = (fleet_path / 'arm_1.yaml').read_bytes()
 
     def fail(*_):
         raise OSError('Read-only test filesystem')
@@ -143,8 +137,8 @@ def test_stale_writer_and_failed_write_never_replace_configuration(fleet_path, m
     monkeypatch.setattr('piper_x_driver.configuration.os.replace', fail)
     with pytest.raises(OSError, match='Read-only'):
         current.save_arm(current.arms[0], 'gripper', 0.7)
-    assert fleet_path.read_bytes() == before
-    assert not list(fleet_path.parent.glob('.arms-*'))
+    assert (fleet_path / 'arm_1.yaml').read_bytes() == before
+    assert not list(fleet_path.glob('.*.tmp'))
 
 
 @pytest.mark.parametrize('width', [0.0, 0.04, 0.07])
@@ -221,10 +215,10 @@ def test_configured_gravity_matches_potential_energy_gradient(effector):
         numerical, abs=1e-7)
 
 
-def test_four_arm_launch_uses_shared_mapping_without_starting_hardware(fleet_path):
+def test_all_arms_launch_uses_shared_mapping_without_starting_hardware(fleet_path):
     share = Path(get_package_share_directory('piper_x_driver'))
     spec = importlib.util.spec_from_file_location(
-        'four_arm_launch', share / 'launch/four_arms.launch.py')
+        'all_arms_launch', share / 'launch/all_arms.launch.py')
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -249,9 +243,12 @@ def test_cpp_core_matches_python_dynamics_and_can_wire_protocol(capsys):
     fleet = FleetConfig(default_config_path())
     arm_cfg = fleet.arm('arm_3')
     gm = fleet.gravity_model(arm_cfg)
-    fm = fleet.friction_model(arm_cfg)
+    joint = f_mod.JointFrictionModel(
+        fc=0.2, fs=0.4, fv=0.3, load_ratio=0.15,
+        harmonics=(f_mod.SpatialHarmonic(omega=3.0, a=0.02, b=-0.01, c=0.03, d=0.01),))
+    fm = f_mod.ArmFrictionModel(arm_id='arm_3', joints={i: joint for i in range(1, 7)})
     eff = fleet.effectors[arm_cfg.end_effector]
-    assert gm is not None and fm is not None
+    assert gm is not None
 
     rng = np.random.default_rng(42)
     q = tuple(rng.uniform(-1.5, 1.5, size=6))

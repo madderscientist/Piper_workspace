@@ -1,4 +1,4 @@
-"""ROS 2 + HTTP Dashboard for InsertAnything policy deployment on PiPER-X (CAN4 / arm_4)."""
+"""ROS 2 + HTTP Dashboard for InsertAnything policy deployment on PiPER-X."""
 
 import argparse
 from collections import deque
@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 from geometry_msgs.msg import WrenchStamped
 import numpy as np
-from piper_x_driver.configuration import ArmConfig, default_config_path, FleetConfig
+from piper_x_driver.configuration import default_config_path, FleetConfig
 from piper_x_driver.protocol import MIT_POSITION_LIMIT, RateMeter
 from piper_x_driver.gravity import ArmGravityModel
 from piper_x_interfaces.msg import ArmStatus, CartesianMitCommand, GripperCommand, MitCommand
@@ -78,32 +78,27 @@ def web_root_path() -> Path:
 
 
 def resolve_target_arm(
-    fleet: FleetConfig | None, arm_selector: str = 'can4', namespace_override: str = '',
+    fleet: FleetConfig, arm_selector: str = '', namespace_override: str = '',
 ) -> tuple[str, str, str, ArmGravityModel | None]:
-    selector = (arm_selector or 'can4').strip()
+    selector = arm_selector.strip()
     ns_clean = ('/' + namespace_override.strip('/')) if namespace_override.strip('/') else ''
-    if fleet is not None and fleet.arms:
-        selected: ArmConfig | None = None
-        if ns_clean:
-            selected = next((a for a in fleet.arms if a.namespace == ns_clean), None)
-        if selected is None:
-            selected = next(
-                (a for a in fleet.arms if selector in (a.id, a.can_port, a.namespace, a.namespace.lstrip('/'))),
-                None,
-            )
-        if selected is None and selector.lower() in ('can4', '4', 'arm4', 'arm_4'):
-            selected = next((a for a in fleet.arms if a.id == 'arm_4'), fleet.arms[-1])
-        if selected is None:
-            selected = fleet.arms[-1]
-        return selected.id, (ns_clean or selected.namespace), selected.can_port, fleet.gravity_model(selected)
-    return 'arm_4', (ns_clean or '/arm_4'), 'can4', None
+    selected = next(
+        (a for a in fleet.arms
+         if (ns_clean and a.namespace == ns_clean)
+         or (selector and selector in (a.id, a.can_port, a.namespace, a.namespace.lstrip('/')))),
+        None,
+    )
+    if selected is None:
+        # 未指定时选本机第一只带腕部力传感器的臂
+        selected = next((a for a in fleet.arms if a.end_effector == 'gripper_with_wrench'), fleet.arms[-1])
+    return selected.id, (ns_clean or selected.namespace), selected.can_port, fleet.gravity_model(selected)
 
 
 class InsertDashboardNode(Node):
     """ROS 2 node managing zero-force drag, gripper switch, goal recording, and 50 Hz ONNX policy."""
 
     def __init__(
-        self, *, config_file: str | Path | None = None, arm_selector: str = 'can4',
+        self, *, config_file: str | Path | None = None, arm_selector: str = '',
         namespace_override: str = '', onnx_path: str | Path | None = None,
         tip_length_m: float = DEFAULT_TIP_LENGTH_M,
         tip_offset_m: Sequence[float] | None = None,
@@ -116,15 +111,10 @@ class InsertDashboardNode(Node):
         self._feedback_callbacks = MutuallyExclusiveCallbackGroup()
         self._policy_lock = threading.Lock()
         self._policy_generation = 0
-        try:
-            self.fleet: FleetConfig | None = FleetConfig(Path(config_file) if config_file else default_config_path())
-        except Exception:
-            self.fleet = None
-
+        self.fleet = FleetConfig(Path(config_file) if config_file else default_config_path())
         self.arm_id, self.arm_namespace, self.can_port, self.gravity_model = resolve_target_arm(
             self.fleet, arm_selector=arm_selector, namespace_override=namespace_override,
         )
-        self.can_label = 'can4' if arm_selector.lower() == 'can4' else self.can_port
         self.tip_offset_m = normalize_tip_offset(tip_offset_m, tip_length_m)
         self.tip_length_m = float(self.tip_offset_m[2])
         self.wrench_source = normalize_wrench_source(wrench_source)
@@ -218,7 +208,7 @@ class InsertDashboardNode(Node):
         self._command_timer = self.create_timer(
             POLICY_PERIOD_S, self._publish_last_target, callback_group=self._feedback_callbacks,
         )
-        self._log('INFO', f'已绑定 {self.can_label} ({self.arm_namespace})，加载模型 {self.policy.onnx_path.name}')
+        self._log('INFO', f'已绑定 {self.can_port} ({self.arm_namespace})，加载模型 {self.policy.onnx_path.name}')
 
     @property
     def wrench_filter(self) -> WrenchFilter:
@@ -966,7 +956,6 @@ class InsertDashboardNode(Node):
                     'id': self.arm_id,
                     'namespace': self.arm_namespace,
                     'can_port': self.can_port,
-                    'can_label': self.can_label,
                     'online': online,
                     'joints_fresh': joints_fresh,
                     'status_fresh': status_fresh,
@@ -1137,12 +1126,12 @@ def create_http_server(
 
 def web_main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description='Launch the InsertAnything ONNX Policy Dashboard for PiPER-X (CAN4 / arm_4).'
+        description='Launch the InsertAnything ONNX Policy Dashboard for PiPER-X.'
     )
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8092)
     parser.add_argument('--config', default=None)
-    parser.add_argument('--arm', default='can4')
+    parser.add_argument('--arm', default='')
     parser.add_argument('--namespace', default='')
     parser.add_argument('--onnx', default=None)
     parser.add_argument('--tip-length', type=float, default=DEFAULT_TIP_LENGTH_M)
@@ -1162,7 +1151,7 @@ def web_main(argv: Sequence[str] | None = None) -> int:
     server = create_http_server(node, host=args.host, port=args.port)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     node.get_logger().info(
-        f'InsertAnything Dashboard ({node.can_label} -> {node.arm_namespace}) '
+        f'InsertAnything Dashboard ({node.can_port} -> {node.arm_namespace}) '
         f'listening on http://{args.host}:{server.server_port}/'
     )
     executor = SingleThreadedExecutor()

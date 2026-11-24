@@ -30,8 +30,8 @@ from .calibration import (
 )
 from .configuration import (
     resolve_sensor_configs,
-    save_sensor_calibration_to_yaml,
-    source_config_path,
+    save_calibration_poses,
+    save_sensor_calibration,
 )
 
 JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
@@ -62,10 +62,15 @@ class CalibrationPoint:
 
 
 class PoseCalibrator(Node):
-    def __init__(self, arm_id: str, config_path: Optional[Path] = None):
-        entry = resolve_sensor_configs(
-            arm_id, str(config_path) if config_path else None
-        )[0]
+    def __init__(
+        self,
+        sensor: str,
+        config_path: Optional[Path] = None,
+        sensor_dir: Optional[Path] = None,
+    ):
+        self.config_file = config_path
+        self.sensor_dir = sensor_dir
+        entry = resolve_sensor_configs(sensor, config_path, sensor_dir)[0]
         self.calib_joint_speed_rad_s = tuple(
             float(v)
             for v in entry.get("calib_joint_speed_rad_s", CALIB_JOINT_SPEED_RAD_S)
@@ -75,8 +80,7 @@ class PoseCalibrator(Node):
         ):
             raise ValueError("calib_joint_speed_rad_s 必须是六个有限正数，单位 rad/s")
         super().__init__("paxini_calibration_client", namespace=entry["namespace"])
-        self.arm_id = entry["arm_id"]
-        self.config_file = source_config_path(config_path)
+        self.sensor = entry["sensor"]
         self.calib_settle_sec = float(entry.get("calib_settle_sec", 0.8))
         self.calib_sample_sec = float(entry.get("calib_sample_sec", 0.5))
         self._wrench_stability = WrenchStabilityWindow(
@@ -159,14 +163,13 @@ class PoseCalibrator(Node):
                     return tuple(self.latest_joint_positions)
             time.sleep(0.005)
 
+    def _entry(self):
+        return resolve_sensor_configs(self.sensor, self.config_file, self.sensor_dir)[0]
+
     def record_pose(self):
         q = self._wait_for_joints()
-        entry = resolve_sensor_configs(self.arm_id, str(self.config_file))[0]
-        poses = list(entry["calibration_poses"])
-        poses.append([round(v, 6) for v in q])
-        save_sensor_calibration_to_yaml(
-            self.arm_id, calibration_poses=poses, config_path=self.config_file
-        )
+        poses = [*self._entry()["calibration_poses"], [round(v, 6) for v in q]]
+        save_calibration_poses(poses, self.config_file)
         return f"已记录公共姿态 {len(poses)}: {poses[-1]}"
 
     def _publish_mit_cmd(
@@ -305,7 +308,7 @@ class PoseCalibrator(Node):
         return point
 
     def run(self):
-        entry = resolve_sensor_configs(self.arm_id, str(self.config_file))[0]
+        entry = self._entry()
         poses = entry["calibration_poses"]
         if not poses:
             raise ValueError("尚未记录公共校准姿态")
@@ -346,14 +349,13 @@ class PoseCalibrator(Node):
             if k not in ("tare_offset", "tool_mass_kg", "tool_com_m")
         }
         quality["kinematics"] = "piper_x_sdk_link6"
-        path = save_sensor_calibration_to_yaml(
-            self.arm_id,
+        path = save_sensor_calibration(
+            entry["calibration_file"],
             tare_offset=result.tare_offset,
             tool_mass_kg=result.tool_mass_kg,
             tool_com_m=result.tool_com_m,
             calibration_samples=[p.to_dict() for p in points],
             calibration_quality=quality,
-            config_path=self.config_file,
         )
         future = self.reload_client.call_async(Trigger.Request())
         while not future.done():
@@ -377,13 +379,13 @@ def main(args=None):
         description="独立的 PaXini 多姿态零偏和重力校准程序"
     )
     parser.add_argument(
-        "--arm", default="arm_3", help="arm_3 / arm_4 / 左手 / 右手 / all"
+        "--arm", default="all", help="传感器名或机械臂 id（如 px6d_right / arm_4），默认全部"
     )
-    parser.add_argument("--config-file", default="")
+    parser.add_argument("--config-file", default=None, type=Path)
     parser.add_argument("action", choices=("record", "list", "clear", "run"))
     options = parser.parse_args(args)
-    cfg = source_config_path(Path(options.config_file) if options.config_file else None)
-    entries = resolve_sensor_configs(options.arm, str(cfg))
+    cfg = options.config_file
+    entries = resolve_sensor_configs(options.arm, cfg)
     if options.action == "list":
         for entry in entries:
             print(
@@ -391,7 +393,9 @@ def main(args=None):
                     {
                         k: entry.get(k)
                         for k in (
+                            "sensor",
                             "arm_id",
+                            "calibration_file",
                             "calibration_poses",
                             "tare_offset",
                             "tool_mass_kg",
@@ -405,15 +409,13 @@ def main(args=None):
             )
         return
     if options.action == "clear":
-        save_sensor_calibration_to_yaml(
-            entries[0]["arm_id"], calibration_poses=[], config_path=cfg
-        )
+        save_calibration_poses([], cfg)
         print("已清空公共校准姿态")
         return
     rclpy.init()
     try:
         for entry in entries:
-            node = PoseCalibrator(entry["arm_id"], cfg)
+            node = PoseCalibrator(entry["sensor"], cfg)
             executor = MultiThreadedExecutor()
             executor.add_node(node)
             thread = threading.Thread(target=executor.spin, daemon=True)

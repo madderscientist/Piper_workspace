@@ -35,6 +35,13 @@
 
   const el = (id) => document.getElementById(id);
 
+  function applyArmPaths(arm) {
+    if (!arm) return;
+    el('input-output-yaml').value = arm.gravity_config || '';
+    el('input-save-gravity-path').value = arm.gravity_config || '';
+    el('input-sync-friction-path').value = arm.friction_config || '';
+  }
+
   function renderArmSelector() {
     const container = el('arm-selector');
     if (!container) return;
@@ -59,11 +66,7 @@
       btn.addEventListener('click', () => {
         state.selectedArmId = arm.id;
         state.selectedNamespace = arm.namespace;
-        const gPath = `/home/a/piper_x_ws/src/piper_gravity/config/${arm.id}_gravity.yaml`;
-        const fPath = `/home/a/piper_x_ws/src/piper_friction/config/${arm.id}_friction.yaml`;
-        if (el('input-output-yaml')) el('input-output-yaml').value = gPath;
-        if (el('input-save-gravity-path')) el('input-save-gravity-path').value = gPath;
-        if (el('input-sync-friction-path')) el('input-sync-friction-path').value = fPath;
+        applyArmPaths(arm);
         if (el('selected-arm-summary')) {
           el('selected-arm-summary').textContent = `${arm.can_port} · ${arm.namespace}`;
         }
@@ -200,12 +203,7 @@
     if (modelYaml && el('yaml-preview').textContent !== modelYaml) {
       el('yaml-preview').textContent = modelYaml;
     }
-    el('payload-mass-card').hidden = !fit?.payload;
     if (!fit) return;
-    if (fit.payload) {
-      const p = fit.payload;
-      el('kpi-payload-mass').textContent = `${p.added_mass_kg.toFixed(4)} / ${p.total_mass_kg.toFixed(4)} kg${p.mass_identified ? '' : '（待重力轴数据）'}`;
-    }
     const m = fit.model;
     const met = fit.metrics;
     el('kpi-scale').textContent = m.scale.toFixed(4);
@@ -270,7 +268,13 @@
       const data = await resp.json();
       el('ros-dot').className = 'dot online';
       el('ros-text').textContent = 'ROS 2 已连接';
-      if (data.arms && data.arms.length) state.arms = data.arms;
+      if (data.arms && data.arms.length) {
+        state.arms = data.arms;
+        if (!state.arms.some((a) => a.id === state.selectedArmId)) state.selectedArmId = state.arms[0].id;
+        if (!el('input-output-yaml').value) {
+          applyArmPaths(state.arms.find((a) => a.id === state.selectedArmId));
+        }
+      }
       let fitsChanged = false;
       if (data.models) {
         if (JSON.stringify(state.models) !== JSON.stringify(data.models)) {

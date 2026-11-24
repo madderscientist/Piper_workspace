@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -19,53 +20,6 @@ from wrist_camera.transforms import (
     piper_fk,
 )
 
-ARM_CAMERA_PRESETS = {
-    'arm_3': {
-        'name': 'camera_arm_3',
-        'arm': 'arm_3',
-        'arm_namespace': '/arm_3',
-        'label': '机械臂 3 腕部相机',
-        'ip': '192.168.123.97',
-        'rtsp_url': 'rtsp://admin:123456@192.168.123.97/stream1',
-        'stream0_url': 'rtsp://admin:123456@192.168.123.97/stream0',
-        'stream1_url': 'rtsp://admin:123456@192.168.123.97/stream1',
-        'frame': 'camera_arm_3',
-        'parent_frame': 'gripper_base_top',
-        'base_frame': 'base_link',
-        'link6_to_top_z_m': GRIPPER_WITH_WRENCH_TOP_Z_M,
-        'gripper_variant': 'gripper_with_wrench',
-        'joint_states_topic': '/arm_3/joint_states_feedback',
-        'profiles': [
-            {'name': 'stream1', 'width': 720, 'height': 480, 'url': 'rtsp://admin:123456@192.168.123.97/stream1'},
-            {'name': 'stream0', 'width': 1920, 'height': 1080, 'url': 'rtsp://admin:123456@192.168.123.97/stream0'},
-        ],
-        'aliases': ('camera_arm_3', 'arm_3_camera', 'arm3_camera', 'camera_arm3',
-                    'camera_3', 'cam3', 'arm_3', 'arm3', '/arm_3', '3', '192.168.123.97'),
-    },
-    'arm_4': {
-        'name': 'camera_arm_4',
-        'arm': 'arm_4',
-        'arm_namespace': '/arm_4',
-        'label': '机械臂 4 腕部相机',
-        'ip': '192.168.123.98',
-        'rtsp_url': 'rtsp://admin:123456@192.168.123.98/stream1',
-        'stream0_url': 'rtsp://admin:123456@192.168.123.98/stream0',
-        'stream1_url': 'rtsp://admin:123456@192.168.123.98/stream1',
-        'frame': 'camera_arm_4',
-        'parent_frame': 'gripper_base_top',
-        'base_frame': 'base_link',
-        'link6_to_top_z_m': GRIPPER_WITH_WRENCH_TOP_Z_M,
-        'gripper_variant': 'gripper_with_wrench',
-        'joint_states_topic': '/arm_4/joint_states_feedback',
-        'profiles': [
-            {'name': 'stream1', 'width': 720, 'height': 480, 'url': 'rtsp://admin:123456@192.168.123.98/stream1'},
-            {'name': 'stream0', 'width': 1920, 'height': 1080, 'url': 'rtsp://admin:123456@192.168.123.98/stream0'},
-        ],
-        'aliases': ('camera_arm_4', 'arm_4_camera', 'arm4_camera', 'camera_arm4',
-                    'camera_4', 'cam4', 'arm_4', 'arm4', '/arm_4', '4', '192.168.123.98'),
-    },
-}
-
 _STREAM_SIZES = {
     'stream1': (720, 480),
     '1': (720, 480),
@@ -74,14 +28,14 @@ _STREAM_SIZES = {
 }
 
 
-def _config_dir() -> Path:
-    local = Path(__file__).resolve().parent.parent / 'config'
-    if local.is_dir():
+def default_board_config_path() -> Path:
+    local = Path(__file__).resolve().parent.parent / 'config' / 'board.yaml'
+    if local.is_file():
         return local
     try:
         from ament_index_python.packages import get_package_share_directory
-        share = Path(get_package_share_directory('wrist_camera')) / 'config'
-        if share.is_dir():
+        share = Path(get_package_share_directory('wrist_camera')) / 'config' / 'board.yaml'
+        if share.is_file():
             return share
     except Exception:
         pass
@@ -89,78 +43,117 @@ def _config_dir() -> Path:
 
 
 def default_cameras_config_path() -> Path:
-    return _config_dir() / 'cameras.yaml'
+    root = os.environ.get('PIPER_CONFIG_DIR')
+    if not root:
+        raise RuntimeError('PIPER_CONFIG_DIR 未设置，请先 source setup_env.bash 或显式传入 config_file')
+    return Path(root) / 'wrist_camera'
 
 
-def default_calibration_path() -> Path:
-    return _config_dir() / 'calibration.yaml'
-
-
-def load_calibrations(calib_file: str | Path | None = None) -> dict[str, Any]:
-    """读取 calibration.yaml 完整字典（含 intrinsics、extrinsics、profile_relations）。"""
-    path = Path(calib_file).expanduser() if calib_file else default_calibration_path()
-    if not path.is_file():
-        return {'intrinsics': {}, 'extrinsics': {}, 'profile_relations': {}}
-    data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+def load_camera_calibration(calib_file: str | Path | None) -> dict[str, Any]:
+    """读取单台相机的标定文件；未配置、缺失或无效均视为未标定。"""
+    empty: dict[str, Any] = {'intrinsics': [], 'extrinsics': None, 'profile_relations': []}
+    if not calib_file:
+        return empty
+    try:
+        data = yaml.safe_load(Path(calib_file).expanduser().read_text(encoding='utf-8'))
+    except (OSError, yaml.YAMLError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    intr = data.get('intrinsics')
+    ext = data.get('extrinsics')
+    rels = data.get('profile_relations')
     return {
-        'intrinsics': dict(data.get('intrinsics') or {}),
-        'extrinsics': dict(data.get('extrinsics') or {}),
-        'profile_relations': dict(data.get('profile_relations') or {}),
+        'intrinsics': list(intr) if isinstance(intr, list) else [],
+        'extrinsics': dict(ext) if isinstance(ext, dict) else None,
+        'profile_relations': list(rels) if isinstance(rels, list) else [],
     }
 
 
+def _parse_camera_file(file: Path) -> dict[str, Any]:
+    raw = yaml.safe_load(file.read_text(encoding='utf-8')) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f'相机配置不是有效映射：{file}')
+    cfg = dict(raw)
+    name = str(cfg.get('name') or file.stem).strip()
+    ip = str(cfg.get('ip', '')).strip()
+    user = str(cfg.get('rtsp_user', 'admin'))
+    password = str(cfg.get('rtsp_password', '123456'))
+    default_stream = str(cfg.get('default_stream', 'stream1'))
+    auth = f'{user}:{password}@' if user else ''
+    cfg['name'] = name
+    cfg.setdefault('arm', name)
+    arm = str(cfg['arm']).strip().lstrip('/')
+    cfg['arm'] = arm
+    cfg.setdefault('arm_namespace', f'/{arm}')
+    cfg.setdefault('label', name)
+    cfg.setdefault('frame', name)
+    cfg.setdefault('parent_frame', 'gripper_base_top')
+    cfg.setdefault('base_frame', 'base_link')
+    cfg.setdefault('link6_to_top_z_m', GRIPPER_WITH_WRENCH_TOP_Z_M)
+    cfg.setdefault('stream0_url', f'rtsp://{auth}{ip}/stream0' if ip else '')
+    cfg.setdefault('stream1_url', f'rtsp://{auth}{ip}/stream1' if ip else '')
+    cfg.setdefault('rtsp_url', f'rtsp://{auth}{ip}/{default_stream}' if ip else '')
+    if not cfg.get('profiles') and ip:
+        cfg['profiles'] = [
+            {'name': 'stream1', 'width': 720, 'height': 480, 'url': cfg['stream1_url']},
+            {'name': 'stream0', 'width': 1920, 'height': 1080, 'url': cfg['stream0_url']},
+        ]
+    aliases = [str(a).strip() for a in (cfg.get('aliases') or []) if str(a).strip()]
+    for extra in (name, arm, ip, cfg['frame']):
+        if extra and extra not in aliases:
+            aliases.append(extra)
+    cfg['aliases'] = tuple(aliases)
+    calib = cfg.get('calibration')
+    cfg['calibration_file'] = str((file.parent / calib).resolve()) if calib else ''
+    return cfg
+
+
 def load_cameras_config(config_file: str | Path | None = None) -> dict[str, dict[str, Any]]:
-    """加载 cameras.yaml 中的相机与别名-IP 映射表。"""
+    """加载本机腕部相机配置目录（每个 *.yaml 一台相机）或单个相机 YAML。"""
     path = Path(config_file).expanduser() if config_file else default_cameras_config_path()
-    if not path.is_file():
-        return {v['name']: dict(v) for v in ARM_CAMERA_PRESETS.values()}
-    data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
-    defaults = data.get('defaults') or {}
-    user = defaults.get('rtsp_user', 'admin')
-    password = defaults.get('rtsp_password', '123456')
-    default_stream = defaults.get('default_stream', 'stream1')
+    files = sorted(path.glob('*.yaml')) if path.is_dir() else ([path] if path.is_file() else [])
+    if not files:
+        raise ValueError(f'未找到腕部相机配置：{path}')
     cameras: dict[str, dict[str, Any]] = {}
-    for name, raw_cfg in (data.get('cameras') or {}).items():
-        cfg = dict(raw_cfg or {})
-        ip = str(cfg.get('ip', '')).strip()
-        auth = f'{user}:{password}@' if user else ''
-        cfg['name'] = name
-        cfg.setdefault('arm', name)
-        cfg.setdefault('arm_namespace', f"/{str(cfg['arm']).lstrip('/')}")
-        cfg.setdefault('label', name)
-        cfg.setdefault('frame', name)
-        cfg.setdefault('parent_frame', 'gripper_base_top')
-        cfg.setdefault('base_frame', 'base_link')
-        cfg.setdefault('link6_to_top_z_m', GRIPPER_WITH_WRENCH_TOP_Z_M)
-        cfg.setdefault('stream0_url', f'rtsp://{auth}{ip}/stream0' if ip else '')
-        cfg.setdefault('stream1_url', f'rtsp://{auth}{ip}/stream1' if ip else '')
-        cfg.setdefault('rtsp_url', f'rtsp://{auth}{ip}/{default_stream}' if ip else '')
-        if not cfg.get('profiles') and ip:
-            cfg['profiles'] = [
-                {'name': 'stream1', 'width': 720, 'height': 480, 'url': cfg['stream1_url']},
-                {'name': 'stream0', 'width': 1920, 'height': 1080, 'url': cfg['stream0_url']},
-            ]
-        aliases = [str(a).strip() for a in (cfg.get('aliases') or []) if str(a).strip()]
-        for extra in (name, cfg['arm'], ip, cfg['frame']):
-            if extra and extra not in aliases:
-                aliases.append(extra)
-        cfg['aliases'] = tuple(aliases)
-        cameras[name] = cfg
-    return cameras or {v['name']: dict(v) for v in ARM_CAMERA_PRESETS.values()}
+    for file in files:
+        cfg = _parse_camera_file(file)
+        cameras[cfg['name']] = cfg
+    return cameras
+
+
+def load_calibrations(config_file: str | Path | None = None) -> dict[str, Any]:
+    """聚合所有已配置相机的标定数据。"""
+    intrinsics: dict[str, list[dict[str, Any]]] = {}
+    extrinsics: dict[str, dict[str, Any]] = {}
+    profile_relations: dict[str, list[dict[str, Any]]] = {}
+    for name, cfg in load_cameras_config(config_file).items():
+        cal = load_camera_calibration(cfg.get('calibration_file'))
+        if cal['intrinsics']:
+            intrinsics[name] = cal['intrinsics']
+        if cal['extrinsics']:
+            extrinsics[name] = cal['extrinsics']
+        if cal['profile_relations']:
+            profile_relations[name] = cal['profile_relations']
+    return {
+        'intrinsics': intrinsics,
+        'extrinsics': extrinsics,
+        'profile_relations': profile_relations,
+    }
 
 
 def resolve_arm_camera(selector: str, config_file: str | Path | None = None) -> dict[str, Any]:
-    """按机械臂名、相机别名或 IP 解析单个腕部相机配置（仅 arm_3 / arm_4 有腕部相机）。"""
+    """按机械臂名、相机别名或 IP 解析单个腕部相机配置。"""
     key = str(selector or '').strip().lower()
     if not key:
-        raise ValueError('必须指定机械臂或相机别名（仅 arm_3 / arm_4 配置了腕部相机）')
+        raise ValueError('必须指定机械臂或相机别名')
     cameras = load_cameras_config(config_file)
     for cfg in cameras.values():
-        alias_set = {a.lower() for a in cfg.get('aliases', ())}
+        alias_set = {a.lower().strip('/') for a in cfg.get('aliases', ())}
         alias_set.update({cfg['name'].lower(), str(cfg.get('arm', '')).lower(), str(cfg.get('ip', '')).lower()})
         if key in alias_set or key.strip('/') in alias_set:
             return dict(cfg)
-    raise ValueError(f'只有 arm_3 和 arm_4 配置了腕部相机，未找到匹配的相机或别名：{selector!r}')
+    raise ValueError(f'未找到匹配的腕部相机：{selector!r}（已配置：{list(cameras)}）')
 
 
 def resolve_camera_selection(
@@ -168,7 +161,7 @@ def resolve_camera_selection(
     camera: str = '',
     config_file: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    """解析目标相机列表（为空或 all/both 时同时返回 arm_3 与 arm_4；支持逗号分隔或单个别名）。"""
+    """解析目标相机列表（为空或 all/both 时返回全部已配置相机；支持逗号分隔或单个别名）。"""
     cameras = load_cameras_config(config_file)
     arm_str = str(arm or '').strip()
     cam_str = str(camera or '').strip()
@@ -203,7 +196,7 @@ def resolve_stream_url(
     """把相机别名 / IP / rtsp:// 地址与码流档位解析为 (rtsp_url, 已知原生尺寸或 None)。"""
     raw = str(camera or '').strip()
     if not raw:
-        raise ValueError('必须指定腕部相机（如 arm_3、arm_4、cam3、IP 或 rtsp:// 地址）')
+        raise ValueError('必须指定腕部相机（如相机名、arm_id、IP 或 rtsp:// 地址）')
     if raw.startswith(('rtsp://', 'rtsps://')):
         tail = raw.rstrip('/').rsplit('/', 1)[-1].lower()
         return raw, _STREAM_SIZES.get(tail)
@@ -225,18 +218,6 @@ def resolve_stream_url(
     raise ValueError(f"不支持的码流 {stream!r}，可选 'stream1' (720x480) 或 'stream0' (1920x1080)")
 
 
-def _camera_candidate_keys(camera: str, config_file: str | Path | None = None) -> list[str]:
-    keys = [camera]
-    try:
-        entry = resolve_arm_camera(camera, config_file=config_file)
-        for alias in (entry['name'], entry.get('arm', ''), *entry.get('aliases', ())):
-            if alias and alias not in keys:
-                keys.append(alias)
-    except ValueError:
-        pass
-    return keys
-
-
 def _scale_intrinsic(entry: dict[str, Any], width: int, height: int) -> dict[str, Any]:
     src_w, src_h = int(entry['width']), int(entry['height'])
     ratio_x, ratio_y = width / float(src_w), height / float(src_h)
@@ -254,6 +235,17 @@ def _scale_intrinsic(entry: dict[str, Any], width: int, height: int) -> dict[str
     return scaled
 
 
+def _calibration_for(
+    camera: str,
+    calib_file: str | Path | None,
+    config_file: str | Path | None,
+) -> dict[str, Any]:
+    if calib_file:
+        return load_camera_calibration(calib_file)
+    cfg = resolve_arm_camera(camera, config_file=config_file)
+    return load_camera_calibration(cfg.get('calibration_file'))
+
+
 def get_intrinsics(
     camera: str,
     *,
@@ -264,17 +256,16 @@ def get_intrinsics(
     config_file: str | Path | None = None,
     allow_scale: bool = True,
 ) -> dict[str, Any] | None:
-    """读取指定腕部相机（支持 arm_3 / arm_4 / cam4 / IP 等任意别名）的内参字典。
+    """读取指定腕部相机的内参字典。
 
     - 显式指定 width/height，或传 stream='stream1' (720x480) / 'stream0' (1920x1080) 匹配对应档位；
     - 均未指定时默认匹配 stream1 (720x480)，若不存在则返回最高分辨率已标定档位。
     """
-    data = load_calibrations(calib_file)
-    intrinsics = data['intrinsics']
-    if not intrinsics:
+    data = _calibration_for(camera, calib_file, config_file)
+    entries = data['intrinsics']
+    if not entries:
         return None
     relations = data['profile_relations']
-    candidates = _camera_candidate_keys(camera, config_file=config_file)
 
     if width <= 0 or height <= 0:
         if stream:
@@ -285,29 +276,23 @@ def get_intrinsics(
         else:
             width, height = 720, 480
 
-    for key in candidates:
-        for entry in intrinsics.get(key, []):
-            if (int(entry.get('width', 0)), int(entry.get('height', 0))) == (width, height):
-                return dict(entry)
+    for entry in entries:
+        if (int(entry.get('width', 0)), int(entry.get('height', 0))) == (width, height):
+            return dict(entry)
 
     if not allow_scale:
         return None
 
-    for key in candidates:
-        for relation in relations.get(key, []):
-            if relation.get('kind') != 'scale' or tuple(relation.get('to', ())) != (width, height):
-                continue
-            source = tuple(relation.get('from', ()))
-            for entry in intrinsics.get(key, []):
-                if (entry.get('width'), entry.get('height')) == source:
-                    return _scale_intrinsic(entry, width, height)
+    for relation in relations:
+        if relation.get('kind') != 'scale' or tuple(relation.get('to', ())) != (width, height):
+            continue
+        source = tuple(relation.get('from', ()))
+        for entry in entries:
+            if (entry.get('width'), entry.get('height')) == source:
+                return _scale_intrinsic(entry, width, height)
 
-    for key in candidates:
-        entries = intrinsics.get(key) or []
-        if entries:
-            best = max(entries, key=lambda e: int(e.get('width', 0)) * int(e.get('height', 0)))
-            return _scale_intrinsic(best, width, height)
-    return None
+    best = max(entries, key=lambda e: int(e.get('width', 0)) * int(e.get('height', 0)))
+    return _scale_intrinsic(best, width, height)
 
 
 def load_camera_info(
@@ -347,12 +332,8 @@ def get_extrinsic(
     config_file: str | Path | None = None,
 ) -> dict[str, Any] | None:
     """读取指定腕部相机的手眼外参字典（gripper_base_top -> camera_optical），不存在返回 None。"""
-    extrinsics = load_calibrations(calib_file)['extrinsics']
-    for key in _camera_candidate_keys(camera, config_file=config_file):
-        entry = extrinsics.get(key)
-        if isinstance(entry, dict):
-            return dict(entry)
-    return None
+    entry = _calibration_for(camera, calib_file, config_file)['extrinsics']
+    return dict(entry) if isinstance(entry, dict) else None
 
 
 load_camera_extrinsic = get_extrinsic
@@ -367,7 +348,7 @@ def extrinsic_matrix(
     """返回 4x4 齐次矩阵 T_top_cam（夹爪最高点 gripper_base_top -> 相机光学系）。"""
     entry = get_extrinsic(camera, calib_file=calib_file, config_file=config_file)
     if entry is None:
-        raise KeyError(f'calibration.yaml 中未找到相机 {camera!r} 的手眼外参')
+        raise KeyError(f'未找到相机 {camera!r} 的手眼外参')
     return matrix_from_dict(entry)
 
 
@@ -382,7 +363,7 @@ def camera_pose_in_base(
     """由机械臂六轴关节角 (rad) 直接解算腕部相机在基座系 base_link 下的 4x4 位姿 T_base_cam。"""
     entry = get_extrinsic(camera, calib_file=calib_file, config_file=config_file)
     if entry is None:
-        raise KeyError(f'calibration.yaml 中未找到相机 {camera!r} 的手眼外参')
+        raise KeyError(f'未找到相机 {camera!r} 的手眼外参')
     arm_id = str(entry.get('arm') or '')
     if not arm_id:
         arm_id = str(resolve_arm_camera(camera, config_file=config_file).get('arm', ''))

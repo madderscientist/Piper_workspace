@@ -1,0 +1,15 @@
+arm: arm_4
+ip: 192.168.123.98
+label: 机械臂 4 腕部相机
+calibration: ../calibration/camera_arm_4.yaml
+rtsp_user: admin
+rtsp_password: "123456"
+default_stream: stream1
+parent_frame: gripper_base_top
+base_frame: base_link
+link6_to_top_z_m: 0.0928
+gripper_variant: gripper_with_wrench
+aliases:
+  - camera_arm_4
+  - cam4
+  - arm_4

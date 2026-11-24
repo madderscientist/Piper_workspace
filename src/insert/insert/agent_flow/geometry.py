@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from pathlib import Path
 import time
 from typing import Any, Sequence
@@ -283,7 +284,7 @@ def wrist_camera_pose_in_base(
     wrist_extrinsic_entry: dict[str, Any],
     gravity_model: ArmGravityModel | None = None,
 ) -> np.ndarray:
-    """Compute T_base_wrist(q) = T_base_top(q) @ T_top_wrist using calibrated arm_4 FK + hand-eye."""
+    """Compute T_base_wrist(q) = T_base_top(q) @ T_top_wrist using calibrated arm FK + hand-eye."""
     if len(joints_rad) < 6:
         raise ValueError('Six joint positions are required')
     offsets = (
@@ -1106,7 +1107,7 @@ def _draw_banner(image: np.ndarray, text: str, *, ok: bool = True) -> None:
     )
 
 
-def save_extrinsics_file(path: Path, cameras_data: dict[str, Any], arm_id: str = 'arm_4') -> None:
+def save_extrinsics_file(path: Path, cameras_data: dict[str, Any], arm_id: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     clean_cams: dict[str, Any] = {}
     for key, val in cameras_data.items():
@@ -1119,7 +1120,9 @@ def save_extrinsics_file(path: Path, cameras_data: dict[str, Any], arm_id: str =
         'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'cameras': clean_cams,
     }
-    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
+    tmp = path.with_name(f'.{path.name}.tmp')
+    tmp.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
+    os.replace(tmp, path)
 
 
 def load_extrinsics_file(path: Path) -> dict[str, dict[str, Any]]:

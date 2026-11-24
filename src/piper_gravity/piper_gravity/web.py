@@ -2,7 +2,7 @@
 
 import argparse
 import csv
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -45,7 +45,6 @@ from .identification import (
     CSV_COLUMNS,
     GravityIdentificationReport,
     ProbeSample,
-    identify_gripper_payload,
     identify_joint_gravity,
     parse_probe_samples_csv_reader,
     save_probe_samples_csv,
@@ -76,7 +75,6 @@ def synthesize_demo_probe_samples(
     num_points: int = 11,
     q_min: float | None = None,
     q_max: float | None = None,
-    arm_model: ArmGravityModel | None = None,
 ) -> list[ProbeSample]:
     """Generate realistic synthetic bidirectional quasi-static probe data for J1..J6."""
     default_lo, default_hi = DEFAULT_JOINT_RANGES.get(joint, (-0.5, 0.5))
@@ -107,9 +105,6 @@ def synthesize_demo_probe_samples(
                 q_shifted = list(base_pose)
                 q_shifted[joint - 1] = q_actual + true_offset
                 true_g = true_scale * gravity_torques(tuple(q_shifted))[joint - 1] + true_bias
-                if arm_model is not None and arm_model.effector_model:
-                    cad_g = arm_model.with_added_mass(0).torques(q_vec)[joint - 1]
-                    true_g = arm_model.with_added_mass(0.16).torques(q_vec)[joint - 1]
                 tau_eq = float(true_g + direction * true_fs + rng.normal(0.0, 0.006))
                 q_cmd = q_actual + tau_eq / max(1.0, kp_real)
                 samples.append(ProbeSample(
@@ -184,11 +179,6 @@ def serialize_gravity_report(
             'grid_points': int(n_grid),
             'theta_min': float(d.theta_grid[0]),
             'theta_max': float(d.theta_grid[-1]),
-        },
-        'payload': None if report.added_mass_kg is None else {
-            'added_mass_kg': report.added_mass_kg,
-            'total_mass_kg': report.total_effector_mass_kg,
-            'mass_identified': report.mass_identified,
         },
         'curves': {
             'theta_grid': [float(x) for x in d.theta_grid[idx]],
@@ -386,13 +376,15 @@ class GravityWorkbenchNode(Node):
                     )
                     q_val = pos[j_idx]
                     eff_kw = self.effector_kwargs.get(ns, {})
-                    g_torques = gravity_torques(pos[:6], **eff_kw)
+                    arm_obj = self.arms_by_ns.get(ns)
+                    g_model = self.arm_models.get(arm_obj.id) if arm_obj is not None else None
+                    # Fit baseline: nominal effector plus configured added_mass_kg, no joint calibration.
+                    g_torques = replace(g_model or ArmGravityModel(), joints={}).torques(
+                        pos[:6], **eff_kw)
                     g_vec = ctrl_state.get('gravity_torque')
                     if isinstance(g_vec, list) and len(g_vec) >= 6:
                         g_applied = float(g_vec[j_idx])
                     else:
-                        arm_obj = self.arms_by_ns.get(ns)
-                        g_model = self.arm_models.get(arm_obj.id) if arm_obj is not None else None
                         g_active = (
                             g_torques[j_idx]
                             if g_model is None
@@ -905,16 +897,10 @@ class GravityWorkbenchNode(Node):
             model_name = config.get('effector', {}).get('model') or self.fleet.effectors[arm.end_effector].model
             current_model = self.arm_models.get(arm_id, ArmGravityModel(arm_id=arm_id)).for_effector(model_name)
             self.joint_samples.setdefault(arm_id, {})[joint] = list(samples)
-            all_samples = {j: list(rows) for j, rows in self.joint_samples[arm_id].items()}
-        if current_model.effector_model:
-            updated_model, reports = identify_gripper_payload(
-                all_samples, current_model, torque_source=torque_source,
-                grid_step=grid_step, trim_ratio=trim_ratio)
-        else:
-            report = identify_joint_gravity(
-                samples, torque_source=torque_source, grid_step=grid_step, trim_ratio=trim_ratio)
-            reports = {report.joint: report}
-            updated_model = current_model.with_joint(report.joint, report.model)
+        report = identify_joint_gravity(
+            samples, torque_source=torque_source, grid_step=grid_step, trim_ratio=trim_ratio)
+        reports = {report.joint: report}
+        updated_model = current_model.with_joint(report.joint, report.model)
         with self.lock:
             self.arm_models[arm_id] = updated_model
             self.fleet.gravity_models[arm_id] = updated_model
@@ -944,7 +930,7 @@ class GravityWorkbenchNode(Node):
     ) -> dict[str, Any]:
         last_payload: dict[str, Any] = {}
         for j in range(1, 7):
-            demo_samples = synthesize_demo_probe_samples(joint=j, arm_model=self.arm_models[arm_id])
+            demo_samples = synthesize_demo_probe_samples(joint=j)
             with self.lock:
                 self.joint_samples.setdefault(arm_id, {})[j] = demo_samples
                 self.samples = demo_samples
@@ -988,6 +974,8 @@ class GravityWorkbenchNode(Node):
                     'name': arm.name,
                     'namespace': ns,
                     'can_port': arm.can_port,
+                    'gravity_config': arm.gravity_config,
+                    'friction_config': arm.friction_config,
                     'online': online,
                     'position': list(pos[:6]) if pos is not None else None,
                     'velocity': list(vel[:6]),
@@ -1173,8 +1161,7 @@ class _WorkbenchHandler(BaseHTTPRequestHandler):
                     return
                 if source == 'demo':
                     joint = int(body.get('joint', 2))
-                    samples = synthesize_demo_probe_samples(
-                        joint=joint, arm_model=self.node.arm_models.get(arm_id))
+                    samples = synthesize_demo_probe_samples(joint=joint)
                     with self.node.lock:
                         self.node.samples = samples
                         self.node.joint_samples.setdefault(arm_id, {})[joint] = samples
@@ -1261,7 +1248,7 @@ def web_main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument('--host', default='127.0.0.1', help='HTTP bind host (default: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=8091, help='HTTP port (default: 8091)')
-    parser.add_argument('--config', default=None, help='Optional fleet arms.yaml path')
+    parser.add_argument('--config', default=None, help='Optional arm configuration directory')
     args = parser.parse_args(argv)
 
     rclpy.init()

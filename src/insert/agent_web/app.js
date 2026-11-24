@@ -505,7 +505,7 @@
       state.autoStopInitialized = true;
     }
 
-    $('can-badge').textContent = (arm.can_label || 'can4').toUpperCase() + ' · ' + (arm.namespace || '/arm_4');
+    $('can-badge').textContent = (arm.can_port || '').toUpperCase() + ' · ' + (arm.namespace || '');
 
     const connPill = $('conn-pill');
     connPill.dataset.state = arm.online ? 'online' : 'offline';

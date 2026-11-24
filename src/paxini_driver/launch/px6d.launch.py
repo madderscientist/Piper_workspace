@@ -4,10 +4,10 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from paxini_driver.configuration import default_config_path, resolve_sensor_configs
+from paxini_driver.configuration import resolve_sensor_configs, source_config_path
 
 _NODE_KEYS = (
-    "arm_id",
+    "calibration_file",
     "interface",
     "serial_port",
     "expected_version",
@@ -30,9 +30,6 @@ _NODE_KEYS = (
     "filter_mode",
     "filter_window",
     "filter_alpha",
-    "tare_offset",
-    "tool_mass_kg",
-    "tool_com_m",
 )
 
 
@@ -48,15 +45,11 @@ def _launch_nodes(context):
     frame_id = LaunchConfiguration("frame_id").perform(context).strip()
     wrench_topic = LaunchConfiguration("wrench_topic").perform(context).strip()
 
-    selected = resolve_sensor_configs(arm=arm, config_file=config_file or None)
+    selected = resolve_sensor_configs(arm, config_file or None)
     single = len(selected) == 1
     nodes = []
     for entry in selected:
         params = {k: entry[k] for k in _NODE_KEYS if k in entry and entry[k] is not None}
-        for k in ("tare_offset", "tool_com_m"):
-            if k in params:
-                params[k] = [float(x) for x in params[k]]
-        params["config_file"] = config_file or str(default_config_path())
         if iface:
             params["interface"] = iface
         if frequency_hz:
@@ -89,7 +82,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument(
-                "config_file", default_value=str(default_config_path())
+                "config_file", default_value=str(source_config_path())
             ),
             DeclareLaunchArgument("arm", default_value="all"),
             DeclareLaunchArgument("namespace", default_value=""),

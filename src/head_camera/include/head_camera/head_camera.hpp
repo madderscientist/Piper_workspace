@@ -36,6 +36,7 @@ struct CameraSpec
   std::string name;
   std::string serial;
   std::string video_device;
+  fs::path calibration_file;
 };
 
 struct UvcDeviceInfo
@@ -78,6 +79,7 @@ struct Options
 };
 
 fs::path default_config_path();
+fs::path default_camera_dir();
 std::vector<CameraSpec> load_camera_specs(const fs::path & path);
 Options parse_options(const std::vector<std::string> & args);
 std::pair<int, int> color_dimensions(const std::string & color);

@@ -198,20 +198,26 @@ class Store:
             mtime_ns = self.calib_file.stat().st_mtime_ns
             if self._calib_cache[0] == mtime_ns:
                 return dict(self._calib_cache[1])
-            data = yaml.safe_load(self.calib_file.read_text(encoding='utf-8')) or {}
+            try:
+                raw = yaml.safe_load(self.calib_file.read_text(encoding='utf-8'))
+            except (OSError, yaml.YAMLError):
+                raw = {}
+            data = raw if isinstance(raw, dict) else {}
         else:
             mtime_ns = None
             data = {}
         data.setdefault('version', VERSION)
-        data.pop('urdf_overrides', None)
-        for section in _SECTIONS:
-            data.setdefault(section, {})
+        if not isinstance(data.get('intrinsics'), list):
+            data['intrinsics'] = []
+        if not isinstance(data.get('extrinsics'), dict):
+            data['extrinsics'] = None
+        if not isinstance(data.get('profile_relations'), list):
+            data['profile_relations'] = []
         self._calib_cache = (mtime_ns, data)
         return data
 
     def write_calibration(self, data: dict) -> str:
         data = dict(data)
-        data.pop('urdf_overrides', None)
         self.calib_file.parent.mkdir(parents=True, exist_ok=True)
         text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=120)
         temporary = self.calib_file.with_suffix('.yaml.tmp')
@@ -232,36 +238,36 @@ class Store:
             'stamp': _stamp(),
         }
         entry.update(extra or {})
-        entries = [e for e in data['intrinsics'].get(camera, [])
+        entries = [e for e in data['intrinsics']
                    if (e['width'], e['height']) != (entry['width'], entry['height'])]
         entries.append(entry)
         entries.sort(key=lambda e: (-e['width'], -e['height']))
-        data['intrinsics'][camera] = entries
+        data['intrinsics'] = entries
         return self.write_calibration(data)
 
     def put_profile_relation(self, camera: str, relation: dict) -> str:
         data = self.read_calibration()
-        relations = [r for r in data['profile_relations'].get(camera, [])
+        relations = [r for r in data['profile_relations']
                      if (r['from'], r['to']) != (relation['from'], relation['to'])]
         relations.append(relation)
-        data['profile_relations'][camera] = relations
+        data['profile_relations'] = relations
         return self.write_calibration(data)
 
     def put_extrinsic(self, camera: str, entry: dict) -> str:
         data = self.read_calibration()
-        data['extrinsics'][camera] = {**entry, 'stamp': _stamp()}
+        data['extrinsics'] = {**entry, 'stamp': _stamp()}
         return self.write_calibration(data)
 
 
 def find_intrinsic(data: dict, camera: str, width: int, height: int,
                    allow_scale: bool = True) -> dict | None:
-    entries = data.get('intrinsics', {}).get(camera, [])
+    entries = data.get('intrinsics') or []
     for entry in entries:
         if entry['width'] == width and entry['height'] == height:
             return dict(entry)
     if not allow_scale:
         return None
-    for relation in data.get('profile_relations', {}).get(camera, []):
+    for relation in data.get('profile_relations') or []:
         if relation.get('kind') != 'scale':
             continue
         source = tuple(relation['from'])

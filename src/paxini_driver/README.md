@@ -26,21 +26,34 @@
 
 ## 2. 启动与使用
 
-`config/px6d.yaml` 默认配置了双臂力传感器，工作在 `interface: rs485`、`poll_rate_hz: 1000`（通过 0x05 请求采集，实际接收频率见 `rx_hz`），节点收到 `Ctrl+C`（`SIGINT` / `SIGTERM`）退出时会自动下发 `0x04` 指令并停止采集，恢复传感器被动模式：
-- `arm_3`（左手，固件 `v1.0.3`）：命名空间 `/arm_3`，默认串口 `/dev/ttyUSB1`（若串口顺序互换会自动按固件版本匹配）
-- `arm_4`（右手，固件 `v1.0.1`）：命名空间 `/arm_4`，默认串口 `/dev/ttyUSB0`（若串口顺序互换会自动按固件版本匹配）
+配置分三处：
+- 包内 `config/px6d.yaml`：协议默认值（`interface: rs485`、`poll_rate_hz: 1000` 等）、公共校准姿态和稳定性实测记录，进 git。
+- `$PIPER_CONFIG_DIR/paxini_driver/<传感器名>.yaml`：本机接入的传感器，一个文件一个传感器，不进 git。
+  必填 `arm`（命名空间为 `/<arm>`），常用 `serial_port`、`expected_version`（串口顺序互换时按固件版本匹配）、
+  `calibration`（标定结果文件，相对本文件），也可覆盖 `defaults` 中任一项。
+- `calibration` 指向的文件：零偏、工具质量/重心及拟合记录；未配置、不存在或无效均视为未标定。
+
+示例 `config/paxini_driver/px6d_right.yaml`：
+
+```yaml
+arm: arm_4
+serial_port: /dev/ttyUSB0
+expected_version: v1.0.1
+calibration: ../calibration/px6d_right.yaml
+```
+
+节点收到 `Ctrl+C`（`SIGINT` / `SIGTERM`）退出时会自动下发 `0x04` 指令并停止采集，恢复传感器被动模式。
 
 ```bash
 source ./setup_env.bash
 colcon build --packages-select paxini_driver --symlink-install
 source install/local_setup.bash
 
-# 默认同时启动左手 arm_3 (/arm_3/wrench_stamped) 与右手 arm_4 (/arm_4/wrench_stamped)
+# 启动本机全部传感器
 ros2 launch paxini_driver px6d.launch.py
 
-# 只启动单臂传感器（支持 arm_3 / left / 左手 或 arm_4 / right / 右手）
-ros2 launch paxini_driver px6d.launch.py arm:=arm_3
-ros2 launch paxini_driver px6d.launch.py arm:=arm_4
+# 只启动一个（传感器名或机械臂 id）
+ros2 launch paxini_driver px6d.launch.py arm:=px6d_right
 ```
 
 ## 3. 驱动职责与接口
@@ -54,7 +67,7 @@ ros2 launch paxini_driver px6d.launch.py arm:=arm_4
 - 发布 `wrench_stamped`：按已加载参数补偿后的六维力，单位 N / Nm，参考点仍为传感器原始参考点。
 - 发布 `sensor_status`：连接、固件版本、实际 `rx_hz`、已加载参数和拟合质量。
 - 订阅 `joint_states_feedback`：取得实际姿态，用于计算工具重力。
-- `reload_config`（`std_srvs/srv/Trigger`）：读取 config 中本传感器的零偏、质量和重心，
+- `reload_config`（`std_srvs/srv/Trigger`）：重新读取 `calibration_file` 中的零偏、质量和重心，
   原子更新补偿参数并重置滤波器，无需重启驱动。标定程序保存结果后自动调用。
 - 硬件服务 `calibrate`（0x10 硬件指令）、`start_stream`、`stop_stream`、`read_once`、`get_version`。
 - `command` 支持 `reload_config`、`calibrate`、`start`、`stop`、`read_once`、`version`、
@@ -63,22 +76,22 @@ ros2 launch paxini_driver px6d.launch.py arm:=arm_4
 手动重新加载参数：
 
 ```bash
-ros2 service call /arm_3/reload_config std_srvs/srv/Trigger '{}'
+ros2 service call /arm_4/reload_config std_srvs/srv/Trigger '{}'
 ```
 
 ## 4. 独立标定程序
 
 先启动机械臂驱动及 paxini_driver，再运行 `ros2 run paxini_driver calibrate`。
 这是独立的 ROS 客户端程序，只通过话题和服务获取数据、控制机械臂；不打开传感器串口。
-标定完成后写 config，再请求所选传感器驱动的 `reload_config`，驱动立即应用新结果。
+标定完成后写入该传感器的 `calibration` 文件，再请求其驱动的 `reload_config`，驱动立即应用新结果。
 
-所有臂共用配置顶层的 `calibration_poses`，只需任选一只臂记录一套。
+所有传感器共用包内 `px6d.yaml` 的 `calibration_poses`，只需任选一只臂记录一套。
 当前公共列表是 arm4 记录的五个姿态。`record` 追加公共姿态，`clear` 清空公共姿态；
 `run` 每次读取最新公共列表，控制所选臂运动并保存该传感器独立的零偏和工具重力参数。
 
 标定程序以约 200 Hz 从当前反馈位置同步插值到下一个姿态，按
 `defaults.calib_joint_speed_rad_s` 中 joint1～joint6 的速度上限计算共同运动时长。
-默认六关节均为 `0.4 rad/s`（约 `22.9°/s`），可在各传感器条目中覆盖这组六个值。
+默认六关节均为 `0.4 rad/s`（约 `22.9°/s`），可在传感器文件中覆盖这组六个值。
 这是标定客户端对目标位置变化率的软件限制，不是 MIT 协议或硬件的实际速度保护；
 MIT 的目标速度为零不代表限速，KP/KD 保持不变。
 插值结束后重置力稳定窗口，持续保持最终目标，根据原始六维力读数动态等待稳定：
@@ -92,23 +105,23 @@ MIT 的目标速度为零不代表限速，KP/KD 保持不变。
 采样结束后，以相同速度限制插值返回校准开始前的位置，保持至力读数稳定，再退出校准控制。
 重力方向使用 `piper_x_driver` 中与 SDK 一致的运动学函数，传感器通道方向已用
 实测重力数据核对；不将显示 URDF 的关节变换直接用于 SDK 关节反馈。
-配置选择与读写集中在 `configuration.py`；保存时串行合并各臂结果并原子替换文件，
-避免两只臂同时标定时覆盖彼此的结果，或驱动重载时读到未写完的 YAML。
-各传感器条目保存 `calibration_samples`（各姿态的位置、原始力和重力方向均值）及
+配置选择与读写集中在 `configuration.py`；保存时加文件锁并原子替换文件，
+避免并发写入互相覆盖，或驱动重载时读到未写完的 YAML。
+标定文件保存 `calibration_samples`（各姿态的位置、原始力和重力方向均值）及
 `calibration_quality`（力/力矩逐分量 RMS 残差），方便复算和检查实际校准误差。
 
 ```bash
 # 1. 手动或零力拖动将机械臂摆到不同姿态（建议 >= 3 个不同腕部朝向），每摆好一个姿态执行一次 record：
-ros2 run paxini_driver calibrate --arm 左手 record
+ros2 run paxini_driver calibrate --arm px6d_right record
 
 # 查看已记录的校准姿态与当前校准参数
-ros2 run paxini_driver calibrate --arm 左手 list
+ros2 run paxini_driver calibrate --arm px6d_right list
 
-# 2. 启动自动校准：机械臂依次运动到已记录的各个姿态采样，解算零偏并写回 src/paxini_driver/config/px6d.yaml
-ros2 run paxini_driver calibrate --arm 左手 run
+# 2. 启动自动校准：机械臂依次运动到已记录的各个姿态采样，解算后写入该传感器的 calibration 文件
+ros2 run paxini_driver calibrate --arm px6d_right run
 
 # 如需重新录制姿态，可先清空
-ros2 run paxini_driver calibrate --arm 左手 clear
+ros2 run paxini_driver calibrate --arm px6d_right clear
 ```
 
 ## 5. 求解模型与可辨识性

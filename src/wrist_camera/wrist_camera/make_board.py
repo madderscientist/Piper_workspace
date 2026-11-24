@@ -9,15 +9,14 @@ import cv2
 import yaml
 
 from wrist_camera.board import Board
-from wrist_camera.rtsp import default_cameras_config_path
+from wrist_camera.rtsp import default_board_config_path
 
 MM_PER_INCH = 25.4
 
 
 def main(argv: list[str] | None = None) -> None:
-    cfg_dir = default_cameras_config_path().parent
     parser = argparse.ArgumentParser(description='生成 ChArUco 标定板图')
-    parser.add_argument('--config', default=str(cfg_dir / 'board.yaml'))
+    parser.add_argument('--config', default=str(default_board_config_path()))
     parser.add_argument('--out', default='/tmp/charuco_board.png')
     parser.add_argument('--dpi', type=float, default=300.0)
     parser.add_argument('--margin-squares', type=float, default=0.5)

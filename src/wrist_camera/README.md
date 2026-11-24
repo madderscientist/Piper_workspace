@@ -4,23 +4,13 @@ PiPER-X 腕部 IP 相机一体化纯 Python 工具包（无相机 ROS 节点、�
 
 ## 1. 硬件与码流配置
 
-相机映射表统一维护在 [config/cameras.yaml](config/cameras.yaml)，标定结果统一保存在 [config/calibration.yaml](config/calibration.yaml)：
+本机腕部相机配置存放在 `$PIPER_CONFIG_DIR/wrist_camera/<相机名>.yaml`（每台相机一个文件，不进 git，模板见根目录 `config/examples/wrist_camera/`）；各相机的标定结果存放在对应 `calibration` 字段指向的 YAML（通常为 `../calibration/<相机名>.yaml`，缺失或无效视为未标定）。包内只保留 [config/board.yaml](config/board.yaml)（ChArUco 标定板尺寸）。
 
-| 相机键名 | 所属机械臂 | IP | 常用别名（`aliases`） | 外参父系（`link6 +Z`） |
-|---|---|---|---|---|
-| `camera_arm_3` | `arm_3` (`/arm_3`) | `192.168.123.97` | `arm_3`, `arm3`, `cam3`, `192.168.123.97` | `gripper_base_top` (`+92.8 mm`) |
-| `camera_arm_4` | `arm_4` (`/arm_4`) | `192.168.123.98` | `arm_4`, `arm4`, `cam4`, `192.168.123.98` | `gripper_base_top` (`+92.8 mm`) |
-
-两台相机接入主机专用网卡 `enp2s0`（`192.168.123.100/24`），固件内双码流均已持久化为 **30 fps**：
-
-| 码流 | RTSP 路径 | 原生分辨率 | 编码格式 | 帧率 | 用途 |
-|---|---|---|---|---|---|
-| **子码流（默认）** | `/stream1` | **`720×480`** | H.265 (HEVC) | **30 fps** | 低延迟实时预览、日常快速取图 |
-| **主码流** | `/stream0` | **`1920×1080`** | H.264 | **30 fps** | 高清视觉定位与 1080p 标定 |
+在工作空间外（未设置 `PIPER_CONFIG_DIR`）调用时，需显式传入 `config_file` 参数指向相机配置目录或单个 YAML 文件，否则报错。
 
 ## 2. Python 直接 `import` 库（取图 + 内外参 + 基座系位姿）
 
-顶层 `import wrist_camera` 不依赖 `rclpy` 或 `cv2`（仅需 `numpy`、`pyyaml` 和系统 `ffmpeg`），在工作空间（`source ./setup_env.bash`）或外部独立虚拟环境（`pip install --no-build-isolation --no-deps -e /home/a/piper_x_ws/src/wrist_camera`）中均可直接导入：
+顶层 `import wrist_camera` 不依赖 `rclpy` 或 `cv2`（仅需 `numpy`、`pyyaml` 和系统 `ffmpeg`），在工作空间（`source ./setup_env.bash`）或外部独立虚拟环境（`pip install --no-build-isolation --no-deps -e <workspace>/src/wrist_camera`）中均可直接导入：
 
 ```python
 from wrist_camera import (
@@ -44,7 +34,7 @@ with WristCamera('arm_4', stream='stream0') as cam:
     t_top_cam = cam.extrinsic_matrix()       # (4, 4) T_top_cam 齐次变换矩阵
     t_base_cam = cam.pose_in_base(q_rad_6)   # (4, 4) 结合六轴关节角正运动学算出 T_base_cam
 
-# 3. 不开相机流时也可随时单独查询任意档位内参、外参与位姿（默认自动读取 config/calibration.yaml）
+# 3. 不开相机流时也可随时单独查询任意档位内参、外参与位姿（自动读取该相机的 calibration 文件）
 intr_480 = get_intrinsics('arm_4', stream='stream1')
 intr_1080 = get_intrinsics('arm_4', width=1920, height=1080)
 ext_dict = get_extrinsic('arm_4')

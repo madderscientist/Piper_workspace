@@ -14,7 +14,11 @@ import yaml
 
 from wrist_camera import extrinsic, intrinsic, transforms
 from wrist_camera.board import Board, probe
-from wrist_camera.rtsp import default_calibration_path, default_cameras_config_path
+from wrist_camera.rtsp import (
+    default_board_config_path,
+    default_cameras_config_path,
+    load_cameras_config,
+)
 from wrist_camera.sources import (
     CameraSource,
     Frames,
@@ -49,32 +53,31 @@ class CalibrationApp:
         detect_period_s: float = 0.15,
     ) -> None:
         cv2.setNumThreads(1)
-        cfg_dir = default_cameras_config_path().parent
 
         self.preview_width = int(preview_width)
         self.jpeg_quality = int(jpeg_quality)
         self.detect_period_s = float(detect_period_s)
 
-        self.board_config_path = Path(board_config or (cfg_dir / 'board.yaml')).expanduser().resolve()
+        self.board_config_path = Path(board_config or default_board_config_path()).expanduser().resolve()
         self.cameras_config_path = Path(cameras_config or default_cameras_config_path()).expanduser().resolve()
         self.board_config = _read_yaml(self.board_config_path)
-        self.cameras_config = _read_yaml(self.cameras_config_path)
+        self.cameras = load_cameras_config(self.cameras_config_path)
 
         self.arm_id, self.camera_name, self.camera_cfg = select_arm_camera(
-            self.cameras_config, arm, camera)
+            self.cameras, arm, camera)
         self.base_frame = str(base_frame or self.camera_cfg.get('base_frame', 'base_link'))
 
+        target_calib = calib_file or self.camera_cfg.get('calibration_file')
+        if not target_calib:
+            raise ValueError(f'相机 {self.camera_name} 未配置 calibration 路径，请设置 calibration 字段或传 --calib-file')
         self.board = Board.from_config(self.board_config)
-        self.store = Store(
-            data_root or '~/camera_calib_data',
-            calib_file or default_calibration_path(),
-        )
+        self.store = Store(data_root or '~/camera_calib_data', target_calib)
 
         self.sources = {
             self.camera_name: CameraSource(
                 self.camera_name, self.camera_cfg, auto_start=connect_camera),
         }
-        gate_cfg = dict(self.cameras_config.get('motion_gate', {}))
+        gate_cfg = dict(self.camera_cfg.get('motion_gate') or {})
         if self.camera_cfg.get('joint_states_topic'):
             gate_cfg['joint_states_topic'] = self.camera_cfg['joint_states_topic']
         default_joint_topic = f'/{self.arm_id}/joint_states_feedback'
@@ -188,7 +191,7 @@ class CalibrationApp:
             'poses': [_pose_summary(p, self.camera_name)
                       for p in self.store.list_extrinsic_poses(self.camera_name)],
             'calib_file': str(self.store.calib_file),
-            'saved_extrinsic': (calibration.get('extrinsics') or {}).get(self.camera_name),
+            'saved_extrinsic': calibration.get('extrinsics'),
             'results': self._results,
         }
 
@@ -350,7 +353,7 @@ class CalibrationApp:
     def relate_profiles(self, body: dict) -> dict:
         name = body.get('camera') or self.camera_name
         calibration = self.store.read_calibration()
-        entries = calibration.get('intrinsics', {}).get(name, [])
+        entries = calibration.get('intrinsics') or []
         if len(entries) < 2:
             raise RuntimeError(f'{name} 至少要标完两个档位才能判断它们是缩放还是裁剪')
         ordered = sorted(entries, key=lambda e: e['width'] * e['height'], reverse=True)

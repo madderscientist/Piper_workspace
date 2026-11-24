@@ -26,7 +26,6 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
-find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -50,7 +49,6 @@ target_include_directories(paxini_driver_core PUBLIC
 )
 target_link_libraries(paxini_driver_core PUBLIC yaml-cpp Threads::Threads)
 ament_target_dependencies(paxini_driver_core PUBLIC
-  ament_index_cpp
   rclcpp
   geometry_msgs
   sensor_msgs
@@ -96,9 +94,6 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_driver test/test_driver.cpp)
   target_link_libraries(test_driver paxini_driver_core)
-  target_compile_definitions(test_driver PRIVATE
-    PAXINI_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-  )
 
   ament_add_pytest_test(test_paxini_driver test/test_paxini_driver.py
     TIMEOUT 60

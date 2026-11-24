@@ -22,9 +22,12 @@ from std_srvs.srv import Trigger
 from piper_x_driver.configuration import default_config_path, FleetConfig
 
 from .bilateral import (
-    ArmSample, BilateralCoupling, JOINT_NAMES, MASTER_INDICES, TeachingConfig,
+    ArmSample, BilateralCoupling, JOINT_NAMES, TeachingConfig,
     TeachingFault, measured_references,
 )
+
+# (master, slave); only pairs whose two arms are both configured on this machine are used.
+PAIRS = (('arm_1', 'arm_3'), ('arm_2', 'arm_4'))
 
 
 class TeachingNode(Node):
@@ -32,6 +35,13 @@ class TeachingNode(Node):
         super().__init__('bilateral_teaching', **kwargs)
         self.declare_parameter('config_file', str(default_config_path()))
         self.fleet = FleetConfig(str(self.get_parameter('config_file').value))
+        ids = {arm.id for arm in self.fleet.arms}
+        pairs = [pair for pair in PAIRS if set(pair) <= ids]
+        if not pairs:
+            raise ValueError(f'No complete master/slave pair {PAIRS} among configured arms')
+        self.pairs = pairs
+        self.arms = [self.fleet.arm(m) for m, _ in pairs] + [self.fleet.arm(s) for _, s in pairs]
+        count = len(self.arms)
         self.declare_parameter('dry_run', True)
         self.declare_parameter('auto_start', True)
         self.declare_parameter('rate_hz', 200.0)
@@ -53,12 +63,12 @@ class TeachingNode(Node):
         self.config = TeachingConfig(**values)
         self.coupling = BilateralCoupling(self.config)
         self.phase = 'preview' if self.dry_run else 'idle'
-        self.reason = 'Waiting for all four driver streams'
-        self.positions: list[tuple[float, ...] | None] = [None] * 4
-        self.velocities: list[tuple[float, ...]] = [(0.0,) * 6] * 4
-        self.statuses: list[ArmStatus | None] = [None] * 4
-        self.joint_received: list[float | None] = [None] * 4
-        self.status_received: list[float | None] = [None] * 4
+        self.reason = 'Waiting for all driver streams'
+        self.positions: list[tuple[float, ...] | None] = [None] * count
+        self.velocities: list[tuple[float, ...]] = [(0.0,) * 6] * count
+        self.statuses: list[ArmStatus | None] = [None] * count
+        self.joint_received: list[float | None] = [None] * count
+        self.status_received: list[float | None] = [None] * count
         self.power_clients, self.mode_clients = [], []
         self.mit_pubs, self.gripper_pubs, self.target_pubs = [], [], []
         self.pending = []
@@ -69,9 +79,9 @@ class TeachingNode(Node):
         self._last_tick = time.monotonic()
         self._last_state_pub = 0.0
         self._last_state_key = None
-        self._mit_msgs = [MitCommand() for _ in range(4)]
-        self._grip_msgs = [GripperCommand() for _ in range(4)]
-        self._target_msgs = [JointState(name=list(JOINT_NAMES)) for _ in range(4)]
+        self._mit_msgs = [MitCommand() for _ in range(count)]
+        self._grip_msgs = [GripperCommand() for _ in range(count)]
+        self._target_msgs = [JointState(name=list(JOINT_NAMES)) for _ in range(count)]
         self._active_msg = Bool()
         self._state_msg = String()
         realtime_sub_qos = QoSProfile(
@@ -79,8 +89,8 @@ class TeachingNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
-        for index in range(4):
-            prefix = self.fleet.arms[index].namespace
+        for index, arm in enumerate(self.arms):
+            prefix = arm.namespace
             self.create_subscription(
                 JointState, prefix + '/joint_states_feedback',
                 lambda message, i=index: self._joints(i, message), realtime_sub_qos)
@@ -96,7 +106,7 @@ class TeachingNode(Node):
             self.gripper_pubs.append(self.create_publisher(
                 GripperCommand, prefix + '/command/gripper', 10))
             self.target_pubs.append(self.create_publisher(
-                JointState, f'/bilateral_teaching/arm_{index + 1}/target', 10))
+                JointState, f'/bilateral_teaching/{arm.id}/target', 10))
         self.state_pub = self.create_publisher(String, '/bilateral_teaching/state', 10)
         self.active_pub = self.create_publisher(Bool, '/bilateral_teaching/active', 10)
         self.create_service(Trigger, '/bilateral_teaching/start', self._start)
@@ -118,7 +128,7 @@ class TeachingNode(Node):
             return
         names = list(message.name)
         if len(names) != 7 or set(names) != set(JOINT_NAMES) or len(message.position) != 7:
-            self.get_logger().error(f'arm_{index + 1}: seven unique positions required')
+            self.get_logger().error(f'{self.arms[index].id}: seven unique positions required')
             self.joint_received[index] = None
             return
         order = [names.index(name) for name in JOINT_NAMES]
@@ -141,24 +151,24 @@ class TeachingNode(Node):
             if not isinstance(state, dict):
                 raise ValueError('control_state must be a JSON object')
         except (ValueError, TypeError) as error:
-            self.get_logger().error(f'arm_{index + 1}: invalid control state: {error}')
+            self.get_logger().error(f'{self.arms[index].id}: invalid control state: {error}')
             return
         mode = state.get('mode')
         if ((mode == 'drag' and self.phase in (
                 'enabling', 'preloading', 'starting', 'engaging', 'active'))
                 or (mode == 'standby' and self.phase in ('engaging', 'active'))):
-            reason = f'arm_{index + 1}: driver stop requested'
+            reason = f'{self.arms[index].id}: driver stop requested'
             self.get_logger().error(reason)
             self.stop(reason, fault=True)
 
     def samples(self, now):
         result = []
-        for index in range(4):
+        for index, arm in enumerate(self.arms):
             status, received = self.statuses[index], self.status_received[index]
             joints, position = self.joint_received[index], self.positions[index]
             if (status is None or received is None or joints is None or position is None
                     or not 0 <= now - joints <= self.config.feedback_timeout):
-                raise TeachingFault(f'arm_{index + 1}: missing/expired ROS feedback')
+                raise TeachingFault(f'{arm.id}: missing/expired ROS feedback')
             ages = tuple(status.feedback_age)
             stamps = tuple(
                 None if age == -1 else received - age for age in ages)
@@ -168,7 +178,7 @@ class TeachingNode(Node):
                 if status.arm_status not in (0, 11) or status.err_code else '')
             result.append(ArmSample(
                 position, stamps, enabled, fault,
-                status.mode_feedback, self.velocities[index]))
+                status.mode_feedback, self.velocities[index], arm.id))
         return tuple(result)
 
     def request_retry(self):
@@ -185,7 +195,7 @@ class TeachingNode(Node):
             self.coupling.check_start(samples, now, require_enabled=False)
             clients = self.power_clients + self.mode_clients
             if not all(client.service_is_ready() for client in clients):
-                raise TeachingFault('All four driver power/mode services must be available')
+                raise TeachingFault('All driver power/mode services must be available')
             self.pending = [
                 client.call_async(Enable.Request(enable_request=True))
                 for client in self.power_clients
@@ -240,11 +250,12 @@ class TeachingNode(Node):
             response.message = self.reason
         return response
 
-    def _send(self, samples, targets, kp, velocities=((0.0,) * 6,) * 4):
+    def _send(self, samples, targets, kp, velocities=None):
         kp_list, kd_list = list(kp), list(self.config.kd)
         zero_6 = (0.0,) * 6
+        velocities = velocities or (zero_6,) * len(samples)
         for index, (sample, target, velocity) in enumerate(zip(samples, targets, velocities)):
-            free_master = self.config.mode == 'master_slave' and index in MASTER_INDICES
+            free_master = self.config.mode == 'master_slave' and index < len(self.pairs)
             follow = self.coupling.engaged and not free_master
             zero_gain = self.coupling.engaged and free_master
             m_msg = self._mit_msgs[index]
@@ -314,11 +325,7 @@ class TeachingNode(Node):
                             ]
                     if self.phase == 'engaging' and self.coupling.engaged:
                         self.coupling._last_tick = now
-                        self._send(
-                            samples, self.coupling.targets,
-                            self.config.kp,
-                            ((0.0,) * 6,) * 4,
-                        )
+                        self._send(samples, self.coupling.targets, self.config.kp)
                         self.phase = 'active'
                     else:
                         targets, kp = self.coupling.step(
@@ -358,9 +365,10 @@ class TeachingNode(Node):
                 'dry_run': self.dry_run, 'mode': self.config.mode,
                 'phase': self.phase, 'reason': self.reason,
                 'holding': self.holding,
-                'start_block_reason': block, 'references': refs, 'pairs': [[1, 3], [2, 4]],
-                'master_arms': [1, 2] if self.config.mode == 'master_slave' else [],
-                'slave_arms': [3, 4] if self.config.mode == 'master_slave' else [],
+                'start_block_reason': block, 'references': refs,
+                'pairs': [list(pair) for pair in self.pairs],
+                'master_arms': [m for m, _ in self.pairs] if self.config.mode == 'master_slave' else [],
+                'slave_arms': [s for _, s in self.pairs] if self.config.mode == 'master_slave' else [],
                 'engage_max_error_deg': self.coupling.engage_error_deg,
             })
             self.state_pub.publish(self._state_msg)

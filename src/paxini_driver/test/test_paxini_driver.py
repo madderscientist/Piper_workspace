@@ -186,19 +186,23 @@ def test_independent_calibrator_with_cpp_driver_pty_reloads_and_compensates(tmp_
                     "calib_joint_speed_rad_s": [0.8] * 6,
                     "calib_stability_range": [0.1] * 3 + [0.01] * 3,
                 },
-                "sensors": {
-                    "arm_3": {
-                        "namespace": "/paxini_test/arm_3",
-                        "tare_offset": [3.0] * 6,
-                    },
-                    "arm_4": {
-                        "namespace": "/paxini_test/arm_4",
-                        "tare_offset": [1.0] * 6,
-                    },
-                },
             }
         )
     )
+    sensor_dir = tmp_path / "paxini_driver"
+    sensor_dir.mkdir()
+    for name, arm in (("left", "arm_3"), ("right", "arm_4")):
+        (sensor_dir / f"{name}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "arm": arm,
+                    "namespace": f"/paxini_test/{arm}",
+                    "calibration": f"../{name}_calibration.yaml",
+                }
+            )
+        )
+    calibration_file = tmp_path / "left_calibration.yaml"
+    calibration_file.write_text(yaml.safe_dump({"tare_offset": [3.0] * 6}))
     bias = (1.5, -2.5, 3.5, 0.02, -0.03, 0.04)
     mass = 0.5
     com = (0.01, -0.02, 0.06)
@@ -219,9 +223,7 @@ def test_independent_calibrator_with_cpp_driver_pty_reloads_and_compensates(tmp_
             "-r",
             "__ns:=/paxini_test/arm_3",
             "-p",
-            "arm_id:=arm_3",
-            "-p",
-            f"config_file:={cfg_path}",
+            f"calibration_file:={calibration_file}",
             "-p",
             "interface:=usb",
             "-p",
@@ -232,8 +234,8 @@ def test_independent_calibrator_with_cpp_driver_pty_reloads_and_compensates(tmp_
     )
 
     rclpy.init()
-    client = PoseCalibrator("arm_3", cfg_path)
-    other = PoseCalibrator("arm_4", cfg_path)
+    client = PoseCalibrator("left", cfg_path, sensor_dir)
+    other = PoseCalibrator("arm_4", cfg_path, sensor_dir)
     fake_arm = rclpy.create_node("fake_arm", namespace="/paxini_test/arm_3")
     q_pub = fake_arm.create_publisher(JointState, "joint_states_feedback", 10)
     status_pub = fake_arm.create_publisher(ArmStatus, "arm_status", 10)
@@ -284,7 +286,7 @@ def test_independent_calibrator_with_cpp_driver_pty_reloads_and_compensates(tmp_
             recorder = other if index == len(poses) - 1 else client
             recorder._on_joints(js)
             recorder.record_pose()
-        assert resolve_sensor_configs("arm_4", str(cfg_path))[0][
+        assert resolve_sensor_configs("right", cfg_path, sensor_dir)[0][
             "calibration_poses"
         ] == [list(q) for q in poses]
         client.latest_joint_positions = None
@@ -320,11 +322,9 @@ def test_independent_calibrator_with_cpp_driver_pty_reloads_and_compensates(tmp_
             latest_w.torque.z,
         ) == pytest.approx((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), abs=0.05)
 
-        saved = yaml.safe_load(cfg_path.read_text())
-        samples = saved["sensors"]["arm_3"]["calibration_samples"]
+        samples = yaml.safe_load(calibration_file.read_text())["calibration_samples"]
         assert len(samples) == 4 and all(p["duration_sec"] >= 0.05 for p in samples)
         assert all(len(p["gravity_unit_mean"]) == 3 for p in samples)
-        assert saved["sensors"]["arm_4"]["tare_offset"] == [1.0] * 6
 
         driver_proc.send_signal(signal.SIGINT)
         driver_proc.wait(timeout=3.0)

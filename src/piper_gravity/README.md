@@ -19,9 +19,9 @@
 
 arm3、arm4 的 `gripper_with_wrench` 使用六个部件的 mesh 体积积分计算质心和完整惯性张量。每个部件内部按均匀密度处理，质量采用 URDF 中的已知值；通过安装变换和平行轴定理合成到驱动原 `link6` 坐标系。传感器、两片法兰、夹爪底座和两片手指的名义总质量为 **0.685505 kg**。
 
-该末端的重力辨识保留已有机械臂各轴 `scale / angle_offset / bias`，将相机等未建模附件统一辨识为一个全臂共享的 `added_mass_kg`，只加到 `gripper_base_without_flange.STL`，不改变传感器、法兰和手指的质量。每次拟合共同使用已采集的各轴双向半和数据；J1、关闭重力补偿的 J6 不提供质量信息，仍可测量静摩擦。保存的 `arm_X_gravity.yaml` 包含 `effector_model` 和 `added_mass_kg`，驱动据此更新总质量、总质心及惯量。
+所有末端使用同一套逐关节辨识：以"名义末端 + `added_mass_kg`"为 CAD 基准，拟合各轴 `scale / angle_offset` 与静摩擦，末端质量偏差由各轴 `scale` 吸收。
 
-附加质量的重力矩对质量呈线性关系：`g(q) = g_nominal(q) + added_mass_kg * g_gripper_per_kg(q)`。相机的等效质心与单位质量惯量采用夹爪底座 mesh；准静态重力数据只能辨识这里的等效质量，不能独立测出相机真实的惯性张量。CSV 必须包含实际采样姿态 `q1..q6`。Web 工作台会显示附加质量和末端总质量；写入驱动当前使用的标定文件后会请求驱动重新加载。
+`added_mass_kg` 是**人工配置**的已知附件质量（如相机），写在重力标定文件 `arm_X_gravity.yaml` 中，默认 `0`；它只加到 `gripper_base_without_flange.STL`（等效质心与单位质量惯量采用夹爪底座 mesh），驱动据此更新总质量、总质心及惯量。重新标定会保留该值；修改它之后需重新执行重力标定，使各轴 `scale` 以新的基准拟合。
 
 更新统一配置中的 `gripper_with_wrench` mesh 质量属性，保留其余末端参数：
 
@@ -62,14 +62,14 @@ $$\tau_{g, j}^{\text{cal}}(q) = \text{scale}_j \cdot \tau_{g, j}^{\text{CAD}}(q 
 
 ```bash
 # 终端 1：启动四臂驱动
-ros2 launch piper_x_driver four_arms.launch.py
+ros2 launch piper_x_driver all_arms.launch.py
 
 # 终端 2：启动重力与静摩擦标定 Web 工作台（默认监听 http://127.0.0.1:8091/）
 ros2 run piper_gravity web --port 8091
 ```
 
 - 支持在网页顶部切换 `机械臂 1 ~ 4` 并**多臂同时并行执行** `J1 → J6` 阶梯逼近队列；
-- 每个关节测完后自动回位至安全锚点角 `SAFE_ANCHOR_POSE`，并实时拟合并保存至 `src/piper_gravity/config/arm_X_gravity.yaml`。
+- 每个关节测完后自动回位至安全锚点角 `SAFE_ANCHOR_POSE`，并实时拟合并保存至臂文件 `gravity_config` 指定的路径（示范为 `config/calibration/arm_X_gravity.yaml`）。
 
 ### 方式二：命令行采集、拟合与评估 (`probe` / `fit` / `evaluate`)
 
@@ -83,21 +83,21 @@ ros2 run piper_gravity probe \
   --q-max 1.20 \
   --num-points 9 \
   --output-csv /tmp/arm1_j2_gravity_probe.csv \
-  --fit-output src/piper_gravity/config/arm_1_gravity.yaml \
-  --update-friction-yaml src/piper_friction/config/arm_1_friction.yaml
+  --fit-output config/calibration/arm_1_gravity.yaml \
+  --update-friction-yaml config/calibration/arm_1_friction.yaml
 
 # 2. 从已有探针或扫描 CSV 批量拟合整臂重力模型
 ros2 run piper_gravity fit \
   /tmp/arm1_j*_gravity_probe.csv \
   --arm-id arm_1 \
-  --output src/piper_gravity/config/arm_1_gravity.yaml
+  --output config/calibration/arm_1_gravity.yaml
 
 # 3. 评估给定六轴角度下的标定重力矩
 ros2 run piper_gravity evaluate \
-  --model src/piper_gravity/config/arm_1_gravity.yaml \
+  --model config/calibration/arm_1_gravity.yaml \
   --position 0.0 0.9 -1.5 0.0 0.0 0.0
 
 # arm3 的复合末端：从 J2～J5 的数据共同拟合夹爪附加质量
 ros2 run piper_gravity fit /tmp/arm3_j*_gravity_probe.csv \
-  --arm-id arm_3 --output src/piper_gravity/config/arm_3_gravity.yaml
+  --arm-id arm_3 --output config/calibration/arm_3_gravity.yaml
 ```

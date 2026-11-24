@@ -17,7 +17,6 @@ import numpy as np
 
 from wrist_camera.rtsp import (
     RtspReader,
-    default_cameras_config_path,
     ffmpeg_command,
     probe_size,
     resolve_camera_selection,
@@ -403,7 +402,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument('--port', type=int, default=8010)
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--jpeg-quality', type=int, default=75)
-    parser.add_argument('--config-file', default=str(default_cameras_config_path()))
+    parser.add_argument('--config-file', default='')
     args = parser.parse_args(argv)
 
     server = PreviewServer(

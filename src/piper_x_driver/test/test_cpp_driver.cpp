@@ -155,20 +155,16 @@ TEST(PiperXDriverCppTest, FleetConfigAndDynamicsLoadCleanly) {
   EXPECT_EQ(fleet.arms[0].can_port, "can0");
   EXPECT_EQ(fleet.arms[3].can_port, "can3");
 
+  // Example calibration files do not exist, so the arms load uncalibrated.
   const auto & a3 = fleet.arm("arm_3");
+  EXPECT_EQ(fleet.friction_model("arm_3"), nullptr);
   const auto * gm = fleet.gravity_model("arm_3");
-  const auto * fm = fleet.friction_model("arm_3");
   ASSERT_NE(gm, nullptr);
-  ASSERT_NE(fm, nullptr);
 
   const Vec6 q{{0.1, 0.5, -0.8, 0.2, -0.3, 0.1}};
   const Vec6 g = gm->torques(q, fleet.effectors.at(a3.end_effector).mass_kg,
                              fleet.effectors.at(a3.end_effector).com_m);
   for (double val : g) {
-    EXPECT_TRUE(std::isfinite(val));
-  }
-  const Vec6 f = fm->torques(q, {{0.02, -0.01, 0.03, 0.0, 0.01, -0.02}});
-  for (double val : f) {
     EXPECT_TRUE(std::isfinite(val));
   }
 }
@@ -544,30 +540,19 @@ TEST(PiperXDriverCppTest, EffectorCalibrationSafetyGatesAndConfigureProtocol) {
   if (!rclcpp::ok()) {
     rclcpp::init(0, nullptr);
   }
-  const auto tmp_yaml = std::filesystem::temp_directory_path() / "piper_cpp_test_arms.yaml";
-  const FleetConfig source_fleet(default_config_path());
-  YAML::Node data = YAML::LoadFile(source_fleet.path);
-  for (size_t i = 0; i < source_fleet.arms.size(); ++i) {
-    data["arms"][i]["friction_config"] = std::filesystem::relative(
-      source_fleet.arms[i].friction_config, tmp_yaml.parent_path()).string();
-    data["arms"][i]["gravity_config"] = std::filesystem::relative(
-      source_fleet.arms[i].gravity_config, tmp_yaml.parent_path()).string();
-  }
-  {
-    std::ofstream stream(tmp_yaml);
-    stream << data;
-  }
-  const FleetConfig copied_fleet(tmp_yaml.string());
+  const auto tmp_dir = std::filesystem::temp_directory_path() / "piper_cpp_test_arms";
+  const auto arm_file = tmp_dir / "arm_2.yaml";
+  std::filesystem::remove_all(tmp_dir);
+  std::filesystem::create_directories(tmp_dir);
+  std::filesystem::copy_file(std::filesystem::path(default_config_path()) / "arm_2.yaml", arm_file);
+  const YAML::Node original = YAML::LoadFile(arm_file.string());
+  const FleetConfig copied_fleet(tmp_dir.string());
   const auto & copied_arm = copied_fleet.arm("arm_2");
-  EXPECT_EQ(copied_arm.friction_config, source_fleet.arm("arm_2").friction_config);
-  EXPECT_EQ(copied_arm.gravity_config, source_fleet.arm("arm_2").gravity_config);
-  copied_fleet.save_arm(copied_arm, copied_arm.end_effector, copied_arm.gravity_scale);
-  const YAML::Node saved = YAML::LoadFile(tmp_yaml.string());
-  for (size_t i = 0; i < source_fleet.arms.size(); ++i) {
-    for (const auto * field : {"friction_config", "gravity_config"}) {
-      EXPECT_EQ(saved["arms"][i][field].as<std::string>(),
-                data["arms"][i][field].as<std::string>());
-    }
+  copied_fleet.save_arm(copied_arm, copied_arm.end_effector, 0.5);
+  const YAML::Node saved = YAML::LoadFile(arm_file.string());
+  EXPECT_DOUBLE_EQ(saved["gravity_scale"].as<double>(), 0.5);
+  for (const auto * field : {"friction_config", "gravity_config"}) {
+    EXPECT_EQ(saved[field].as<std::string>(), original[field].as<std::string>());
   }
 
   auto mock = std::make_unique<MockArm>("can1");
@@ -575,7 +560,7 @@ TEST(PiperXDriverCppTest, EffectorCalibrationSafetyGatesAndConfigureProtocol) {
 
   rclcpp::NodeOptions opts;
   opts.arguments({"--ros-args", "-r", "__ns:=/arm_2"});
-  opts.append_parameter_override("config_file", tmp_yaml.string());
+  opts.append_parameter_override("config_file", tmp_dir.string());
   auto driver = std::make_shared<DriverNode>(opts, std::move(mock), true);
   auto client_node = std::make_shared<rclcpp::Node>("cpp_calib_client");
 
@@ -646,8 +631,7 @@ TEST(PiperXDriverCppTest, EffectorCalibrationSafetyGatesAndConfigureProtocol) {
   exec.remove_node(driver);
   exec.remove_node(client_node);
   driver->shutdown_driver();
-  std::filesystem::remove(tmp_yaml);
-  std::filesystem::remove(tmp_yaml.string() + ".lock");
+  std::filesystem::remove_all(tmp_dir);
 }
 
 }  // namespace

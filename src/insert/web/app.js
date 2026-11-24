@@ -49,7 +49,7 @@
     const policy = data.policy || {};
     const goal = data.goal;
 
-    $('can-badge').textContent = (arm.can_label || 'can4').toUpperCase() + ' · ' + (arm.namespace || '/arm_4') + ' (' + (arm.can_port || 'can3') + ')';
+    $('can-badge').textContent = (arm.can_port || '').toUpperCase() + ' · ' + (arm.namespace || '');
     $('conn-pill').dataset.state = arm.online ? 'online' : 'offline';
     $('conn-pill').textContent = arm.online ? 'ROS 在线' : '等待遥测';
 

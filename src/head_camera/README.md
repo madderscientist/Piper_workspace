@@ -2,19 +2,13 @@
 
 **Azure Kinect DK 头部相机** 工具包：通过每台相机出厂烧录的 **12 位唯一硬件序列号（USB Serial Number，作用等同于网卡 MAC 地址）** 固定绑定多台相机，默认以 **V4L2 纯 RGB 硬件直通 MJPG** 模式单进程同时管理一台或多台头部相机，提供低延迟 HTTP 单帧抓拍、实时 MJPEG 视频流与按序列号隔离的 **ChArUco 内参标定**。
 
-## 1. 硬件序列号绑定与当前双相机配置
+## 1. 硬件序列号绑定与配置
 
-`/dev/video0`、`/dev/video2` 的编号会随插拔顺序变化，但相机 USB 描述符中的 **12 位硬件序列号（`serial`）** 固定跟定物理相机。[config/head_camera.yaml](config/head_camera.yaml) 已绑定当前接入的两台头部相机：
-
-| 相机别名 | 12 位硬件序列号（`serial`） | 说明 |
-|---|---|---|
-| `head_1` | `000314605112` | 通过序列号自动匹配对应 `/dev/videoN` 与独立内参 |
-| `head_2` | `000456614112` | 通过序列号自动匹配对应 `/dev/videoN` 与独立内参 |
+`/dev/video0`、`/dev/video2` 的编号会随插拔顺序变化，但相机 USB 描述符中的 **12 位硬件序列号（`serial`）** 固定跟定物理相机。本机相机列表放在 `$PIPER_CONFIG_DIR/head_camera/<相机名>.yaml`（每台相机一个文件，不进 git，模板见根目录 `config/examples/head_camera/`），包含 `serial` 与 `calibration` 路径；包内 [config/head_camera.yaml](config/head_camera.yaml) 只保留默认运行参数与 ChArUco 标定板尺寸。
 
 ## 2. 查询设备、启动全部或只启动指定/新接入相机
 
 ```bash
-cd /home/a/piper_x_ws
 source ./setup_env.bash
 
 # 1. 列出所有已连接相机（已绑定相机显示 [head_1]/[head_2]，新插入未绑定相机显示 [new] 及 12 位 serial）
@@ -83,9 +77,9 @@ curl -fsS 'http://127.0.0.1:8310/frame/color.jpg?camera=head_2&fresh=1' -o head2
 ffplay -fflags nobuffer -flags low_delay 'http://127.0.0.1:8310/stream/color.mjpg?camera=head_1'
 ```
 
-## 4. ChArUco 内参标定（按序列号独立保存）
+## 4. ChArUco 内参标定（按相机独立保存）
 
-默认标定板规格为 `12 × 9` 格、方格 `15 mm`（`0.015 m`）、Marker `11.25 mm`（`0.01125 m`）、`DICT_5X5_100`。标定结果按相机 12 位硬件序列号与分辨率写入 [config/intrinsic.yaml](config/intrinsic.yaml) 的 `cameras.<serial>.profiles.<WxH>` 下，互不覆盖：
+默认标定板规格来自包内 [config/head_camera.yaml](config/head_camera.yaml)（`12 × 9` 格、方格 `15 mm`、Marker `11.25 mm`、`DICT_5X5_100`）。每台相机的标定结果写入其 `calibration` 指向的文件（默认 `$PIPER_CONFIG_DIR/calibration/<相机名>.yaml`，不进 git），缺失或无效视为未标定：
 
 1. **网页交互标定**：浏览器打开 `http://127.0.0.1:8310/` 切到 **「内参标定」**，在下拉框选择 `head_1` 或 `head_2`，手持标定板采集多角度视图后点击 **「求解并保存内参」**。
 2. **离线目录标定**：
@@ -96,7 +90,7 @@ ffplay -fflags nobuffer -flags low_delay 'http://127.0.0.1:8310/stream/color.mjp
 ## 5. 构建与测试
 
 ```bash
-cd /home/a/piper_x_ws
+cd <工作空间根目录>
 source ./setup_env.bash
 .venv/bin/python /usr/bin/colcon build --symlink-install --packages-select head_camera
 .venv/bin/python /usr/bin/colcon test --packages-select head_camera --event-handlers console_direct+

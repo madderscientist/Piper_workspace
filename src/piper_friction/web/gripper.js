@@ -36,6 +36,13 @@
     return state.arms.find((a) => a.id === state.selectedArmId) || state.arms[0];
   }
 
+  function applyArmPaths(arm) {
+    const yamlPath = arm.friction_config || '';
+    $('input-output-csv').value = yamlPath && `${yamlPath.slice(0, yamlPath.lastIndexOf('/') + 1)}${arm.id}_sweep_j7.csv`;
+    $('input-fit-output').value = yamlPath;
+    $('input-save-yaml-path').value = yamlPath;
+  }
+
   function showNotice(msg, kind = 'warn') {
     const bar = $('notice-bar');
     if (!msg) {
@@ -324,9 +331,7 @@
       `;
       btn.addEventListener('click', () => {
         state.selectedArmId = arm.id;
-        $('input-output-csv').value = `/home/a/piper_x_ws/src/piper_friction/config/${arm.id}_sweep_j7.csv`;
-        $('input-fit-output').value = `/home/a/piper_x_ws/src/piper_friction/config/${arm.id}_friction.yaml`;
-        $('input-save-yaml-path').value = `/home/a/piper_x_ws/src/piper_friction/config/${arm.id}_friction.yaml`;
+        applyArmPaths(arm);
         renderAll();
       });
       container.appendChild(btn);
@@ -729,6 +734,8 @@
       $('conn-text').textContent = 'ROS 2 工作台在线';
       if (Array.isArray(data.arms) && data.arms.length > 0) {
         state.arms = data.arms;
+        if (!state.arms.some((a) => a.id === state.selectedArmId)) state.selectedArmId = state.arms[0].id;
+        if (!$('input-fit-output').value) applyArmPaths(selectedArm());
         for (const a of data.arms) {
           if (a.gripper_model && !state.gripperFits[a.id]) {
             state.gripperFits[a.id] = buildFitFromLoadedModel(a.id, a.gripper_model);

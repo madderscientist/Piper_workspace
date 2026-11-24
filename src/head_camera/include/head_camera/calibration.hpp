@@ -61,7 +61,8 @@ struct IntrinsicProfile
   BoardConfig board;
 };
 
-fs::path default_intrinsic_path();
+fs::path default_intrinsic_path(const std::string & camera_name = "");
+fs::path resolve_intrinsic_path(const Options & options);
 std::string normalize_dictionary_name(const std::string & name, int needed_markers = 0);
 cv::Ptr<cv::aruco::CharucoBoard> make_charuco_board(
   const BoardConfig & config, cv::Ptr<cv::aruco::Dictionary> * out_dict = nullptr);

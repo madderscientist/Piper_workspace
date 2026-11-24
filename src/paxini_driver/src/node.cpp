@@ -89,24 +89,7 @@ PaxiniDriverNode::PaxiniDriverNode(
   filter_("none", 5, 0.2),
   worker_enabled_(start_worker)
 {
-  arm_id_ = trim(declare_parameter<std::string>("arm_id", ""));
-  const std::string cfg_param = trim(declare_parameter<std::string>("config_file", ""));
-  if (!cfg_param.empty()) {
-    config_file_ = std::filesystem::path(cfg_param);
-  }
-  if (arm_id_.empty()) {
-    // 未显式指定 arm_id 时，支持从 /arm_3 或 /arm_4 命名空间自动推断
-    std::string ns = get_namespace();
-    while (!ns.empty() && ns.front() == '/') {
-      ns.erase(ns.begin());
-    }
-    while (!ns.empty() && ns.back() == '/') {
-      ns.pop_back();
-    }
-    if (ns == "arm_3" || ns == "arm_4") {
-      arm_id_ = ns;
-    }
-  }
+  calibration_file_ = trim(declare_parameter<std::string>("calibration_file", ""));
 
   interface_ = trim_lower(declare_parameter<std::string>("interface", "usb"));
   const std::string serial_port = declare_parameter<std::string>("serial_port", "/dev/ttyUSB0");
@@ -148,22 +131,21 @@ PaxiniDriverNode::PaxiniDriverNode(
     std::copy(com_vec.begin(), com_vec.end(), tool_com_m_.begin());
   }
 
-  if (!arm_id_.empty()) {
-    try {
-      // 若启动参数未覆盖标定值，则从 px6d.yaml 读取对应臂的零偏、工具质量/质心及拟合质量摘要
-      const auto cfg = resolve_sensor_calibration(arm_id_, config_file_);
-      calibration_quality_json_ = cfg.calibration_quality_json;
-      if (all_zero_6(tare_offset_) && cfg.has_tare_offset) {
-        tare_offset_ = cfg.tare_offset;
-      }
-      if (tool_mass_kg_ == 0.0 && cfg.has_tool_mass) {
-        tool_mass_kg_ = cfg.tool_mass_kg;
-      }
-      if (all_zero_3(tool_com_m_) && cfg.has_tool_com) {
-        tool_com_m_ = cfg.tool_com_m;
-      }
-    } catch (const std::exception &) {
+  try {
+    // 若启动参数未覆盖标定值，则从标定文件读取零偏、工具质量/质心及拟合质量摘要
+    const auto cfg = load_sensor_calibration(calibration_file_);
+    calibration_quality_json_ = cfg.calibration_quality_json;
+    if (all_zero_6(tare_offset_) && cfg.has_tare_offset) {
+      tare_offset_ = cfg.tare_offset;
     }
+    if (tool_mass_kg_ == 0.0 && cfg.has_tool_mass) {
+      tool_mass_kg_ = cfg.tool_mass_kg;
+    }
+    if (all_zero_3(tool_com_m_) && cfg.has_tool_com) {
+      tool_com_m_ = cfg.tool_com_m;
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(get_logger(), "Sensor not calibrated (%s)", e.what());
   }
 
   if (acq == "default") {
@@ -763,7 +745,7 @@ std::pair<bool, std::string> PaxiniDriverNode::calibrate_hardware() {
 std::pair<bool, std::string> PaxiniDriverNode::reload_config() {
   try {
     // 热重载仅原子替换内存中的零偏与工具重力参数并清空滤波器历史，不向硬件发送任何指令，也不重放旧样本
-    const auto entry = resolve_sensor_calibration(arm_id_, config_file_);
+    const auto entry = load_sensor_calibration(calibration_file_);
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       tare_offset_ = entry.tare_offset;
@@ -773,7 +755,7 @@ std::pair<bool, std::string> PaxiniDriverNode::reload_config() {
       filter_.reset();
       latest_wrench_.reset();
     }
-    return {true, arm_id_ + " 已重载标定参数"};
+    return {true, "已重载标定参数"};
   } catch (const std::exception & exc) {
     return {false, exc.what()};
   }

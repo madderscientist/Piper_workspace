@@ -1,12 +1,14 @@
 # InsertAnything 插入策略部署与控制台 (`insert`)
 
-基于 [`actor.onnx`](actor.onnx) 的六自由度力控插孔策略 ROS 2 部署包与 Web 控制台（默认绑定 `can4` / `arm_4` / `/arm_4`）。
+基于 [`actor.onnx`](actor.onnx) 的六自由度力控插孔策略 ROS 2 部署包与 Web 控制台。
+
+目标臂由 `--arm`（或 launch 参数 `arm_id`，可填 id、CAN 口或命名空间）指定；未指定时选本机 `config/arms/` 中第一只 `end_effector: gripper_with_wrench` 的臂。
 
 ## 1. 启动方式
 
 ```bash
 # 终端 1：启动驱动
-ros2 launch piper_x_driver four_arms.launch.py
+ros2 launch piper_x_driver all_arms.launch.py
 
 # 终端 2：启动 InsertAnything 控制台（默认监听 http://127.0.0.1:8092/）
 ros2 run insert web --port 8092
@@ -41,30 +43,29 @@ ros2 launch insert insert.launch.py port:=8092
 # 确保双外部相机服务与本地 copilot-api (127.0.0.1:4141) 已运行
 ros2 run head_camera head_camera serve
 
-# 启动全流程网页（默认绑定 arm_4，调用 gpt-6.1-sol · max）
+# 启动全流程网页（调用 gpt-6.1-sol · max）
 ros2 run insert agent_web --port 8093
 # 或使用 launch：
 ros2 launch insert agent.launch.py port:=8093
 ```
 
-1. **准备与 Float**：机械臂默认保持零力拖动（Float），右侧实时显示 `head_1`、`head_2`、`camera_arm_4` 三视角画面与系统状态。
-2. **板块 1 · 相机位置标定**：空夹爪拖动机械臂使腕部相机与双外部相机同看 `12×9` ChArUco 标定板，一键解算并持久化 `T_base_head_1`、`T_base_head_2`。
+1. **准备与 Float**：机械臂默认保持零力拖动（Float），右侧实时显示 `head_1`、`head_2` 与目标臂腕部相机三视角画面与系统状态。
+2. **板块 1 · 相机位置标定**：空夹爪拖动机械臂使腕部相机与双外部相机同看 `12×9` ChArUco 标定板，一键解算并持久化 `T_base_head_1`、`T_base_head_2` 到 `config/extrinsics.yaml`（本机数据，不进 git）。外部相机内参从 head_camera 服务的 `/api/intrinsic` 获取。
 3. **板块 2 · 双图 Agent 识别**：前端提供两段式可编辑 Prompt，单次调用 `gpt-6.1-sol (max)` 同时识别两张外部相机图，输出 `arm_4` 坐标系下孔口位置、插入朝向、对齐增量并绘制三维重投影标记图。
 4. **板块 3 · 初步移动**：平滑控制插头姿态对齐孔轴，并将插头末端移至孔口正前方 `0.5 cm` 处悬停锁位。
 5. **板块 4 · 执行插入**：与原 `insert` 一致选择 `Rule-based` 或 `Policy-based` 完成 50 Hz 闭环力控插入。
 
 ## 4. 带腕部六维力传感器的整臂 MuJoCo 仿真 (`insert.sim_mujoco`)
 
-基于 `piper_description_with_wrench.urdf`（含臂侧法兰、PX6D-75A 传感器、夹爪侧法兰、双指夹爪与夹持插头碰撞体）搭建的 1 kHz 物理仿真环境，在 `mjlab` 环境（Python 3.11 + MuJoCo 3.6）下运行：
+基于 `piper_description_with_wrench.urdf`（含臂侧法兰、PX6D-75A 传感器、夹爪侧法兰、双指夹爪与夹持插头碰撞体）搭建的 1 kHz 物理仿真环境。`mujoco` 已列入根目录 `requirements.txt`，直接在工作空间 `.venv` 中运行；`--viser` 另需 `viser`、`trimesh`，`--snapshot` 另需 `Pillow`：
 
 ```bash
 # 运行多组执行对照实验（关节 MIT PD vs 200 Hz 尖端笛卡尔阻抗、单点清零 vs 姿态解析重力补偿、规则策略）
-PYTHONPATH=src/piper_x_driver:src/insert ~/micromamba/envs/mjlab/bin/python -m insert.sim_mujoco --compare
+ros2 run insert sim --compare
 
 # 启动交互式 Viser 3D 网页可视化（默认 http://127.0.0.1:8095）
-PYTHONPATH=src/piper_x_driver:src/insert ~/micromamba/envs/mjlab/bin/python -m insert.sim_mujoco --viser --impedance cartesian_tip
+ros2 run insert sim --viser --impedance cartesian_tip
 
 # 单回合运行并保存渲染快照
-PYTHONPATH=src/piper_x_driver:src/insert ~/micromamba/envs/mjlab/bin/python -m insert.sim_mujoco \
-  --shape hexagon --impedance cartesian_tip --snapshot /tmp/piper_sim.png
+ros2 run insert sim --shape hexagon --impedance cartesian_tip --snapshot /tmp/piper_sim.png
 ```

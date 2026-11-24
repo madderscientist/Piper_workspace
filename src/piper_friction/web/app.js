@@ -56,6 +56,13 @@
     return state.arms.find((a) => a.id === state.selectedArmId) || state.arms[0];
   }
 
+  function applyArmPaths(arm) {
+    const yamlPath = arm.friction_config || '';
+    $('input-output-csv').value = yamlPath && `${yamlPath.slice(0, yamlPath.lastIndexOf('/') + 1)}${arm.id}_sweep.csv`;
+    $('input-fit-output').value = yamlPath;
+    $('input-save-yaml-path').value = yamlPath;
+  }
+
   function showNotice(msg, kind = 'warn') {
     const bar = $('notice-bar');
     if (!msg) {
@@ -232,13 +239,7 @@
         if (state.sweepsByNs && state.sweepsByNs[arm.namespace]) {
           state.sweep = state.sweepsByNs[arm.namespace];
         }
-        const defaultCsv = `/home/a/piper_x_ws/src/piper_friction/config/${arm.id}_sweep.csv`;
-        const defaultYaml = `/home/a/piper_x_ws/src/piper_friction/config/${arm.id}_friction.yaml`;
-        $('input-output-csv').value = defaultCsv;
-        $('input-fit-output').value = defaultYaml;
-        if ($('input-save-yaml-path')) {
-          $('input-save-yaml-path').value = defaultYaml;
-        }
+        applyArmPaths(arm);
         setDriverFrictionScale(arm.namespace, 0.0, true);
         renderAll();
       });
@@ -903,6 +904,8 @@
       $('conn-text').textContent = 'ROS 2 标定服务在线';
       if (Array.isArray(data.arms) && data.arms.length > 0) {
         state.arms = data.arms;
+        if (!state.arms.some((a) => a.id === state.selectedArmId)) state.selectedArmId = state.arms[0].id;
+        if (!$('input-fit-output').value) applyArmPaths(selectedArm());
       }
       if (data.sweeps_by_ns) {
         state.sweepsByNs = data.sweeps_by_ns;

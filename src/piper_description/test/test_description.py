@@ -299,16 +299,11 @@ def test_real_ros_follow_launch_converts_feedback_to_finger_tf():
     (1, 'teach_base'), (2, 'teach_base'), (3, 'gripper_base'), (4, 'gripper_base'),
 ])
 def test_follow_chooses_configured_end_effector_model(index, terminal, tmp_path):
-    cfg_file = tmp_path / 'arms.yaml'
-    cfg_file.write_text(yaml.safe_dump({
-        'version': 1,
-        'arms': [
-            {'id': 'arm_1', 'namespace': '/arm_1', 'end_effector': 'teaching_handle'},
-            {'id': 'arm_2', 'namespace': '/arm_2', 'end_effector': 'teaching_handle'},
-            {'id': 'arm_3', 'namespace': '/arm_3', 'end_effector': 'gripper_with_wrench'},
-            {'id': 'arm_4', 'namespace': '/arm_4', 'end_effector': 'gripper_with_wrench'},
-        ],
-    }), encoding='utf-8')
+    cfg_file = tmp_path
+    for i, effector in enumerate(
+            ('teaching_handle', 'teaching_handle', 'gripper_with_wrench', 'gripper_with_wrench'), 1):
+        (tmp_path / f'arm_{i}.yaml').write_text(yaml.safe_dump(
+            {'id': f'arm_{i}', 'namespace': f'/arm_{i}', 'end_effector': effector}), encoding='utf-8')
     spec = importlib.util.spec_from_file_location(
         'follow_entry', SHARE / 'launch/follow.launch.py')
     assert spec is not None and spec.loader is not None

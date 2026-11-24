@@ -18,7 +18,7 @@
 |---|---|---|---|
 | **C++ 实时驱动层** | [`src/socketcan_arm.cpp`](src/socketcan_arm.cpp)<br/>[`src/can_protocol.cpp`](src/can_protocol.cpp) | `SocketCanArm`, `encode_mit_command` | **原生 Linux SocketCAN 硬件与协议层**。使用内核 `CAN_RAW_FILTER` 白名单、`recvmmsg` + `SO_TIMESTAMPNS` 纳秒级硬件时间戳接收解码、`sendmmsg` 单次系统调用批量下发 6 轴 MIT 帧，管理固件校验（`0x4AF`）、使能、200 Hz 夹爪插值与零点标定（`0x476`）。 |
 | **C++ 实时控制层** | [`src/controller.cpp`](src/controller.cpp)<br/>[`src/node.cpp`](src/node.cpp)<br/>[`src/main.cpp`](src/main.cpp) | `Controller`, `DriverNode` | **4 独立原生 `rclcpp` 驱动进程**。每臂独立进程隔离故障，以 200 Hz 执行看门狗、误差自适应刚度 $s_a$、重力两级守恒分配、关节/夹爪摩擦补偿与末端六维力估计，对外暴露 ROS 2 话题与服务。 |
-| **C++ 共享核心库** | [`include/piper_x_driver/*.hpp`](include/piper_x_driver)<br/>[`src/gravity.cpp`](src/gravity.cpp)<br/>[`src/friction.cpp`](src/friction.cpp)<br/>[`src/configuration.cpp`](src/configuration.cpp) | `piper_x_driver_core` | **零 ROS 节点耦合的 C++17 静态核心库**。单向依赖更底层的 `piper_description` 包，启动时直接解析 `piper_description/urdf/piper_no_gripper_description.urdf` 获取 6 轴关节原点/RPY 与连杆质量、质心、3×3 惯性张量，统一提供正运动学、连杆姿态惯量、雅可比、外力螺旋、重力/摩擦模型与 `arms.yaml` 解析。 |
+| **C++ 共享核心库** | [`include/piper_x_driver/*.hpp`](include/piper_x_driver)<br/>[`src/gravity.cpp`](src/gravity.cpp)<br/>[`src/friction.cpp`](src/friction.cpp)<br/>[`src/configuration.cpp`](src/configuration.cpp) | `piper_x_driver_core` | **零 ROS 节点耦合的 C++17 静态核心库**。单向依赖更底层的 `piper_description` 包，启动时直接解析 `piper_description/urdf/piper_no_gripper_description.urdf` 获取 6 轴关节原点/RPY 与连杆质量、质心、3×3 惯性张量，统一提供正运动学、连杆姿态惯量、雅可比、外力螺旋、重力/摩擦模型与臂配置目录解析。 |
 | **Python 公共绑定层** | [`piper_x_driver/__init__.py`](piper_x_driver/__init__.py)<br/>[`src/pybind_module.cpp`](src/pybind_module.cpp) | `_core`, `gravity.py`, `friction.py`, `configuration.py`, `protocol.py` | **供上层 Python 包单向 `import` 的无状态库**。导入时不打开任何硬件或 ROS 上下文；计算密集函数自动路由至 `pybind11` 编译的 `_core` C++ 模块，保证全工作空间 C++ 与 Python 共享唯一一份公式真值。 |
 
 ### 0.2 外部 Python 包可以 `import` 哪些接口、怎么用？
@@ -70,7 +70,7 @@ tau_cad = gravity_torques(q, mass_kg=0.685, com_m=(0.0, 0.0, 0.05))
 kd_auto = max_critical_kd((17.0, 16.0, 15.0, 4.0, 3.0, 3.0), end_effector="gripper_with_wrench")
 
 # 加载标定重力模型（自动应用各关节 angle_offset、scale 与末端等效附加质量 added_mass_kg）
-g_model = load_gravity_model("src/piper_gravity/config/arm_3_gravity.yaml")
+g_model = load_gravity_model("config/calibration/arm_3_gravity.yaml")
 T_cal = g_model.forward_kinematics(q, tool_offset_m=(0.0, 0.0, 0.16))
 q_cal = g_model.inverse_kinematics(T_cal, q_seed=q, tool_offset_m=(0.0, 0.0, 0.16))
 J_cal = g_model.jacobian(q, frame="gripper")
@@ -94,9 +94,9 @@ from piper_x_driver import (
     feedback_problem,
 )
 
-fleet = FleetConfig(default_config_path())
+fleet = FleetConfig(default_config_path())    # $PIPER_CONFIG_DIR/arms，每个 *.yaml 一个臂
 arm4 = fleet.arm("arm_4")                      # 读取 can_port / namespace / kp / kd / s_a 等
-f_model = fleet.friction_model(arm4)           # 读取已配置的 ArmFrictionModel
+f_model = fleet.friction_model(arm4)           # 读取已配置的 ArmFrictionModel（未标定时为 None）
 tau_f = f_model.torques(q, (0.05,) * 6)        # 计算 6 轴摩擦力矩 (Nm)
 ```
 
@@ -106,15 +106,15 @@ tau_f = f_model.torques(q, (0.05,) * 6)        # 计算 6 轴摩擦力矩 (Nm)
 
 ## 1. 启动与配置
 
-[config/arms.yaml](config/arms.yaml) 定义四臂的 CAN 端口、命名空间、末端选择、补偿系数、标定文件路径和默认 `debug_kp / debug_kd`。三种末端 `teaching_handle / gripper / gripper_with_wrench` 的模型、质量属性、来源及自动阻尼所需的最大关节惯量统一保存在 [config/effectors.yaml](config/effectors.yaml)，通过同一加载和合成逻辑得到总质量、质心与惯性张量。旧末端保留原 CAD 聚合参数，带传感器的末端保留各部件的均匀密度 mesh 参数；运行时保存机械臂配置不会把这些参数复制回 `arms.yaml`。旧版内嵌末端参数的配置仍可读取。
+臂配置目录默认为 `$PIPER_CONFIG_DIR/arms`（即工作空间 `config/arms/`，launch 参数 `config_file:=<目录>` 可覆盖）。目录中每个 `*.yaml` 定义一个臂的 CAN 端口、命名空间、末端选择、补偿系数、标定文件路径和默认 `kp / kd`，示范见 [config/examples/arms](../../config/examples/arms)。三种末端 `teaching_handle / gripper / gripper_with_wrench` 的模型、质量属性、来源及自动阻尼所需的最大关节惯量统一保存在 [config/effectors.yaml](config/effectors.yaml)，通过同一加载和合成逻辑得到总质量、质心与惯性张量。旧末端保留原 CAD 聚合参数，带传感器的末端保留各部件的均匀密度 mesh 参数。运行时保存机械臂配置只改写该臂自己的文件。
 
 arm3、arm4 默认使用 `gripper_with_wrench`，加载 `piper_description_with_wrench.urdf`，名义总质量为 0.685505 kg。各部件参数已变换到驱动原 `link6` 坐标系。重力标定文件中的 `added_mass_kg` 只增加夹爪底座的质量，用于等效表示未建模的相机等附件；驱动同时更新重力、惯量和自动阻尼计算，配置遥测中的 `gravity_payload` 提供应用后的总质量、质心和惯性张量。
 
 ```bash
 # 启动四臂驱动（启动后自动退出可能残留的原生 Leader 模式、使能六关节并进入 MIT 补偿模式）
-ros2 launch piper_x_driver four_arms.launch.py
+ros2 launch piper_x_driver all_arms.launch.py
 # 可选：自定义驱动频率（默认 200.0 Hz）
-ros2 launch piper_x_driver four_arms.launch.py rate_hz:=200.0
+ros2 launch piper_x_driver all_arms.launch.py rate_hz:=200.0
 
 # 一键将四臂彻底断电失能
 ros2 launch piper_x_driver power_off.launch.py
@@ -175,7 +175,7 @@ $$
 
 ### 3.1 静态重力矩与标定模型计算 ([gravity.py](piper_x_driver/gravity.py))
 
-在每个控制周期，驱动根据当前六轴实测位置 $q_{1..6}$ 与当前配置的末端质量/质心（示教手柄、标准夹爪或带 PX6D-75A 的夹爪）计算静态重力支撑力矩。若在 [config/arms.yaml](config/arms.yaml) 中配置了 `gravity_config`（如 `src/piper_gravity/config/arm_1_gravity.yaml`），驱动通过 `ArmGravityModel.torques(q)` 应用各关节标定比例因子 $\text{scale}_i$ 与零位偏置 $\text{angle\_offset}_i$，并乘以平滑过渡的重力比例系数 $\alpha_g \in [0, 1]$（运行时修改 `gravity_scale` 按最大 $1.0\text{ s}^{-1}$ 斜率渐变）：
+在每个控制周期，驱动根据当前六轴实测位置 $q_{1..6}$ 与当前配置的末端质量/质心（示教手柄、标准夹爪或带 PX6D-75A 的夹爪）计算静态重力支撑力矩。若臂文件中配置的 `gravity_config`（如 `config/calibration/arm_1_gravity.yaml`）存在，驱动通过 `ArmGravityModel.torques(q)` 应用各关节标定比例因子 $\text{scale}_i$ 与零位偏置 $\text{angle\_offset}_i$，并乘以平滑过渡的重力比例系数 $\alpha_g \in [0, 1]$（运行时修改 `gravity_scale` 按最大 $1.0\text{ s}^{-1}$ 斜率渐变）：
 
 $$
 g_i(q) = \alpha_g \cdot \tau_{\text{grav}, i}^{\text{cal}}(q, \text{effector})
@@ -254,9 +254,9 @@ $$
 
 ### 4.1 计算公式与模型来源
 
-驱动在启动或配置更新时，根据 [config/arms.yaml](config/arms.yaml) 中各臂的 `friction_config` 字段加载对应的六轴摩擦参数文件（如 `src/piper_friction/config/arm_1_friction.yaml`；若置空则不启用摩擦补偿）。
+驱动在启动或配置更新时，根据臂文件中的 `friction_config` 字段加载对应的六轴摩擦参数文件（如 `config/calibration/arm_1_friction.yaml`；置空或文件不存在则不启用摩擦补偿，启动时打印未标定警告）。
 
-`friction_config` 和 `gravity_config` 支持绝对路径或相对于 `arms.yaml` 实际文件所在目录的路径（先解析安装目录中的软链接），不依赖启动命令的当前目录。仓库默认使用 `../../piper_friction/config/arm_1_friction.yaml` 和 `../../piper_gravity/config/arm_1_gravity.yaml` 这样的相对路径，配合 `colcon build --symlink-install` 可直接迁移工作空间。运行时向标定工具提供解析后的绝对路径，保存机械臂配置时保留 YAML 中原有的路径写法。
+`friction_config` 和 `gravity_config` 支持绝对路径或相对于臂文件实际所在目录的路径（先解析软链接），不依赖启动命令的当前目录。示范使用 `../calibration/arm_1_friction.yaml` 这样的相对路径。运行时向标定工具提供解析后的绝对路径，保存机械臂配置时保留 YAML 中原有的路径写法。
 
 每轮控制周期，驱动读取当前六轴实测关节角 $q_{1..6}$ 与实测角速度 $\dot{q}_{1..6}$，调用 `ArmFrictionModel.torques(q, dq)` 计算六轴摩擦力矩 $f_i(q_i, \dot{q}_i)$（含 Stribeck 干摩擦、粘滞阻尼、方向相关的周期性啮合摩擦调制 $\tau_{\text{mod}}$ 以及方向无关的齿槽转矩 $\tau_{\text{cog}}$）。
 
@@ -267,7 +267,7 @@ $$
 - **误差自适应刚度（Adaptive Stiffness）**：
   通过无量纲归一化幂律在小误差精细跟踪区提高刚度、大误差处平滑退回标称 $k_{p,i}$，阻尼按 $\sqrt{\cdot}$ 同步缩放以保持阻尼比恒定：
   $$k_{p, i}' = k_{p, i}\left(1 + \frac{s_a}{(|e_i| / b)^p + 1}\right), \qquad k_{d, i}' = k_{d, i}\sqrt{\frac{k_{p, i}'}{k_{p, i}}}$$
-  每次周期均从指令标称增益起算（不复乘发散），且重力折合 $\Delta p_i = g_i / k_{p, i}'$ 与末端力估计均使用实际下发的 $k_{p, i}'$。可通过 `arms.yaml` 或 `ros2 param set` 运行时在线调节 `adaptive_stiffness_scale`（$s_a$，默认 `0.0`）、`adaptive_stiffness_b`（默认 `0.08 rad`）、`adaptive_stiffness_power`（默认 `3.0`）以及 `friction_error_epsilon`（默认 `0.05 rad`）、`friction_velocity_epsilon`（默认 `0.02 rad/s`）。
+  每次周期均从指令标称增益起算（不复乘发散），且重力折合 $\Delta p_i = g_i / k_{p, i}'$ 与末端力估计均使用实际下发的 $k_{p, i}'$。可通过臂文件或 `ros2 param set` 运行时在线调节 `adaptive_stiffness_scale`（$s_a$，默认 `0.0`）、`adaptive_stiffness_b`（默认 `0.08 rad`）、`adaptive_stiffness_power`（默认 `3.0`）以及 `friction_error_epsilon`（默认 `0.05 rad`）、`friction_velocity_epsilon`（默认 `0.02 rad/s`）。
 - **完整数学公式、物理推导与标定流程**：详见 [`piper_friction` README](../piper_friction/README.md#12-总摩擦力矩公式全景拆解)。
 
 ### 4.2 作用通道（直接叠加至 `t_ff`）

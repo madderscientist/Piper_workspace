@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
@@ -51,14 +52,15 @@ std::string default_config_path();
 std::string json_escape(const std::string & s);
 std::string json_number(double v);
 
+// Arm directory: every *.yaml in it configures one arm present on this machine.
 class FleetConfig {
 public:
   explicit FleetConfig(const std::string & path);
 
   std::string path;
-  bool has_inline_effectors{false};
   std::map<std::string, Effector> effectors;
   std::vector<ArmConfig> arms;
+  std::map<std::string, std::string> files;
   std::map<std::string, std::optional<ArmFrictionModel>> friction_models;
   std::map<std::string, std::optional<ArmGravityModel>> gravity_models;
 
@@ -72,6 +74,12 @@ public:
     const std::string & end_effector,
     double gravity_scale,
     std::optional<double> friction_scale = std::nullopt) const;
+
+private:
+  ArmConfig load_arm(
+    const std::filesystem::path & file,
+    std::optional<ArmFrictionModel> & f_model,
+    std::optional<ArmGravityModel> & g_model) const;
 };
 
 }  // namespace piper_x_driver

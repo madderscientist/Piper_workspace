@@ -4,7 +4,7 @@ import math
 import pytest
 
 from piper_teaching.bilateral import (
-    ArmSample, BilateralCoupling, TeachingConfig, TeachingFault, references,
+    ArmSample, BilateralCoupling, peers_for_mode, TeachingConfig, TeachingFault, references,
 )
 from piper_x_driver.protocol import FEEDBACK_FIELDS
 
@@ -28,6 +28,8 @@ def test_negative_kd_sentinel_forwarded_for_driver_auto_damping():
 
 
 def test_home_engage_then_pair_coupling():
+    assert peers_for_mode('bilateral', 2) == (1, 0)
+    assert peers_for_mode('master_slave', 2) == (0, 0)
     state = samples()
     state = state[:2] + tuple(replace(sample, position=(
         sample.position[0] + 0.5, *sample.position[1:6], 0.06)) for sample in state[2:])

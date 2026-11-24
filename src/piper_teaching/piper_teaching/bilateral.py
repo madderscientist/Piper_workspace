@@ -7,22 +7,21 @@ from piper_x_driver.protocol import feedback_problem
 
 
 JOINT_NAMES = tuple(f'joint{i}' for i in range(1, 7)) + ('gripper',)
-_PEERS = {
-    'bilateral': (2, 3, 0, 1),
-    'master_slave': (0, 1, 0, 1),
-}
-TEACHING_MODES = tuple(_PEERS)
-MASTER_INDICES = (0, 1)
+TEACHING_MODES = ('bilateral', 'master_slave')
 
 
 class TeachingFault(RuntimeError):
     """A failed interlock that must stop coupling, never silently resume it."""
 
 
-def peers_for_mode(mode: str) -> tuple[int, ...]:
-    if mode not in _PEERS:
+def peers_for_mode(mode: str, count: int) -> tuple[int, ...]:
+    """Arms are ordered [masters..., slaves...]; arm i pairs with arm i ± count/2."""
+    if mode not in TEACHING_MODES:
         raise ValueError(f'mode must be one of {TEACHING_MODES}')
-    return _PEERS[mode]
+    half = count // 2
+    if mode == 'master_slave':
+        return tuple(i % half for i in range(count))
+    return tuple(i + half if i < half else i - half for i in range(count))
 
 
 @dataclass(frozen=True)
@@ -65,24 +64,26 @@ class ArmSample:
     fault: str = ''
     mode: int = 0
     velocity: tuple[float, ...] = (0.0,) * 6
+    name: str = ''
 
 
 def measured_references(samples: tuple[ArmSample, ...], config: TeachingConfig,
                         now: float) -> tuple[tuple[float, ...], ...]:
     """Expose fresh measurements."""
-    if len(samples) != 4:
-        raise TeachingFault('Exactly four arm samples are required')
-    peers = peers_for_mode(config.mode)
+    if not samples or len(samples) % 2:
+        raise TeachingFault('Arm samples must form master/slave pairs')
+    peers = peers_for_mode(config.mode, len(samples))
     for index, sample in enumerate(samples, 1):
+        name = sample.name or f'arm_{index}'
         problem = feedback_problem(
             tuple(None if stamp is None else now - stamp for stamp in sample.received),
             config.feedback_timeout)
         if problem:
-            raise TeachingFault(f'arm_{index}: incomplete or expired CAN feedback: {problem}')
+            raise TeachingFault(f'{name}: incomplete or expired CAN feedback: {problem}')
         if sample.fault:
-            raise TeachingFault(f'arm_{index}: {sample.fault}')
+            raise TeachingFault(f'{name}: {sample.fault}')
         if len(sample.position) != 7:
-            raise TeachingFault(f'arm_{index}: invalid joint/gripper position')
+            raise TeachingFault(f'{name}: invalid joint/gripper position')
     return tuple(samples[peer].position for peer in peers)
 
 
@@ -92,7 +93,8 @@ def references(samples: tuple[ArmSample, ...], config: TeachingConfig,
     refs = measured_references(samples, config, now)
     for index, sample in enumerate(samples, 1):
         if require_enabled and (len(sample.enabled) != 7 or not all(sample.enabled[:6])):
-            raise TeachingFault(f'arm_{index}: all six motors must already be enabled')
+            raise TeachingFault(
+                f'{sample.name or f"arm_{index}"}: all six motors must already be enabled')
     return refs
 
 
@@ -104,7 +106,7 @@ class BilateralCoupling:
         self.active = False
         self.reason = 'Not started'
         self.targets: tuple[tuple[float, ...], ...] = ()
-        self.velocities: tuple[tuple[float, ...], ...] = ((0.0,) * 6,) * 4
+        self.velocities: tuple[tuple[float, ...], ...] = ()
         self._last_tick = 0.0
         self.engage_goals: tuple[tuple[float, ...], ...] = ()
         self.engaged = False
@@ -115,24 +117,25 @@ class BilateralCoupling:
             raise TeachingFault('Coupling is already started')
         self.check_start(samples, now)
         self.targets = tuple(sample.position for sample in samples)
+        half = len(samples) // 2
         pair_goals = (
-            (samples[0].position[:6], samples[1].position[:6])
+            tuple(samples[i].position[:6] for i in range(half))
             if self.config.mode == 'master_slave' else
             tuple(
                 tuple(
                     0.5 * (a + b)
-                    for a, b in zip(samples[i].position[:6], samples[i + 2].position[:6])
+                    for a, b in zip(samples[i].position[:6], samples[i + half].position[:6])
                 )
-                for i in MASTER_INDICES
+                for i in range(half)
             )
         )
         self.engage_goals = pair_goals * 2
-        self.velocities = ((0.0,) * 6,) * 4
+        self.velocities = ((0.0,) * 6,) * len(samples)
         self._last_tick = now
         self.engaged = False
         self.engage_error_deg = None
         self.active = True
-        self.reason = 'Waiting for all four MOVE_M mode acknowledgements'
+        self.reason = 'Waiting for all MOVE_M mode acknowledgements'
 
     def check_start(self, samples: tuple[ArmSample, ...], now: float,
                     require_enabled: bool = True) -> None:
@@ -167,7 +170,7 @@ class BilateralCoupling:
                         ) + (old[6],)
                         for old, goal in zip(self.targets, goals)
                     )
-                    self.velocities = ((0.0,) * 6,) * 4
+                    self.velocities = ((0.0,) * 6,) * len(samples)
                     self.engage_error_deg = math.degrees(max(
                         abs(q - goal_q)
                         for sample, goal in zip(samples, goals)
@@ -181,10 +184,10 @@ class BilateralCoupling:
                 else:
                     self.targets = refs
                     self.engage_error_deg = 0.0
-                    peers = peers_for_mode(self.config.mode)
+                    peers = peers_for_mode(self.config.mode, len(samples))
                     self.velocities = tuple(
                         (0.0,) * 6
-                        if self.config.mode == 'master_slave' and arm in MASTER_INDICES
+                        if self.config.mode == 'master_slave' and arm < len(samples) // 2
                         else tuple(
                             max(-45.0, min(45.0, float(v))) for v in samples[peer].velocity[:6]
                         )
@@ -193,7 +196,7 @@ class BilateralCoupling:
                 self.reason = 'Coupling active' if self.engaged else (
                     f'Engaging pair alignment; max joint error {self.engage_error_deg:.1f} deg')
             else:
-                self.velocities = ((0.0,) * 6,) * 4
+                self.velocities = ((0.0,) * 6,) * len(samples)
             self._last_tick = now
             return self.targets, self.config.kp
         except TeachingFault as exc:

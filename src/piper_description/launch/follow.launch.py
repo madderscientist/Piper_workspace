@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_path
@@ -19,10 +20,8 @@ _EFFECTOR_MODELS = {
 
 
 def _default_config_file() -> str:
-    try:
-        return str(get_package_share_path('piper_x_driver') / 'config/arms.yaml')
-    except Exception:
-        return ''
+    root = os.environ.get('PIPER_CONFIG_DIR')
+    return str(Path(root) / 'arms') if root else ''
 
 
 def _follow(context):
@@ -30,19 +29,18 @@ def _follow(context):
     namespace = LaunchConfiguration('namespace')
     model = LaunchConfiguration('model').perform(context)
     if not model:
-        cfg_path = LaunchConfiguration('config_file').perform(context)
-        if not cfg_path or not Path(cfg_path).is_file():
-            raise ValueError('Supply model:=... or a valid config_file:=...')
-        data = yaml.safe_load(Path(cfg_path).read_text(encoding='utf-8')) or {}
+        cfg_dir = LaunchConfiguration('config_file').perform(context)
+        if not cfg_dir or not Path(cfg_dir).is_dir():
+            raise ValueError('Supply model:=... or a valid arm directory config_file:=...')
         selected = '/' + namespace.perform(context).strip('/')
-        arm = next(
-            (a for a in (data.get('arms') or []) if a.get('namespace') == selected),
-            None,
+        arms = (
+            yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+            for path in sorted(Path(cfg_dir).glob('*.yaml'))
         )
+        arm = next((a for a in arms if a.get('namespace') == selected), None)
         if arm is None:
             raise ValueError('Namespace not in fleet configuration; supply an explicit model')
-        inline_eff = (data.get('effectors') or {}).get(arm['end_effector'], {})
-        model_name = inline_eff.get('model') or _EFFECTOR_MODELS.get(arm['end_effector'])
+        model_name = _EFFECTOR_MODELS.get(arm['end_effector'])
         if not model_name:
             raise ValueError(f"Unknown end_effector: {arm['end_effector']}")
         model = str(share / 'urdf' / model_name)

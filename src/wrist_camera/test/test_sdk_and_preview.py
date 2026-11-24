@@ -10,6 +10,7 @@ from urllib.request import urlopen
 
 import numpy as np
 import pytest
+import yaml
 
 from wrist_camera import (
     WristCamera,
@@ -58,20 +59,56 @@ def test_pure_python_import_without_rclpy_or_cv2_and_ppm_decode():
     assert 'scale=640:-2:flags=area' in run_mock.call_args.args[0]
 
 
-def test_intrinsics_extrinsics_pose_and_wrist_camera_reader():
-    intr_1080 = get_intrinsics('arm_4', stream='stream0')
-    intr_480 = load_camera_info('cam4', 720, 480)
+def test_intrinsics_extrinsics_pose_and_wrist_camera_reader(tmp_path, monkeypatch):
+    calib_file = tmp_path / 'camera_arm_4.yaml'
+    calib_file.write_text(yaml.safe_dump({
+        'version': 1,
+        'intrinsics': [
+            {
+                'width': 1920, 'height': 1080,
+                'camera_matrix': [2000.0, 0.0, 960.0, 0.0, 2000.0, 540.0, 0.0, 0.0, 1.0],
+                'distortion_model': 'plumb_bob',
+                'distortion_coefficients': [0.0] * 5,
+            },
+            {
+                'width': 720, 'height': 480,
+                'camera_matrix': [750.0, 0.0, 360.0, 0.0, 888.0, 240.0, 0.0, 0.0, 1.0],
+                'distortion_model': 'plumb_bob',
+                'distortion_coefficients': [0.0] * 5,
+            },
+        ],
+        'extrinsics': {
+            'arm': 'arm_4',
+            'parent': 'gripper_base_top',
+            'child': 'camera_arm_4',
+            'link6_to_top_z_m': 0.0928,
+            'translation': [0.02, -0.01, 0.05],
+            'rotation': [0.0, 0.0, 0.0, 1.0],
+        },
+        'profile_relations': [],
+    }), encoding='utf-8')
+    cam_dir = tmp_path / 'wrist_camera'
+    cam_dir.mkdir()
+    (cam_dir / 'camera_arm_4.yaml').write_text(yaml.safe_dump({
+        'arm': 'arm_4',
+        'ip': '192.168.123.98',
+        'calibration': '../camera_arm_4.yaml',
+        'aliases': ['cam4'],
+    }), encoding='utf-8')
+
+    intr_1080 = get_intrinsics('arm_4', stream='stream0', config_file=cam_dir)
+    intr_480 = load_camera_info('cam4', 720, 480, calib_file=calib_file)
     assert intr_1080 is not None and (intr_1080['width'], intr_1080['height']) == (1920, 1080)
     assert intr_480 is not None and (intr_480['width'], intr_480['height']) == (720, 480)
 
-    ext = get_extrinsic('arm_4')
+    ext = get_extrinsic('arm_4', config_file=cam_dir)
     assert ext is not None and ext['parent'] == 'gripper_base_top'
-    t_top_cam = extrinsic_matrix('arm_4')
+    t_top_cam = extrinsic_matrix('arm_4', config_file=cam_dir)
     assert t_top_cam.shape == (4, 4)
 
     q = (0.1, 0.6, -1.1, 0.2, -0.4, 0.3)
     zero_offsets = (0.0,) * 6
-    t_base_cam = camera_pose_in_base('arm_4', q, angle_offsets=zero_offsets)
+    t_base_cam = camera_pose_in_base('arm_4', q, angle_offsets=zero_offsets, config_file=cam_dir)
     expected = piper_fk(q, zero_offsets, tool_offset_z_m=ext['link6_to_top_z_m']) @ t_top_cam
     assert np.allclose(t_base_cam, expected, atol=1e-12)
 
@@ -88,7 +125,7 @@ def test_intrinsics_extrinsics_pose_and_wrist_camera_reader():
         def stop(self):
             self.stopped = True
 
-    with WristCamera('arm_4', stream='stream1', reader_cls=FakeReader) as cam:
+    with WristCamera('arm_4', stream='stream1', config_file=cam_dir, reader_cls=FakeReader) as cam:
         intr = cam.intrinsics()
         extr = cam.extrinsic()
         assert intr is not None and intr['width'] == 720
@@ -101,6 +138,11 @@ def test_intrinsics_extrinsics_pose_and_wrist_camera_reader():
             0.03, lambda: holders['on_frame'](bytes([9, 8, 7]) * (720 * 480), 720, 480),
         ).start()
         assert cam.grab(timeout=1.0)[0, 0].tolist() == [9, 8, 7]
+
+    # Outside workspace without PIPER_CONFIG_DIR: must require explicit config_file
+    monkeypatch.delenv('PIPER_CONFIG_DIR', raising=False)
+    with pytest.raises(RuntimeError):
+        resolve_arm_camera('arm_4')
 
 
 def test_preview_server_streams_on_demand_and_stops_when_idle():

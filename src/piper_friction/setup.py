@@ -10,7 +10,6 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/piper_friction']),
         ('share/piper_friction', ['package.xml']),
         (os.path.join('share', 'piper_friction', 'web'), glob('web/*')),
-        (os.path.join('share', 'piper_friction', 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     entry_points={

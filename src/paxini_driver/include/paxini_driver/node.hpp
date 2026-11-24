@@ -127,8 +127,7 @@ private:
   void on_command_msg(const std_msgs::msg::String & msg);
   void io_loop();
 
-  std::string arm_id_;
-  std::filesystem::path config_file_;
+  std::filesystem::path calibration_file_;
   std::string interface_;
   std::string expected_version_;
   int device_id_{DEFAULT_DEVICE_ID};

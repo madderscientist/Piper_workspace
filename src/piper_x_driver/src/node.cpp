@@ -73,6 +73,25 @@ DriverNode::DriverNode(
   }
   public_config_prefix_ =
     "{\"configuration\": " + fleet_->public_json(arm_config_) + ", ";
+  for (const auto & [kind, cfg_path] : {
+      std::pair<const char *, std::string>{"gravity", arm_config_.gravity_config},
+      std::pair<const char *, std::string>{"friction", arm_config_.friction_config}})
+  {
+    std::string problem = cfg_path.empty() ? "no path configured" : "";
+    if (problem.empty()) {
+      try {
+        std::string(kind) == "gravity" ?
+          (void)load_gravity_model(cfg_path) : (void)load_friction_model(cfg_path);
+      } catch (const std::exception & e) {
+        problem = cfg_path + ": " + e.what();
+      }
+    }
+    if (!problem.empty()) {
+      RCLCPP_WARN(
+        get_logger(), "%s: %s not calibrated (%s)", arm_config_.id.c_str(), kind,
+        problem.c_str());
+    }
+  }
 
   this->declare_parameter<double>("friction_error_epsilon", arm_config_.friction_error_epsilon);
   this->declare_parameter<double>(
@@ -893,7 +912,7 @@ void DriverNode::handle_configure(
       }
       last_error_.clear();
       response->success = true;
-      response->message = "Temporary runtime friction_scale applied without modifying arms.yaml";
+      response->message = "Temporary runtime friction_scale applied without modifying the arm file";
       publish_control_state();
       return;
     }

@@ -1,0 +1,4 @@
+arm: arm_4
+serial_port: /dev/ttyUSB0
+expected_version: v1.0.1
+calibration: ../calibration/px6d_right.yaml

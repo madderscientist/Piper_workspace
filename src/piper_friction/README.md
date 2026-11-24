@@ -166,7 +166,7 @@ $$
 
 ```bash
 # 终端 1：启动驱动
-ros2 launch piper_x_driver four_arms.launch.py
+ros2 launch piper_x_driver all_arms.launch.py
 
 # 终端 2：启动摩擦力标定 Web 工作台（默认端口 8090）
 ros2 run piper_friction web --port 8090
@@ -187,9 +187,9 @@ ros2 run piper_friction web --port 8090
 
 ```bash
 # 终端 1：启动驱动
-ros2 launch piper_x_driver four_arms.launch.py
+ros2 launch piper_x_driver all_arms.launch.py
 
-# 终端 2：扫描采集 J1（-0.6 ~ +0.6 rad）并直接拟合并写入 config/arm_1_friction.yaml
+# 终端 2：扫描采集 J1（-0.6 ~ +0.6 rad）并直接拟合并写入 config/calibration/arm_1_friction.yaml
 ros2 run piper_friction sweep \
   --namespace /arm_1 \
   --arm-id arm_1 \
@@ -317,7 +317,7 @@ $$
 
 ```bash
 # 终端 1：启动驱动
-ros2 launch piper_x_driver four_arms.launch.py
+ros2 launch piper_x_driver all_arms.launch.py
 
 # 终端 2：启动摩擦力标定工作台
 ros2 run piper_friction web --port 8090
@@ -326,7 +326,7 @@ ros2 run piper_friction web --port 8090
 浏览器打开 **`http://127.0.0.1:8090/gripper.html`**（或点击首页右上角 **“🦾 夹爪非周期摩擦标定专页 →”**）：
 1. 点击选择目标机械臂卡片（选中卡片高亮显示）；
 2. 确认扫描行程范围（默认 `0.003 ~ 0.080 m`）、扫描线速度（默认 `0.005 0.010 0.020 0.040 0.080 m/s`）与扫描力限幅（默认 `2.0 N`）；
-3. 点击 **“▶ 开始夹爪多速往复扫描采集”**（扫描期间机械臂六个关节保持原状不动，仅夹爪通过 `0x159` 独立往复开合，完成后自动拟合并将 `gripper:` 段合并写入 `config/arm_X_friction.yaml`）。
+3. 点击 **“▶ 开始夹爪多速往复扫描采集”**（扫描期间机械臂六个关节保持原状不动，仅夹爪通过 `0x159` 独立往复开合，完成后自动拟合并将 `gripper:` 段合并写入臂文件 `friction_config` 指定的文件）。
 
 也可直接使用命令行完成夹爪（`--joint 7`）扫描与拟合：
 
@@ -336,15 +336,15 @@ ros2 run piper_friction sweep \
   --q-min 0.003 --q-max 0.080 \
   --speeds 0.005 0.010 0.020 0.040 0.080 \
   --gripper-effort 2.0 \
-  --output-csv /home/a/piper_x_ws/src/piper_friction/config/arm_1_sweep_j7.csv \
-  --fit-output /home/a/piper_x_ws/src/piper_friction/config/arm_1_friction.yaml
+  --output-csv config/calibration/arm_1_sweep_j7.csv \
+  --fit-output config/calibration/arm_1_friction.yaml
 ```
 
 #### 2. 在驱动中启用夹爪摩擦力补偿
 
-1. 确保 [`src/piper_friction/config/arm_1_friction.yaml`](config/arm_1_friction.yaml)～[`arm_4_friction.yaml`](config/arm_4_friction.yaml) 中已包含标定生成的 `gripper:` 节点；
-2. 确保 [`src/piper_x_driver/config/arms.yaml`](../src/piper_x_driver/config/arms.yaml) 中对应机械臂的：
+1. 确保臂文件 `friction_config` 指向的摩擦文件（示范为 `config/calibration/arm_X_friction.yaml`）中已包含标定生成的 `gripper:` 节点；
+2. 确保工作空间 `config/arms/arm_X.yaml` 中对应机械臂的：
    - `friction_config` 指向该 YAML 文件；
-   - `friction_scale` 大于 `0`（推荐 `0.85`；注意标定采集开始时会自动将 `friction_scale` 置 `0.0`，标定结束后可在 Web 页面点击 **“恢复 0.85”** 或在 `arms.yaml` 中设回 `0.85`）；
-3. 启动或重启驱动（`ros2 launch piper_x_driver four_arms.launch.py`），驱动即会根据本臂实测开度与速度在主动跟随（`effort > 0`）与被动捏合（`effort <= 0`）下自动应用非周期夹爪摩擦力补偿，并在 `/arm_X/control_state` 的 `gripper_friction` 字段中实时上报当前补偿力。
+   - `friction_scale` 大于 `0`（推荐 `0.85`；注意标定采集开始时会自动将 `friction_scale` 置 `0.0`，标定结束后可在 Web 页面点击 **“恢复 0.85”** 或在臂文件中设回 `0.85`）；
+3. 启动或重启驱动（`ros2 launch piper_x_driver all_arms.launch.py`），驱动即会根据本臂实测开度与速度在主动跟随（`effort > 0`）与被动捏合（`effort <= 0`）下自动应用非周期夹爪摩擦力补偿，并在 `/arm_X/control_state` 的 `gripper_friction` 字段中实时上报当前补偿力。
 

@@ -1,7 +1,9 @@
 #include "head_camera/head_camera.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -119,26 +121,6 @@ void set_option(Options & options, const std::string & key, const std::string & 
   }
 }
 
-std::vector<CameraSpec> parse_cameras_node(const YAML::Node & node)
-{
-  std::vector<CameraSpec> result;
-  if (!node || !node.IsMap()) {
-    return result;
-  }
-  for (const auto & item : node) {
-    CameraSpec spec;
-    spec.name = item.first.as<std::string>();
-    if (item.second.IsScalar()) {
-      spec.serial = item.second.as<std::string>();
-    } else if (item.second.IsMap()) {
-      if (item.second["serial"]) spec.serial = item.second["serial"].as<std::string>();
-      if (item.second["video_device"]) spec.video_device = item.second["video_device"].as<std::string>();
-    }
-    result.push_back(std::move(spec));
-  }
-  return result;
-}
-
 void load_config(Options & options, const fs::path & path, bool & color_explicit)
 {
   const auto config = YAML::LoadFile(path.string());
@@ -147,8 +129,8 @@ void load_config(Options & options, const fs::path & path, bool & color_explicit
   }
   for (const auto & item : config) {
     auto key = item.first.as<std::string>();
-    if (key == "cameras") {
-      options.cameras = parse_cameras_node(item.second);
+    if (key == "board") {
+      continue;
     } else if (key == "preview") {
       options.preview = item.second.as<bool>();
     } else {
@@ -179,19 +161,45 @@ fs::path default_config_path()
   return fs::absolute("src/head_camera/config/head_camera.yaml");
 }
 
-std::vector<CameraSpec> load_camera_specs(const fs::path & path)
+fs::path default_camera_dir()
 {
-  if (!fs::exists(path)) {
+  const char * root = std::getenv("PIPER_CONFIG_DIR");
+  if (!root || !*root) {
     return {};
   }
-  try {
-    const auto root = YAML::LoadFile(path.string());
-    if (root && root.IsMap() && root["cameras"]) {
-      return parse_cameras_node(root["cameras"]);
-    }
-  } catch (...) {
+  return fs::path(root) / "head_camera";
+}
+
+std::vector<CameraSpec> load_camera_specs(const fs::path & path)
+{
+  if (path.empty() || !fs::is_directory(path)) {
+    return {};
   }
-  return {};
+  std::vector<fs::path> files;
+  for (const auto & entry : fs::directory_iterator(path)) {
+    if (entry.is_regular_file() && entry.path().extension() == ".yaml") {
+      files.push_back(entry.path());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  std::vector<CameraSpec> specs;
+  for (const auto & file : files) {
+    try {
+      const auto node = YAML::LoadFile(file.string());
+      if (!node || !node.IsMap()) continue;
+      CameraSpec spec;
+      spec.name = node["name"] ? node["name"].as<std::string>() : file.stem().string();
+      if (node["serial"]) spec.serial = node["serial"].as<std::string>();
+      if (node["video_device"]) spec.video_device = node["video_device"].as<std::string>();
+      if (node["calibration"]) {
+        spec.calibration_file = fs::weakly_canonical(
+          file.parent_path() / node["calibration"].as<std::string>());
+      }
+      specs.push_back(std::move(spec));
+    } catch (...) {
+    }
+  }
+  return specs;
 }
 
 std::pair<int, int> color_dimensions(const std::string & color)
@@ -259,15 +267,11 @@ Options parse_options(const std::vector<std::string> & args)
     values.emplace_back(flag.substr(2), args[++i]);
   }
   bool color_explicit = false;
-  bool config_loaded = false;
+  options.cameras = load_camera_specs(default_camera_dir());
   for (const auto & value : values) {
     if (value.first == "config") {
       load_config(options, value.second, color_explicit);
-      config_loaded = true;
     }
-  }
-  if (!config_loaded) {
-    options.cameras = load_camera_specs(default_config_path());
   }
   for (const auto & value : values) {
     if (value.first == "preview") {

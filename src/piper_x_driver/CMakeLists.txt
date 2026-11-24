@@ -113,7 +113,7 @@ if(PIPER_IPO_SUPPORTED)
   )
 endif()
 
-install(PROGRAMS scripts/damping
+install(PROGRAMS scripts/damping scripts/can_up
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY config launch
@@ -125,7 +125,8 @@ install(FILES README.md CAN_PROTOCOL.md
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_cpp_driver test/test_cpp_driver.cpp)
+  ament_add_gtest(test_cpp_driver test/test_cpp_driver.cpp
+    ENV PIPER_CONFIG_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../../config/examples)
   target_link_libraries(test_cpp_driver piper_x_driver_core)
 endif()
 

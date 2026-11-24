@@ -8,7 +8,6 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/piper_gravity']),
         ('share/piper_gravity', ['package.xml']),
-        ('share/piper_gravity/config', glob('config/*.yaml')),
         ('share/piper_gravity/web', glob('web/*')),
     ],
     install_requires=['setuptools'],

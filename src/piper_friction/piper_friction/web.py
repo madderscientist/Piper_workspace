@@ -1997,7 +1997,7 @@ def web_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument('--port', type=int, default=8090, help='Bind port (default: 8090)')
     parser.add_argument(
         '--config', default=str(default_config_path()),
-        help='Path to shared arms.yaml configuration',
+        help='Arm configuration directory (one YAML per arm)',
     )
     args = parser.parse_args(argv)
 

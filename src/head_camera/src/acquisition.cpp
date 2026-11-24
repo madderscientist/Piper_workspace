@@ -703,7 +703,7 @@ std::vector<Options> resolve_serve_targets(const Options & options)
 
 void list_devices()
 {
-  const auto specs = load_camera_specs(default_config_path());
+  const auto specs = load_camera_specs(default_camera_dir());
   const auto uvc = discover_uvc_devices();
   for (size_t i = 0; i < uvc.size(); ++i) {
     const auto alias = alias_for_serial(specs, uvc[i].serial);

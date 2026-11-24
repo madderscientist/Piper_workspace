@@ -10,7 +10,7 @@ import yaml
 
 from .conftest import front_pose, render
 from piper_x_driver.gravity import forward_kinematics
-from wrist_camera import transforms
+from wrist_camera import load_cameras_config, transforms
 from wrist_camera.board import Board
 from wrist_camera.calib import CalibrationApp
 from wrist_camera.sources import (
@@ -26,7 +26,7 @@ CONFIG = Path(__file__).resolve().parents[1] / 'config'
 
 @pytest.fixture(scope='module')
 def cameras_cfg():
-    return yaml.safe_load((CONFIG / 'cameras.yaml').read_text(encoding='utf-8'))
+    return load_cameras_config()
 
 
 @pytest.fixture(scope='module')
@@ -182,9 +182,8 @@ def test_dashboard_single_arm_extrinsic_workflow(tmp_path, board, flat):
         saved = _post(port, '/api/save_extrinsic', {'camera': 'camera_arm_3', 'method': 'joint'})
         assert Path(saved['path']).is_file()
         calib_data = app.store.read_calibration()
-        assert 'urdf_overrides' not in calib_data
-        assert calib_data['extrinsics']['camera_arm_3']['parent'] == 'gripper_base_top'
-        origins = calib_data['extrinsics']['camera_arm_3']['mesh_origins']
+        assert calib_data['extrinsics']['parent'] == 'gripper_base_top'
+        origins = calib_data['extrinsics']['mesh_origins']
         assert origins['gripper_base_without_flange'][2] == pytest.approx(
             origins['gripper_base_top'][2] + GRIPPER_BASE_WITHOUT_FLANGE_TOP_Z_M, abs=1e-5)
         assert origins['gripper_base_with_flange'][2] == pytest.approx(

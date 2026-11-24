@@ -31,7 +31,6 @@ from wrist_camera import (
     grab_frame,
     resolve_arm_camera,
 )
-import yaml
 
 from ..policy import (
     DEFAULT_TIP_LENGTH_M,
@@ -110,25 +109,6 @@ def default_outputs_dir() -> Path:
     return here.parent.parent.parent / 'outputs'
 
 
-def _find_head_intrinsic_yaml() -> Path:
-    candidates = [
-        Path('/home/a/piper_x_ws/src/head_camera/config/intrinsic.yaml'),
-    ]
-    for parent in Path(__file__).resolve().parents:
-        cand = parent / 'src' / 'head_camera' / 'config' / 'intrinsic.yaml'
-        if cand not in candidates:
-            candidates.append(cand)
-    try:
-        share = Path(get_package_share_directory('head_camera')) / 'config' / 'intrinsic.yaml'
-        candidates.append(share)
-    except Exception:
-        pass
-    for path in candidates:
-        if path.is_file():
-            return path
-    return candidates[0]
-
-
 def _encode_jpeg(image_bgr: np.ndarray, quality: int = 88) -> bytes:
     ok, buf = cv2.imencode('.jpg', image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
     if not ok:
@@ -143,7 +123,7 @@ class AgentInsertNode(InsertDashboardNode):
         self,
         *,
         config_file: str | Path | None = None,
-        arm_selector: str = 'can4',
+        arm_selector: str = '',
         namespace_override: str = '',
         onnx_path: str | Path | None = None,
         tip_length_m: float = DEFAULT_TIP_LENGTH_M,
@@ -278,14 +258,6 @@ class AgentInsertNode(InsertDashboardNode):
                 return info
         except Exception:
             pass
-        path = _find_head_intrinsic_yaml()
-        if path.is_file():
-            raw = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
-            cams = raw.get('cameras') or {}
-            if camera in cams:
-                prof = (cams[camera].get('profiles') or {}).get('1920x1080')
-                if prof:
-                    return {'available': True, 'camera_key': camera, **prof}
         raise RuntimeError(f'外部相机 {camera} 尚未标定内参，请先在 head_camera 标定内参')
 
     def _ensure_wrist_rtsp(self):
@@ -1218,7 +1190,7 @@ class _AgentFlowHTTPHandler(BaseHTTPRequestHandler):
                 if frame is None:
                     canvas = np.zeros((360, 640, 3), dtype=np.uint8)
                     canvas[:] = (28, 36, 52)
-                    txt = 'Wrist Stream Paused' if not self.node.wrist_preview_enabled else 'Waiting for camera_arm_4...'
+                    txt = 'Wrist Stream Paused' if not self.node.wrist_preview_enabled else 'Waiting for wrist camera...'
                     cv2.putText(canvas, txt, (95, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (180, 200, 225), 2, cv2.LINE_AA)
                     jpg = _encode_jpeg(canvas, quality=75)
                     sleep_s = 0.5
@@ -1403,12 +1375,12 @@ def create_agent_http_server(
 
 def agent_web_main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description='Launch the 4-stage Agent-guided Insertion Pipeline Web UI for PiPER-X (arm_4).'
+        description='Launch the 4-stage Agent-guided Insertion Pipeline Web UI for PiPER-X.'
     )
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8093)
     parser.add_argument('--config', default=str(default_config_path()))
-    parser.add_argument('--arm', default='can4')
+    parser.add_argument('--arm', default='')
     parser.add_argument('--namespace', default='')
     parser.add_argument('--onnx', default='')
     parser.add_argument('--tip-length', type=float, default=DEFAULT_TIP_LENGTH_M)

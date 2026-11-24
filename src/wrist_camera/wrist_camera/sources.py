@@ -20,15 +20,9 @@ from wrist_camera.transforms import (
     piper_fk,
 )
 
-ALLOWED_ARMS = ('arm_3', 'arm_4')
-_ARM_ALIASES = {
-    'arm_3': 'arm_3', 'arm3': 'arm_3', '/arm_3': 'arm_3', '3': 'arm_3',
-    'arm_4': 'arm_4', 'arm4': 'arm_4', '/arm_4': 'arm_4', '4': 'arm_4',
-}
 _JOINT_NAMES_6 = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
 
 __all__ = [
-    'ALLOWED_ARMS',
     'CameraSource',
     'Frames',
     'GRIPPER_BASE_WITHOUT_FLANGE_TOP_Z_M',
@@ -37,20 +31,9 @@ __all__ = [
     'GRIPPER_WITH_WRENCH_TOP_Z_M',
     'MotionGate',
     'load_arm_angle_offsets',
-    'normalize_arm_id',
     'piper_fk',
     'select_arm_camera',
 ]
-
-
-def normalize_arm_id(arm: str) -> str:
-    raw = str(arm or '').strip().lower()
-    if not raw:
-        raise ValueError('必须指定机械臂（仅支持 arm_3 或 arm_4）')
-    canonical = _ARM_ALIASES.get(raw)
-    if canonical is None:
-        raise ValueError(f'只有 arm_3 和 arm_4 有腕部相机，不支持 {arm!r}')
-    return canonical
 
 
 def _match_camera(cameras: dict, selector: str) -> tuple[str | None, dict | None]:
@@ -69,35 +52,36 @@ def _match_camera(cameras: dict, selector: str) -> tuple[str | None, dict | None
     return None, None
 
 
-def select_arm_camera(cameras_config: dict, arm: str = '', camera: str = '') -> tuple[str, str, dict]:
+def select_arm_camera(cameras: dict, arm: str = '', camera: str = '') -> tuple[str, str, dict]:
     """解析并校验单臂与对应腕部相机（支持只传 arm、只传 camera、或同时传两者并校验匹配）。"""
-    arm_raw = str(arm or '').strip()
+    arm_raw = str(arm or '').strip().lstrip('/')
     cam_raw = str(camera or '').strip()
     if not arm_raw and not cam_raw:
-        raise ValueError('启动标定需要指定 --arm（arm_3 或 arm_4）或 --camera')
-    cameras = (cameras_config or {}).get('cameras', {}) or {}
+        raise ValueError('启动标定需要指定 --arm 或 --camera')
     if not cameras:
-        raise ValueError('cameras.yaml 中没有配置任何相机')
+        raise ValueError('未配置任何腕部相机')
 
     if arm_raw and not cam_raw:
-        arm_id = normalize_arm_id(arm_raw)
-        matched_name, matched_cfg = _match_camera(cameras, arm_id)
+        matched_name, matched_cfg = _match_camera(cameras, arm_raw)
         if matched_name is None or matched_cfg is None:
-            raise ValueError(f'未找到 {arm_id} 对应的腕部相机配置')
+            raise ValueError(f'未找到 {arm_raw} 对应的腕部相机配置（已配置：{list(cameras)}）')
+        arm_id = str(matched_cfg.get('arm') or arm_raw).strip().lstrip('/')
     elif cam_raw and not arm_raw:
         matched_name, matched_cfg = _match_camera(cameras, cam_raw)
         if matched_name is None or matched_cfg is None:
             raise ValueError(f'未找到相机 {camera!r}，可选相机：{list(cameras)}')
-        arm_id = normalize_arm_id(matched_cfg.get('arm', ''))
+        arm_id = str(matched_cfg.get('arm') or '').strip().lstrip('/')
+        if not arm_id:
+            raise ValueError(f'相机 {matched_name} 未配置 arm 字段')
     else:
-        arm_id = normalize_arm_id(arm_raw)
         matched_name, matched_cfg = _match_camera(cameras, cam_raw)
         if matched_name is None or matched_cfg is None:
             raise ValueError(f'未找到相机 {camera!r}，可选相机：{list(cameras)}')
-        cfg_arm = matched_cfg.get('arm')
-        if cfg_arm and normalize_arm_id(cfg_arm) != arm_id:
+        cfg_arm = str(matched_cfg.get('arm') or '').strip().lstrip('/')
+        if cfg_arm and cfg_arm.lower() != arm_raw.lower():
             raise ValueError(
-                f'指定的机械臂 {arm_id} 与相机 {matched_name}（归属 {cfg_arm}）不匹配')
+                f'指定的机械臂 {arm_raw} 与相机 {matched_name}（归属 {cfg_arm}）不匹配')
+        arm_id = cfg_arm or arm_raw
 
     matched_cfg.setdefault('arm', arm_id)
     matched_cfg.setdefault('arm_namespace', f'/{arm_id}')

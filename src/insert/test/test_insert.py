@@ -1,4 +1,4 @@
-"""Focused verification for InsertAnything ONNX policy deployment and CAN4 dashboard workflow."""
+"""Focused verification for InsertAnything ONNX policy deployment and dashboard workflow."""
 
 import json
 import math
@@ -288,13 +288,13 @@ def test_transforms_wrench_and_onnx_policy_convergence():
     assert p_lim_chk == pytest.approx(p_lim_des, abs=1e-4)
 
 
-def test_dashboard_can4_gripper_record_and_policy_workflow():
-    """Verify end-to-end dashboard workflow on CAN4 (/arm_4): gripper switch, drag, record goal, and execute policy."""
+def test_dashboard_gripper_record_and_policy_workflow():
+    """Verify end-to-end dashboard workflow on /arm_4: gripper switch, drag, record goal, and execute policy."""
     rclpy.init()
     node = helper = server = None
     try:
-        node = InsertDashboardNode(arm_selector='can4', wrench_source='estimated')
-        assert node.arm_id == 'arm_4' and node.arm_namespace == '/arm_4' and node.can_label == 'can4'
+        node = InsertDashboardNode(arm_selector='arm_4', wrench_source='estimated')
+        assert node.arm_id == 'arm_4' and node.arm_namespace == '/arm_4'
 
         helper = rclpy.create_node('test_insert_helper')
         received_mit: list[MitCommand] = []

@@ -1,0 +1,19 @@
+id: arm_3
+name: 机械臂 3
+namespace: /arm_3
+can_port: can2
+end_effector: gripper_with_wrench
+gravity_scale: 1.0
+mounting: upright
+kp: [17.0, 16.0, 15.0, 4.0, 3.0, 3.0]
+kd: [5.99, 6.06, 3.16, 0.53, 0.31, 0.08]
+s_a: 2.0
+friction_scale: 0.88
+friction_config: ../calibration/arm_3_friction.yaml
+gravity_config: ../calibration/arm_3_gravity.yaml
+friction_error_epsilon: 0.05
+friction_velocity_epsilon: 0.02
+target_velocity_cutoff_hz: 5.0
+adaptive_stiffness_b: 0.08
+adaptive_stiffness_power: 3.0
+offset_ramp_s: 2.0

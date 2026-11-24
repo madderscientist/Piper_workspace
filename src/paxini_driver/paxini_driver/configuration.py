@@ -1,4 +1,9 @@
-"""传感器配置解析与标定参数原子持久化工具（独立于 ROS 节点）。"""
+"""传感器配置解析与标定参数原子持久化工具（独立于 ROS 节点）。
+
+- 包内 config/px6d.yaml：协议默认值与公共校准姿态（进 git）。
+- $PIPER_CONFIG_DIR/paxini_driver/<传感器名>.yaml：本机传感器（arm、serial_port、expected_version、calibration 等）。
+- 传感器文件中 calibration 指向的标定结果文件；缺失或无效视为未标定。
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,7 @@ import fcntl
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 import yaml
 from ament_index_python.packages import PackageNotFoundError, get_package_share_path
@@ -25,75 +30,63 @@ def source_config_path(fallback: Optional[Path] = None) -> Path:
         return source
 
 
-def default_config_path() -> Path:
-    return source_config_path()
+def default_sensor_dir() -> Path:
+    root = os.environ.get("PIPER_CONFIG_DIR")
+    if not root:
+        raise RuntimeError("PIPER_CONFIG_DIR 未设置，请先 source setup_env.bash")
+    return Path(root) / "paxini_driver"
+
+
+def _load_mapping(path: Path) -> dict[str, Any]:
+    """缺失或无法解析的文件视为空。"""
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def resolve_sensor_configs(
-    arm: str = "",
+    selector: str = "",
     config_file: Optional[str] = None,
+    sensor_dir: Optional[str] = None,
 ) -> List[dict[str, Any]]:
-    path = Path(config_file) if config_file else default_config_path()
-    raw = yaml.safe_load(path.read_text()) or {}
-    defaults = dict(raw.get("defaults") or {})
-    sensors = raw.get("sensors") or {}
-    selector = arm.strip().lower()
+    """按传感器名或机械臂 id 选择本机传感器；空或 all 表示全部。"""
+    raw = yaml.safe_load(source_config_path(config_file).read_text()) or {}
+    directory = Path(sensor_dir) if sensor_dir else default_sensor_dir()
+    selector = selector.strip()
     entries: List[dict[str, Any]] = []
-    for key, cfg in sensors.items():
-        merged = {
-            **defaults,
-            **cfg,
-            "arm_id": key,
-            "calibration_poses": raw.get("calibration_poses") or [],
-        }
-        aliases = {str(a).strip().lower() for a in merged.get("aliases", [])} | {
-            key.lower()
-        }
-        if not selector or selector == "all" or selector in aliases:
-            entries.append(merged)
-    if not entries:
-        raise ValueError(
-            f"Unknown sensor arm selector '{arm}'; available: {list(sensors)}"
+    for file in sorted(directory.glob("*.yaml")):
+        cfg = yaml.safe_load(file.read_text()) or {}
+        arm = str(cfg["arm"])
+        if selector not in ("", "all", file.stem, arm):
+            continue
+        calibration = (file.parent / cfg["calibration"]).resolve() if cfg.get("calibration") else None
+        entries.append(
+            {
+                "namespace": f"/{arm}",
+                **(raw.get("defaults") or {}),
+                **cfg,
+                **(_load_mapping(calibration) if calibration else {}),
+                "sensor": file.stem,
+                "arm_id": arm,
+                "calibration_file": str(calibration or ""),
+                "calibration_poses": raw.get("calibration_poses") or [],
+            }
         )
+    if not entries:
+        raise ValueError(f"No PX6D sensor matches '{selector}' in {directory}")
     return entries
 
 
-def save_sensor_calibration_to_yaml(
-    arm_id: str,
-    *,
-    tare_offset: Optional[Sequence[float]] = None,
-    tool_mass_kg: Optional[float] = None,
-    tool_com_m: Optional[Sequence[float]] = None,
-    calibration_poses: Optional[Sequence[Sequence[float]]] = None,
-    calibration_samples: Optional[Sequence[dict[str, Any]]] = None,
-    calibration_quality: Optional[dict[str, Any]] = None,
-    config_path: Optional[Path] = None,
-) -> Path:
-    """将公共校准姿态或单臂标定结果写回 px6d.yaml，保留其余传感器与测量记录字段。"""
-    target = source_config_path(config_path).resolve()
-    # 通过文件排他锁串行化双臂并发写入，并用同目录临时文件 + os.replace 保证驱动 reload 时读到完整 YAML。
+def _update_yaml(target: Path, update: Callable[[dict[str, Any]], None]) -> Path:
+    """文件排他锁串行化并发写入，同目录临时文件 + os.replace 保证驱动 reload 时读到完整 YAML。"""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
     with target.with_suffix(target.suffix + ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        raw = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
-        sensors = raw.setdefault("sensors", {})
-        entry = sensors.setdefault(arm_id, {})
-        if tare_offset is not None:
-            entry["tare_offset"] = [round(float(v), 6) for v in tare_offset[:6]]
-        if tool_mass_kg is not None:
-            entry["tool_mass_kg"] = round(float(tool_mass_kg), 6)
-        if tool_com_m is not None:
-            entry["tool_com_m"] = [round(float(v), 6) for v in tool_com_m[:3]]
-        if calibration_samples is not None:
-            entry["calibration_samples"] = list(calibration_samples)
-        if calibration_quality is not None:
-            entry["calibration_quality"] = dict(calibration_quality)
-        if calibration_poses is not None:
-            raw["calibration_poses"] = [
-                [round(float(v), 6) for v in pose[:6]] for pose in calibration_poses
-            ]
-            for sensor in sensors.values():
-                sensor.pop("calibration_poses", None)
-        content = yaml.safe_dump(raw, allow_unicode=True, sort_keys=False)
+        raw = _load_mapping(target)
+        update(raw)
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -104,10 +97,44 @@ def save_sensor_calibration_to_yaml(
                 delete=False,
             ) as stream:
                 temporary = Path(stream.name)
-                stream.write(content)
-            temporary.chmod(target.stat().st_mode & 0o777)
+                yaml.safe_dump(raw, stream, allow_unicode=True, sort_keys=False)
+            if target.exists():
+                temporary.chmod(target.stat().st_mode & 0o777)
             os.replace(temporary, target)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
     return target
+
+
+def save_calibration_poses(
+    poses: Sequence[Sequence[float]], config_path: Optional[Path] = None
+) -> Path:
+    """公共校准姿态写入包内 px6d.yaml。"""
+    rounded = [[round(float(v), 6) for v in pose[:6]] for pose in poses]
+    return _update_yaml(
+        source_config_path(config_path),
+        lambda raw: raw.__setitem__("calibration_poses", rounded),
+    )
+
+
+def save_sensor_calibration(
+    calibration_file: str,
+    *,
+    tare_offset: Sequence[float],
+    tool_mass_kg: float,
+    tool_com_m: Sequence[float],
+    calibration_samples: Sequence[dict[str, Any]],
+    calibration_quality: dict[str, Any],
+) -> Path:
+    """单个传感器的标定结果写入其 calibration 文件。"""
+    if not calibration_file:
+        raise ValueError("传感器配置缺少 calibration 字段，无法保存标定结果")
+    values = {
+        "tare_offset": [round(float(v), 6) for v in tare_offset[:6]],
+        "tool_mass_kg": round(float(tool_mass_kg), 6),
+        "tool_com_m": [round(float(v), 6) for v in tool_com_m[:3]],
+        "calibration_samples": list(calibration_samples),
+        "calibration_quality": dict(calibration_quality),
+    }
+    return _update_yaml(Path(calibration_file), lambda raw: raw.update(values))

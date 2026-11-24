@@ -35,7 +35,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from piper_x_driver.configuration import default_config_path, FleetConfig
-from wrist_camera import default_calibration_path, load_calibrations
+from wrist_camera import default_cameras_config_path, load_camera_calibration, load_cameras_config
 
 from .control import ArmController, drain_client, TeachingController
 
@@ -50,41 +50,36 @@ STREAM_TOPICS = {
 }
 STALE_SECONDS = 2.0
 LOGGER = logging.getLogger('state_dashboard.http')
-_CAMERA_CALIB_CACHE: dict[str, Any] = {'mtime': None, 'path': None, 'data': {}}
+_CAMERA_CALIB_CACHE: dict[str, Any] = {'sig': None, 'data': {}}
 
 
-def default_camera_calibration_path() -> Path | None:
-    path = default_calibration_path()
-    return path if path.parent.is_dir() else None
-
-
-def load_camera_calibrations(calib_path: Path | None = None) -> dict[str, dict[str, Any]]:
-    """Load per-arm camera intrinsic and extrinsic calibration from wrist_camera YAML."""
-    path = calib_path or default_camera_calibration_path()
-    if path is None or not path.is_file():
-        return {}
+def load_camera_calibrations(config_dir: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load per-arm camera intrinsic and extrinsic calibration from wrist_camera config."""
     try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return {}
-    if _CAMERA_CALIB_CACHE['path'] == str(path) and _CAMERA_CALIB_CACHE['mtime'] == mtime:
-        return _CAMERA_CALIB_CACHE['data']
-    try:
-        raw = load_calibrations(path)
+        cameras = load_cameras_config(config_dir or default_cameras_config_path())
     except Exception:
         return {}
-    intrinsics = raw.get('intrinsics') or {}
-    extrinsics = raw.get('extrinsics') or {}
+    sig = []
+    for name, cfg in cameras.items():
+        cf = cfg.get('calibration_file') or ''
+        try:
+            mtime = Path(cf).stat().st_mtime if cf else None
+        except OSError:
+            mtime = None
+        sig.append((name, cf, mtime))
+    sig_tuple = tuple(sig)
+    if _CAMERA_CALIB_CACHE['sig'] == sig_tuple:
+        return _CAMERA_CALIB_CACHE['data']
     by_arm: dict[str, dict[str, Any]] = {}
-    for cam_name, ext in extrinsics.items():
+    for cam_name, cfg in cameras.items():
+        cal = load_camera_calibration(cfg.get('calibration_file'))
+        ext = cal.get('extrinsics')
         if not isinstance(ext, dict):
             continue
-        arm_key = str(ext.get('arm') or '').strip().lstrip('/')
-        if not arm_key and cam_name.startswith('camera_arm_'):
-            arm_key = cam_name[len('camera_'):]
+        arm_key = str(cfg.get('arm') or ext.get('arm') or '').strip().lstrip('/')
         if not arm_key:
             continue
-        intr_list = intrinsics.get(cam_name) or []
+        intr_list = cal.get('intrinsics') or []
         by_arm[f'/{arm_key}'] = {
             'camera': cam_name,
             'parent': ext.get('parent', 'gripper_base_top'),
@@ -113,7 +108,7 @@ def load_camera_calibrations(calib_path: Path | None = None) -> dict[str, dict[s
                 for item in intr_list if isinstance(item, dict) and 'camera_matrix' in item
             ],
         }
-    _CAMERA_CALIB_CACHE.update({'path': str(path), 'mtime': mtime, 'data': by_arm})
+    _CAMERA_CALIB_CACHE.update({'sig': sig_tuple, 'data': by_arm})
     return by_arm
 
 
@@ -122,10 +117,10 @@ def _reject_nonfinite(constant: str) -> Any:
 
 
 def normalize_namespaces(values: list[str]) -> list[str]:
-    """Validate four distinct, non-root ROS namespaces."""
+    """Validate distinct, non-root ROS namespaces."""
     namespaces = ['/' + value.strip('/') for value in values]
-    if len(namespaces) != 4 or len(set(namespaces)) != 4:
-        raise ValueError('Exactly four distinct arm namespaces are required.')
+    if not namespaces or len(set(namespaces)) != len(namespaces):
+        raise ValueError('At least one distinct arm namespace is required.')
     for namespace in namespaces:
         if not re.fullmatch(r'(?:/[A-Za-z_][A-Za-z0-9_]*)+', namespace):
             raise ValueError(f'Invalid arm namespace: {namespace}')
@@ -703,9 +698,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         arm_match = re.fullmatch(
-            r'/api/arms/([1-4])/(enable|disable|configure|calibrate|mode|joints|cartesian|gripper'
-            r'|mit/command)',
+            r'/api/arms/([1-9][0-9]?)/(enable|disable|configure|calibrate|mode|joints|cartesian'
+            r'|gripper|mit/command)',
             self.path)
+        if arm_match is not None and int(arm_match.group(1)) > len(self._server.store.namespaces):
+            arm_match = None
         teaching_match = re.fullmatch(r'/api/teaching/(start|stop|mode)', self.path)
         if arm_match is None and teaching_match is None:
             self._json_response(404, {'message': '未知操作。'})
@@ -854,7 +851,7 @@ def main(args: list[str] | None = None) -> None:
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8089)
     parser.add_argument('--config', default=str(default_config_path()))
-    parser.add_argument('--namespaces', nargs=4)
+    parser.add_argument('--namespaces', nargs='+')
     options = parser.parse_args(remove_ros_args(argv)[1:])
     try:
         fleet = FleetConfig(options.config)

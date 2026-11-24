@@ -40,7 +40,7 @@ Board options (for calibrate; defaults match 12x9 / 15mm / 11.25mm / DICT_5X5_10
   --square-size METERS  Square side length in meters (default: 0.015)
   --marker-size METERS  Marker side length in meters (default: 0.01125)
   --dictionary NAME     ArUco dictionary (default: DICT_5X5_100)
-  --intrinsic FILE.yaml Intrinsic YAML path (default: config/intrinsic.yaml)
+  --intrinsic FILE.yaml Intrinsic YAML path (default: camera's calibration or $PIPER_CONFIG_DIR/calibration/<name>.yaml)
 )";
 }  // namespace
 
@@ -67,8 +67,7 @@ int main(int argc, char ** argv)
     }
     if (options.command == "calibrate") {
       const auto solved = head_camera::calibrate_directory(options);
-      const auto target = options.intrinsic_file.empty() ?
-        head_camera::default_intrinsic_path() : options.intrinsic_file;
+      const auto target = head_camera::resolve_intrinsic_path(options);
       std::cout << "Calibrated " << solved.width << 'x' << solved.height
                 << " from " << solved.images << " images (RMS: " << solved.rms << " px)\n"
                 << "Saved: " << target << '\n';

@@ -6,9 +6,8 @@
 
 namespace paxini_driver {
 
-// 从 px6d.yaml 解析出的单传感器标定补偿参数与质量摘要
+// 单传感器标定文件中的补偿参数与质量摘要
 struct SensorCalibrationConfig {
-  std::string arm_id;
   std::array<double, 6> tare_offset{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_tare_offset{false};
   double tool_mass_kg{0.0};
@@ -18,13 +17,8 @@ struct SensorCalibrationConfig {
   std::string calibration_quality_json{"{}"};
 };
 
-// 获取默认配置文件路径（symlink-install 下自动指向源码中的 config/px6d.yaml）
-std::filesystem::path default_config_path();
-
-// 按臂标识或别名（如 arm_3 / arm_4 / 左手 / 右手）读取合并 defaults 后的标定配置
-SensorCalibrationConfig resolve_sensor_calibration(
-  const std::string & arm,
-  const std::filesystem::path & config_file = {});
+// 读取单个传感器的标定文件；文件缺失或格式无效时抛出异常，由调用方按未标定处理
+SensorCalibrationConfig load_sensor_calibration(const std::filesystem::path & file);
 
 std::string json_escape(const std::string & s);
 

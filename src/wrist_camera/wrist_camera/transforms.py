@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import numpy as np
-import yaml
 
 GRIPPER_WITH_WRENCH_TOP_Z_M = 0.0928
 GRIPPER_BASE_WITH_FLANGE_TOP_Z_M = 0.063
@@ -271,18 +269,13 @@ def piper_fk(position, angle_offsets=None, tool_offset_z_m: float = 0.0) -> np.n
 
 def load_arm_angle_offsets(arm_id: str) -> tuple[float, ...]:
     """加载对应机械臂标定过的重力零位偏置 angle_offset（不存在则返回全 0）。"""
+    from piper_x_driver.configuration import default_config_path, FleetConfig
+
     arm_clean = str(arm_id or '').strip().lstrip('/')
-    pkg_src = Path(__file__).resolve().parents[2] / 'piper_gravity' / 'config' / f'{arm_clean}_gravity.yaml'
-    candidates = [pkg_src, Path(f'/home/a/piper_x_ws/src/piper_gravity/config/{arm_clean}_gravity.yaml')]
-    for path in candidates:
-        if path.is_file():
-            try:
-                data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
-                joints = data.get('joints', {}) or {}
-                return tuple(
-                    float((joints.get(f'joint{i}') or joints.get(i) or {}).get('angle_offset', 0.0))
-                    for i in range(1, 7)
-                )
-            except Exception:
-                pass
-    return (0.0,) * 6
+    try:
+        model = FleetConfig(default_config_path()).gravity_model(arm_clean)
+    except (OSError, ValueError):
+        model = None
+    if model is None:
+        return (0.0,) * 6
+    return tuple(model.joint(i).angle_offset for i in range(1, 7))

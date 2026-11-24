@@ -11,7 +11,7 @@
 
 ## 1. 预览与启动
 
-先确保 `ros2 launch piper_x_driver four_arms.launch.py` 已在同一 `ROS_DOMAIN_ID` 下运行：
+先确保 `ros2 launch piper_x_driver all_arms.launch.py` 已在同一 `ROS_DOMAIN_ID` 下运行：
 
 ```bash
 # 预览模式（默认 dry_run:=true，仅发布配对参考，不操作电机）
@@ -51,12 +51,12 @@ ros2 service call /bilateral_teaching/stop std_srvs/srv/Trigger '{}'
 ```
 
 - **上层停止（调用 `/bilateral_teaching/stop` 或 `Ctrl+C` 退出 `teaching.launch.py`）**：停止发布耦合指令，四臂驱动保持在 `mit` 重力补偿模式。
-- **驱动退出（`Ctrl+C` 退出 `four_arms.launch.py`）**：底层自动切换到固件原生零力拖动（`drag`）模式。
+- **驱动退出（`Ctrl+C` 退出 `all_arms.launch.py`）**：底层自动切换到固件原生零力拖动（`drag`）模式。
 - **彻底断电**：运行 `ros2 launch piper_x_driver power_off.launch.py` 或调用 `enable_srv(False)`。
 
 ## 3. 配置参数
 
-配对耦合参数位于 [bilateral_teaching.yaml](config/bilateral_teaching.yaml)，四臂硬件与重力参数位于 [arms.yaml](../piper_x_driver/config/arms.yaml)：
+配对耦合参数位于 [bilateral_teaching.yaml](config/bilateral_teaching.yaml)，臂硬件与重力参数位于工作空间 `config/arms/`（示范见 [config/examples/arms](../../config/examples/arms)）；示教只运行两端都已配置的主从对：
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|

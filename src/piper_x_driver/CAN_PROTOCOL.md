@@ -14,7 +14,7 @@
 - 除明确标出的固件查询和 CPV 外，下文固定 SDK 的发送帧均为 8 字节；
   TX 表中标为保留的字节由编码器填 0。MIT 是位打包，不按普通整数表解释。
 - “CAN/SDK 支持”指固定版本存在消息定义、编解码或调用入口，**不等于已在本机带动力验收**。
-  “ROS 已开放”只指自有 `piper_x_driver`；[官方 ROS 源码](../vendor/agx_arm_ros)
+  “ROS 已开放”只指自有 `piper_x_driver`；[官方 ROS 源码](https://github.com/agilexrobotics/agx_arm_ros/tree/286633e0d2edb038ee3a1047d9feb7f614a1c076)
   是参考，不是默认启动的另一个接口集合。
 
 ### 单位与转换

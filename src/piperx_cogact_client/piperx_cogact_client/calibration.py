@@ -202,26 +202,31 @@ class CalibrationManager:
             if not self.path.is_file():
                 self.loaded_from_disk = False
                 return False
-            raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
-            if not isinstance(raw, dict):
+            try:
+                raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
+                if not isinstance(raw, dict):
+                    self.loaded_from_disk = False
+                    return False
+                state = self._default_state()
+                for key in ("calibration_id", "updated_at", "world_origin", "base_mid_x_m", "board_z_m"):
+                    if raw.get(key) is not None:
+                        state[key] = raw[key]
+                if state["world_origin"] in ("board", "mid_base"):
+                    state["world_origin"] = "board_up" if state["world_origin"] == "board" else "dual_base_board"
+                for group in ("world_from_base", "flange_from_tcp"):
+                    src = raw.get(group) or {}
+                    for side in ("left", "right"):
+                        if src.get(side) is not None:
+                            state[group][side] = np.asarray(src[side], dtype=np.float64).reshape(4, 4).tolist()
+                if raw.get("world_from_head_camera_cv") is not None:
+                    state["world_from_head_camera_cv"] = np.asarray(raw["world_from_head_camera_cv"], dtype=np.float64).reshape(4, 4).tolist()
+                if isinstance(raw.get("board_observations"), dict):
+                    state["board_observations"] = copy.deepcopy(raw["board_observations"])
+                if isinstance(raw.get("home_poses"), dict):
+                    state["home_poses"] = copy.deepcopy(raw["home_poses"])
+            except (OSError, yaml.YAMLError, ValueError, TypeError):
+                self.loaded_from_disk = False
                 return False
-            state = self._default_state()
-            for key in ("calibration_id", "updated_at", "world_origin", "base_mid_x_m", "board_z_m"):
-                if raw.get(key) is not None:
-                    state[key] = raw[key]
-            if state["world_origin"] in ("board", "mid_base"):
-                state["world_origin"] = "board_up" if state["world_origin"] == "board" else "dual_base_board"
-            for group in ("world_from_base", "flange_from_tcp"):
-                src = raw.get(group) or {}
-                for side in ("left", "right"):
-                    if src.get(side) is not None:
-                        state[group][side] = np.asarray(src[side], dtype=np.float64).reshape(4, 4).tolist()
-            if raw.get("world_from_head_camera_cv") is not None:
-                state["world_from_head_camera_cv"] = np.asarray(raw["world_from_head_camera_cv"], dtype=np.float64).reshape(4, 4).tolist()
-            if isinstance(raw.get("board_observations"), dict):
-                state["board_observations"] = copy.deepcopy(raw["board_observations"])
-            if isinstance(raw.get("home_poses"), dict):
-                state["home_poses"] = copy.deepcopy(raw["home_poses"])
             self.data = state
             self.loaded_from_disk = True
             return True

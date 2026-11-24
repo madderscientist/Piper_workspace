@@ -5,7 +5,7 @@
 ## 启动
 
 ```bash
-cd /home/a/piper_x_ws
+cd <工作空间根目录>
 source ./setup_env.bash
 CMAKE_BUILD_PARALLEL_LEVEL=2 .venv/bin/python /usr/bin/colcon build --symlink-install --packages-select piperx_cogact_client
 source ./setup_env.bash
@@ -57,7 +57,7 @@ base_from_link6_target = inverse(world_from_base) @ world_from_tcp_target @ inve
 
 FK/IK 使用驱动的关节零偏。IK 首步以实测关节角为初值，后续沿用上一步解；整批求解后再按所选模式下发 `MitCommand`，夹爪使用独立的 `GripperCommand`。
 
-外参、工具偏移和起始位保存于 [config/calibration.yaml](config/calibration.yaml)，启动自动加载。手工修改后需重启；重新标定会重算外参。“记录当前双臂位置”保存关节角与开度，“平滑回到标定起始位”采用五次插值。
+外参、工具偏移和起始位保存于 `config/calibration.yaml`（本机数据，不进 git；缺失或无效视为未标定），启动自动加载。手工修改后需重启；重新标定会重算外参。“记录当前双臂位置”保存关节角与开度，“平滑回到标定起始位”采用五次插值。
 
 ## Python 调用
 

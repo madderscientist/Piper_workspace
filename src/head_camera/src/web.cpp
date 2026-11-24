@@ -499,7 +499,7 @@ private:
 WebState::WebState(const Options & options)
 : options(options),
   calib(
-    options.intrinsic_file, options.output,
+    resolve_intrinsic_path(options), options.output,
     !options.serial.empty() ? options.serial :
     (!options.camera_name.empty() ? options.camera_name : "default"))
 {

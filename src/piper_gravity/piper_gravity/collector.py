@@ -1,6 +1,6 @@
 """ROS 2 client node for executing bidirectional quasi-static gravity & static friction probes."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import time
@@ -9,7 +9,7 @@ from typing import Any, Sequence
 
 import numpy as np
 from piper_x_driver.protocol import MIT_GAIN_SCALE, MIT_KD_LSB, MIT_KP_LSB
-from piper_x_driver.gravity import ArmGravityModel, gravity_torques, load_gravity_model, max_critical_kd
+from piper_x_driver.gravity import ArmGravityModel, load_gravity_model, max_critical_kd
 from piper_x_interfaces.msg import ArmStatus, MitCommand
 from piper_x_interfaces.srv import ConfigureArm, Enable, SetMode
 from rclpy.node import Node
@@ -292,7 +292,9 @@ class ProbeCollectorNode(Node):
                     self.config.joint, kp_cmd, kd_cmd,
                 )
                 q_val = self.latest_position[j_idx]
-                g_torques = gravity_torques(self.latest_position[:6], **self.effector_kwargs)
+                # Fit baseline: nominal effector plus configured added_mass_kg, no joint calibration.
+                g_torques = replace(self.gravity_model or ArmGravityModel(), joints={}).torques(
+                    self.latest_position[:6], **self.effector_kwargs)
                 if (self.applied_gravity_torques is not None
                         and len(self.applied_gravity_torques) >= 6):
                     g_applied = float(self.applied_gravity_torques[j_idx])

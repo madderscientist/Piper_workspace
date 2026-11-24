@@ -3,13 +3,18 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-from piper_x_driver.configuration import default_config_path
+from piper_x_driver.configuration import default_config_path, FleetConfig
 
 
 def _launch_nodes(context):
     config_file = LaunchConfiguration('config_file').perform(context)
-    arm_id = LaunchConfiguration('arm_id').perform(context)
-    namespace = LaunchConfiguration('namespace').perform(context)
+    from insert.web import resolve_target_arm
+
+    arm_id, namespace, _, _ = resolve_target_arm(
+        FleetConfig(config_file),
+        LaunchConfiguration('arm_id').perform(context),
+        LaunchConfiguration('namespace').perform(context),
+    )
     host = LaunchConfiguration('host').perform(context)
     port = LaunchConfiguration('port').perform(context)
     wrench_source = LaunchConfiguration('wrench_source').perform(context)
@@ -50,8 +55,8 @@ def _launch_nodes(context):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('config_file', default_value=str(default_config_path())),
-        DeclareLaunchArgument('arm_id', default_value='arm_4'),
-        DeclareLaunchArgument('namespace', default_value='/arm_4'),
+        DeclareLaunchArgument('arm_id', default_value=''),
+        DeclareLaunchArgument('namespace', default_value=''),
         DeclareLaunchArgument('host', default_value='127.0.0.1'),
         DeclareLaunchArgument('port', default_value='8092'),
         DeclareLaunchArgument('wrench_source', default_value='paxini'),

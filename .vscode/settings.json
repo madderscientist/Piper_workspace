@@ -5,8 +5,7 @@
   "python.analysis.exclude": [
     "build",
     "install",
-    "log",
-    "src/vendor"
+    "log"
   ],
   "python.analysis.extraPaths": [
     "${workspaceFolder}/src/piper_x_driver",

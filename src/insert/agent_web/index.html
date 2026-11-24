@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PiPER-X · Agent 视觉引导全流程插孔控制台 (arm_4)</title>
+  <title>PiPER-X · Agent 视觉引导全流程插孔控制台</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="brand-badge" id="can-badge">CAN4 · /arm_4</span>
+      <span class="brand-badge" id="can-badge"></span>
       <div class="brand-titles">
         <h1>Agent 视觉引导全流程插孔控制台</h1>
         <p class="subtitle" id="top-subtitle">三机同板标定 · gpt-6.1-sol (max) 双视角识别 · 孔前 0.5 cm 预对准 · 50 Hz 力控插入</p>
@@ -103,7 +103,7 @@
           <span class="card-tag" id="calib-card-badge">待标定</span>
         </div>
         <p class="card-desc">
-          Float 下使腕部相机 <code>camera_arm_4</code> 与 <code>head_1</code>、<code>head_2</code> 同看 ChArUco 标定板，自动解算并保存基座系外参（可多采联合精化）。
+          Float 下使腕部相机 腕部相机 与 <code>head_1</code>、<code>head_2</code> 同看 ChArUco 标定板，自动解算并保存基座系外参（可多采联合精化）。
         </p>
 
         <div class="btn-row">
@@ -434,10 +434,10 @@
 
           <div class="cam-tile">
             <div class="cam-tile-head">
-              <strong>camera_arm_4（腕部相机）</strong>
+              <strong>腕部相机</strong>
               <span class="cam-badge" id="badge-wrist">RTSP 实时</span>
             </div>
-            <img id="live-wrist" src="/api/stream/wrist" data-full="/api/frame/wrist" alt="camera_arm_4 实时画面" class="cam-feed zoomable">
+            <img id="live-wrist" src="/api/stream/wrist" data-full="/api/frame/wrist" alt="腕部相机实时画面" class="cam-feed zoomable">
           </div>
         </div>
       </article>

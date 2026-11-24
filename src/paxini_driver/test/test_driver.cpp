@@ -246,22 +246,15 @@ TEST(PaxiniDriverTest, RosDriverRawCompensationReloadAndShutdown) {
     std::filesystem::temp_directory_path() /
     ("paxini_cpp_test_" + std::to_string(::getpid()));
   std::filesystem::create_directories(tmp_dir);
-  const auto cfg_path = tmp_dir / "px6d.yaml";
-  {
-    std::ofstream ofs(cfg_path);
-    ofs << "sensors:\n  arm_3:\n    namespace: /paxini_cpp_test/arm_3\n";
-  }
-
-  const auto src_cfg = std::filesystem::path(PAXINI_SOURCE_DIR) / "config" / "px6d.yaml";
-  EXPECT_EQ(resolve_sensor_calibration("右手", src_cfg).arm_id, "arm_4");
+  const auto cfg_path = tmp_dir / "px6d_test.yaml";
+  std::filesystem::remove(cfg_path);
 
   rclcpp::init(0, nullptr);
   auto state = std::make_shared<FakeTransport::SharedState>();
   rclcpp::NodeOptions opts;
   opts.arguments({"--ros-args", "-r", "__ns:=/paxini_cpp_test/arm_3"});
   opts.parameter_overrides({
-    rclcpp::Parameter("arm_id", "arm_3"),
-    rclcpp::Parameter("config_file", cfg_path.string()),
+    rclcpp::Parameter("calibration_file", cfg_path.string()),
     rclcpp::Parameter("reconnect_sec", 0.01),
     rclcpp::Parameter("frequency_hz", 200),
   });
@@ -333,8 +326,7 @@ TEST(PaxiniDriverTest, RosDriverRawCompensationReloadAndShutdown) {
 
   {
     std::ofstream ofs(cfg_path);
-    ofs << "sensors:\n  arm_3:\n    namespace: /paxini_cpp_test/arm_3\n"
-        << "    tare_offset: [10.0, -5.0, 20.0, 0.1, -0.2, 0.3]\n";
+    ofs << "tare_offset: [10.0, -5.0, 20.0, 0.1, -0.2, 0.3]\n";
   }
   const auto before_commands = state->commands;
   EXPECT_TRUE(node->reload_config().first);

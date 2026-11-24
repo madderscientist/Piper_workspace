@@ -13,7 +13,6 @@ import rclpy
 from .collector import DEFAULT_PROBE_KP, ProbeCollectorNode, ProbeConfig
 from .identification import (
     GravityIdentificationReport,
-    identify_gripper_payload,
     identify_joint_gravity,
     load_probe_samples_csv,
     save_probe_samples_csv,
@@ -36,20 +35,12 @@ def format_report(report: GravityIdentificationReport) -> str:
         f'  Nominal CAD RMSE = {report.rmse_cad:.5f} Nm',
         f'  Calibrated RMSE  = {report.rmse_calibrated:.5f} Nm',
     ]
-    if report.added_mass_kg is not None:
-        lines += [
-            f'Added gripper mass = {report.added_mass_kg:.6f} kg',
-            f'Total terminal mass = {report.total_effector_mass_kg:.6f} kg',
-            'Extra mass uses the uniform gripper mesh; arm calibration and known parts are retained.',
-        ]
     return '\n'.join(lines)
 
 
 def _fit_for_arm(by_joint, arm_model, fleet, arm_id, **kwargs):
     arm = fleet.arm(arm_id)
     arm_model = arm_model.for_effector(fleet.effectors[arm.end_effector].model)
-    if arm_model.effector_model:
-        return identify_gripper_payload(by_joint, arm_model, **kwargs)
     reports = {}
     for joint, samples in sorted(by_joint.items()):
         report = identify_joint_gravity(samples, **kwargs)

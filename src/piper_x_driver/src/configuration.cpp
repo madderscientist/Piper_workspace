@@ -9,6 +9,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -18,7 +19,6 @@
 #include <sstream>
 #include <stdexcept>
 
-#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <yaml-cpp/yaml.h>
 
 namespace piper_x_driver {
@@ -54,22 +54,11 @@ double bounded(double value, const std::string & name, double lower, double uppe
 }
 
 std::string default_config_path() {
-  try {
-    auto share = std::filesystem::path(
-      ament_index_cpp::get_package_share_directory("piper_x_driver"));
-    auto p = share / "config" / "arms.yaml";
-    if (std::filesystem::exists(p)) {
-      return p.string();
-    }
-  } catch (const std::exception &) {
+  const char * root = std::getenv("PIPER_CONFIG_DIR");
+  if (root == nullptr || *root == '\0') {
+    throw std::runtime_error("PIPER_CONFIG_DIR is not set; source setup_env.bash");
   }
-#ifdef PIPER_X_DRIVER_SOURCE_DIR
-  auto src = std::filesystem::path(PIPER_X_DRIVER_SOURCE_DIR) / "config" / "arms.yaml";
-  if (std::filesystem::exists(src)) {
-    return src.string();
-  }
-#endif
-  throw std::runtime_error("Cannot locate piper_x_driver config/arms.yaml");
+  return (std::filesystem::path(root) / "arms").string();
 }
 
 std::string json_escape(const std::string & s) {
@@ -166,10 +155,6 @@ std::string yaml_strict_string(const YAML::Node & n, const std::string & name) {
   return n.as<std::string>();
 }
 
-bool is_blank(const std::string & s) {
-  return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); });
-}
-
 std::string trim(const std::string & s) {
   size_t b = 0;
   while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) {
@@ -210,88 +195,72 @@ std::string json_effector(const Effector & eff) {
 
 FleetConfig::FleetConfig(const std::string & raw_path) {
   std::error_code ec;
-  auto resolved = std::filesystem::canonical(raw_path, ec);
-  if (ec) {
-    throw std::invalid_argument("Configuration path not found: " + raw_path);
+  const auto resolved = std::filesystem::canonical(raw_path, ec);
+  if (ec || !std::filesystem::is_directory(resolved)) {
+    throw std::invalid_argument("Arm configuration directory not found: " + raw_path);
   }
   path = resolved.string();
-  YAML::Node data = YAML::LoadFile(path);
-  if (!data || !data.IsMap() || !data["version"] || !data["arms"]) {
-    throw std::invalid_argument("Fleet configuration requires version and arms");
-  }
-  for (auto it = data.begin(); it != data.end(); ++it) {
-    const std::string k = it->first.as<std::string>();
-    if (k != "version" && k != "effectors" && k != "arms") {
-      throw std::invalid_argument("Fleet configuration requires version and arms");
-    }
-  }
-  if (!data["version"].IsScalar() || data["version"].Scalar() != "1") {
-    throw std::invalid_argument("Unsupported fleet configuration version");
+
+  for (const auto & kv : terminal_profiles()) {
+    const RigidBody body = terminal_body(kv.first);
+    Effector eff;
+    eff.label = kv.second.label;
+    eff.mass_kg = bounded(body.mass_kg, "mass_kg", 0.0, 2.0);
+    eff.com_m = body.com_m;
+    eff.source = kv.second.source;
+    eff.model = kv.second.model;
+    effectors.emplace(kv.first, std::move(eff));
   }
 
-  static const std::set<std::string> allowed_models = {
-    "piper_description.urdf",
-    "piper_description_with_teach.urdf",
-    "piper_description_with_wrench.urdf",
-    "piper_no_gripper_description.urdf",
-  };
-
-  if (data["effectors"] && !data["effectors"].IsNull()) {
-    has_inline_effectors = true;
-    const YAML::Node profiles = data["effectors"];
-    if (!profiles.IsMap() || profiles.size() == 0) {
-      throw std::invalid_argument("At least one effector profile is required");
-    }
-    static const std::set<std::string> eff_fields = {
-      "label", "mass_kg", "com_m", "source", "model"
-    };
-    for (auto it = profiles.begin(); it != profiles.end(); ++it) {
-      const std::string key = yaml_strict_string(it->first, "effector_key");
-      const YAML::Node p = it->second;
-      if (!p.IsMap() || p.size() != eff_fields.size()) {
-        throw std::invalid_argument("Invalid effector profile");
-      }
-      for (auto pit = p.begin(); pit != p.end(); ++pit) {
-        if (!eff_fields.count(pit->first.as<std::string>())) {
-          throw std::invalid_argument("Invalid effector profile");
-        }
-      }
-      const std::string label = yaml_strict_string(p["label"], "label");
-      const std::string source = yaml_strict_string(p["source"], "source");
-      const std::string model = yaml_strict_string(p["model"], "model");
-      if (is_blank(label) || is_blank(source) || is_blank(model)) {
-        throw std::invalid_argument("Effector string fields must be non-empty");
-      }
-      if (!allowed_models.count(model)) {
-        throw std::invalid_argument("Unsupported visualization model");
-      }
-      Effector eff;
-      eff.label = label;
-      eff.mass_kg = bounded(yaml_strict_number(p["mass_kg"], "mass_kg"), "mass_kg", 0.0, 2.0);
-      eff.com_m = yaml_vector<3>(p["com_m"], "com_m", -0.5, 0.5);
-      eff.source = source;
-      eff.model = model;
-      effectors.emplace(key, std::move(eff));
-    }
-  } else {
-    const auto & profiles = terminal_profiles();
-    for (const auto & kv : profiles) {
-      const RigidBody body = terminal_body(kv.first);
-      Effector eff;
-      eff.label = kv.second.label;
-      eff.mass_kg = bounded(body.mass_kg, "mass_kg", 0.0, 2.0);
-      eff.com_m = body.com_m;
-      eff.source = kv.second.source;
-      eff.model = kv.second.model;
-      effectors.emplace(kv.first, std::move(eff));
+  std::vector<std::filesystem::path> arm_files;
+  for (const auto & entry : std::filesystem::directory_iterator(resolved)) {
+    if (entry.is_regular_file() && entry.path().extension() == ".yaml") {
+      arm_files.push_back(entry.path());
     }
   }
-
-  const YAML::Node arms_node = data["arms"];
-  if (!arms_node.IsSequence() || arms_node.size() != 4) {
-    throw std::invalid_argument("Exactly four configured arms are required");
+  std::sort(arm_files.begin(), arm_files.end());
+  if (arm_files.empty()) {
+    throw std::invalid_argument(
+      "No arm configuration in " + path + "; copy from config/examples/arms");
+  }
+  for (const auto & entry : arm_files) {
+    const auto file = std::filesystem::canonical(entry);
+    std::optional<ArmFrictionModel> f_model;
+    std::optional<ArmGravityModel> g_model;
+    ArmConfig cfg;
+    try {
+      cfg = load_arm(file, f_model, g_model);
+    } catch (const std::invalid_argument & e) {
+      throw std::invalid_argument(file.filename().string() + ": " + e.what());
+    }
+    files[cfg.id] = file.string();
+    friction_models[cfg.id] = f_model;
+    gravity_models[cfg.id] = g_model;
+    arms.push_back(std::move(cfg));
   }
 
+  std::set<std::string> ids, namespaces, ports;
+  for (const auto & a : arms) {
+    ids.insert(a.id);
+    namespaces.insert(a.namespace_str);
+    ports.insert(a.can_port);
+  }
+  if (ids.size() != arms.size()) {
+    throw std::invalid_argument("Duplicate id");
+  }
+  if (namespaces.size() != arms.size()) {
+    throw std::invalid_argument("Duplicate namespace");
+  }
+  if (ports.size() != arms.size()) {
+    throw std::invalid_argument("Duplicate can_port");
+  }
+}
+
+ArmConfig FleetConfig::load_arm(
+  const std::filesystem::path & file,
+  std::optional<ArmFrictionModel> & f_model,
+  std::optional<ArmGravityModel> & g_model) const
+{
   static const std::set<std::string> known_arm_keys = {
     "id", "name", "namespace", "can_port", "end_effector", "gravity_scale", "mounting",
     "kp", "kd", "s_a", "friction_scale", "friction_config", "gravity_config",
@@ -306,204 +275,168 @@ FleetConfig::FleetConfig(const std::string & raw_path) {
   static const std::regex ns_re("^(?:/[A-Za-z_][A-Za-z0-9_]*)+$");
   static const std::regex can_re("^[A-Za-z0-9_.-]{1,15}$");
 
-  for (const auto & raw : arms_node) {
-    if (!raw.IsMap()) {
+  const YAML::Node raw = YAML::LoadFile(file.string());
+  if (!raw.IsMap()) {
+    throw std::invalid_argument("Invalid arm configuration fields");
+  }
+  for (auto it = raw.begin(); it != raw.end(); ++it) {
+    if (!known_arm_keys.count(it->first.as<std::string>())) {
       throw std::invalid_argument("Invalid arm configuration fields");
     }
-    for (auto it = raw.begin(); it != raw.end(); ++it) {
-      if (!known_arm_keys.count(it->first.as<std::string>())) {
-        throw std::invalid_argument("Invalid arm configuration fields");
-      }
+  }
+  for (const auto & req : required_base_keys) {
+    if (!raw[req]) {
+      throw std::invalid_argument("Invalid arm configuration fields");
     }
-    for (const auto & req : required_base_keys) {
-      if (!raw[req]) {
-        throw std::invalid_argument("Invalid arm configuration fields");
-      }
+  }
+  Vec6 kp_vec{};
+  if (raw["debug_kp"]) {
+    const Vec6 legacy_kp = yaml_vector<6>(raw["debug_kp"], "debug_kp", 0.0, 500.0);
+    if (!raw["kp"]) {
+      kp_vec = legacy_kp;
     }
-    Vec6 kp_vec{};
-    if (raw["debug_kp"]) {
-      const Vec6 legacy_kp = yaml_vector<6>(raw["debug_kp"], "debug_kp", 0.0, 500.0);
-      if (!raw["kp"]) {
-        kp_vec = legacy_kp;
-      }
-    }
-    if (raw["kp"]) {
-      kp_vec = yaml_vector<6>(raw["kp"], "kp", 0.0, 500.0);
-    } else if (!raw["debug_kp"]) {
-      throw std::invalid_argument("kp requires 6 values");
-    }
-
-    std::optional<Vec6> raw_kd;
-    if (raw["debug_kd"]) {
-      const Vec6 legacy_kd = yaml_vector<6>(raw["debug_kd"], "debug_kd", -100.0, 100.0);
-      if (!raw["kd"]) {
-        raw_kd = legacy_kd;
-      }
-    }
-    if (raw["kd"]) {
-      raw_kd = yaml_vector<6>(raw["kd"], "kd", -100.0, 100.0);
-    }
-
-    double sa_val = 2.0;
-    if (raw["adaptive_stiffness_scale"]) {
-      const double legacy_sa = bounded(
-        yaml_strict_number(raw["adaptive_stiffness_scale"], "adaptive_stiffness_scale"),
-        "adaptive_stiffness_scale", 0.0, 20.0);
-      if (!raw["s_a"]) {
-        sa_val = legacy_sa;
-      }
-    }
-    if (raw["s_a"]) {
-      sa_val = bounded(yaml_strict_number(raw["s_a"], "s_a"), "s_a", 0.0, 20.0);
-    }
-
-    ArmConfig cfg;
-    cfg.id = yaml_strict_string(raw["id"], "id");
-    cfg.name = yaml_strict_string(raw["name"], "name");
-    cfg.namespace_str = yaml_strict_string(raw["namespace"], "namespace");
-    cfg.can_port = yaml_strict_string(raw["can_port"], "can_port");
-    cfg.end_effector = yaml_strict_string(raw["end_effector"], "end_effector");
-    cfg.mounting = yaml_strict_string(raw["mounting"], "mounting");
-    if (cfg.id.empty() || cfg.name.empty() || cfg.namespace_str.empty() ||
-        cfg.can_port.empty() || cfg.end_effector.empty() || cfg.mounting.empty())
-    {
-      throw std::invalid_argument("Arm identity strings must be non-empty");
-    }
-    if (!std::regex_match(cfg.id, id_re)) {
-      throw std::invalid_argument("Invalid arm id");
-    }
-    if (!std::regex_match(cfg.namespace_str, ns_re)) {
-      throw std::invalid_argument("Invalid arm namespace");
-    }
-    if (!std::regex_match(cfg.can_port, can_re)) {
-      throw std::invalid_argument("Invalid SocketCAN interface");
-    }
-    if (cfg.mounting != "upright") {
-      throw std::invalid_argument("Only upright mounting is supported by this gravity model");
-    }
-    if (!effectors.count(cfg.end_effector)) {
-      throw std::invalid_argument("Unknown end_effector");
-    }
-
-    cfg.gravity_scale = bounded(
-      yaml_strict_number(raw["gravity_scale"], "gravity_scale"), "gravity_scale", 0.0, 1.0);
-    cfg.friction_scale = raw["friction_scale"]
-      ? bounded(
-          yaml_strict_number(raw["friction_scale"], "friction_scale"), "friction_scale", 0.0, 1.0)
-      : 1.0;
-    if (raw["friction_config"] && !raw["friction_config"].IsNull()) {
-      cfg.friction_config = trim(yaml_strict_string(raw["friction_config"], "friction_config"));
-    }
-    if (raw["gravity_config"] && !raw["gravity_config"].IsNull()) {
-      cfg.gravity_config = trim(yaml_strict_string(raw["gravity_config"], "gravity_config"));
-    }
-
-    std::optional<ArmFrictionModel> f_model;
-    if (!cfg.friction_config.empty()) {
-      std::filesystem::path fp(cfg.friction_config);
-      if (!fp.is_absolute()) {
-        fp = std::filesystem::path(path).parent_path() / fp;
-      }
-      std::error_code fec;
-      auto fcanon = std::filesystem::canonical(fp, fec);
-      if (fec) {
-        throw std::invalid_argument("friction_config file not found: " + cfg.friction_config);
-      }
-      f_model = load_friction_model(fcanon.string());
-      cfg.friction_config = fcanon.string();
-    }
-    friction_models[cfg.id] = f_model;
-
-    std::optional<ArmGravityModel> g_model;
-    if (!cfg.gravity_config.empty()) {
-      std::filesystem::path gp(cfg.gravity_config);
-      if (!gp.is_absolute()) {
-        gp = std::filesystem::path(path).parent_path() / gp;
-      }
-      std::error_code gec;
-      auto gcanon = std::filesystem::canonical(gp, gec);
-      if (gec) {
-        throw std::invalid_argument("gravity_config file not found: " + cfg.gravity_config);
-      }
-      g_model = load_gravity_model(gcanon.string());
-      cfg.gravity_config = gcanon.string();
-    }
-    ArmGravityModel base_g = g_model.value_or(ArmGravityModel{cfg.id, {}, "", 0.0});
-    ArmGravityModel candidate = base_g.for_effector(effectors.at(cfg.end_effector).model);
-    if (g_model.has_value() || !candidate.effector_model.empty()) {
-      g_model = candidate;
-    }
-    gravity_models[cfg.id] = g_model;
-
-    const Vec6 auto_kd = max_critical_kd(
-      kp_vec, cfg.end_effector, g_model.has_value() ? &(*g_model) : nullptr);
-    cfg.kp = kp_vec;
-    if (raw_kd.has_value()) {
-      for (size_t i = 0; i < 6; ++i) {
-        cfg.kd[i] = ((*raw_kd)[i] < 0.0) ? auto_kd[i] : (*raw_kd)[i];
-      }
-    } else {
-      cfg.kd = auto_kd;
-    }
-    cfg.s_a = sa_val;
-    cfg.friction_error_epsilon = raw["friction_error_epsilon"]
-      ? bounded(
-          yaml_strict_number(raw["friction_error_epsilon"], "friction_error_epsilon"),
-          "friction_error_epsilon", 0.0, 10.0)
-      : 0.05;
-    cfg.friction_velocity_epsilon = raw["friction_velocity_epsilon"]
-      ? bounded(
-          yaml_strict_number(raw["friction_velocity_epsilon"], "friction_velocity_epsilon"),
-          "friction_velocity_epsilon", 0.0, 100.0)
-      : 0.02;
-    cfg.target_velocity_cutoff_hz = raw["target_velocity_cutoff_hz"]
-      ? bounded(
-          yaml_strict_number(raw["target_velocity_cutoff_hz"], "target_velocity_cutoff_hz"),
-          "target_velocity_cutoff_hz", 0.0, 1000.0)
-      : 5.0;
-    if (cfg.target_velocity_cutoff_hz <= 0.0) {
-      throw std::invalid_argument("target_velocity_cutoff_hz must be finite and positive");
-    }
-    cfg.adaptive_stiffness_b = raw["adaptive_stiffness_b"]
-      ? bounded(
-          yaml_strict_number(raw["adaptive_stiffness_b"], "adaptive_stiffness_b"),
-          "adaptive_stiffness_b", 0.0, 10.0)
-      : 0.08;
-    if (cfg.adaptive_stiffness_b <= 0.0) {
-      throw std::invalid_argument("adaptive_stiffness_b must be finite and positive");
-    }
-    cfg.adaptive_stiffness_power = raw["adaptive_stiffness_power"]
-      ? bounded(
-          yaml_strict_number(raw["adaptive_stiffness_power"], "adaptive_stiffness_power"),
-          "adaptive_stiffness_power", 0.0, 20.0)
-      : 3.0;
-    if (cfg.adaptive_stiffness_power <= 0.0) {
-      throw std::invalid_argument("adaptive_stiffness_power must be finite and positive");
-    }
-    cfg.offset_ramp_s = raw["offset_ramp_s"]
-      ? bounded(
-          yaml_strict_number(raw["offset_ramp_s"], "offset_ramp_s"),
-          "offset_ramp_s", 0.0, 30.0)
-      : 2.0;
-
-    arms.push_back(std::move(cfg));
+  }
+  if (raw["kp"]) {
+    kp_vec = yaml_vector<6>(raw["kp"], "kp", 0.0, 500.0);
+  } else if (!raw["debug_kp"]) {
+    throw std::invalid_argument("kp requires 6 values");
   }
 
-  std::set<std::string> ids, namespaces, ports;
-  for (const auto & a : arms) {
-    ids.insert(a.id);
-    namespaces.insert(a.namespace_str);
-    ports.insert(a.can_port);
+  std::optional<Vec6> raw_kd;
+  if (raw["debug_kd"]) {
+    const Vec6 legacy_kd = yaml_vector<6>(raw["debug_kd"], "debug_kd", -100.0, 100.0);
+    if (!raw["kd"]) {
+      raw_kd = legacy_kd;
+    }
   }
-  if (ids.size() != 4) {
-    throw std::invalid_argument("Duplicate id");
+  if (raw["kd"]) {
+    raw_kd = yaml_vector<6>(raw["kd"], "kd", -100.0, 100.0);
   }
-  if (namespaces.size() != 4) {
-    throw std::invalid_argument("Duplicate namespace");
+
+  double sa_val = 2.0;
+  if (raw["adaptive_stiffness_scale"]) {
+    const double legacy_sa = bounded(
+      yaml_strict_number(raw["adaptive_stiffness_scale"], "adaptive_stiffness_scale"),
+      "adaptive_stiffness_scale", 0.0, 20.0);
+    if (!raw["s_a"]) {
+      sa_val = legacy_sa;
+    }
   }
-  if (ports.size() != 4) {
-    throw std::invalid_argument("Duplicate can_port");
+  if (raw["s_a"]) {
+    sa_val = bounded(yaml_strict_number(raw["s_a"], "s_a"), "s_a", 0.0, 20.0);
   }
+
+  ArmConfig cfg;
+  cfg.id = yaml_strict_string(raw["id"], "id");
+  cfg.name = yaml_strict_string(raw["name"], "name");
+  cfg.namespace_str = yaml_strict_string(raw["namespace"], "namespace");
+  cfg.can_port = yaml_strict_string(raw["can_port"], "can_port");
+  cfg.end_effector = yaml_strict_string(raw["end_effector"], "end_effector");
+  cfg.mounting = yaml_strict_string(raw["mounting"], "mounting");
+  if (cfg.id.empty() || cfg.name.empty() || cfg.namespace_str.empty() ||
+      cfg.can_port.empty() || cfg.end_effector.empty() || cfg.mounting.empty())
+  {
+    throw std::invalid_argument("Arm identity strings must be non-empty");
+  }
+  if (!std::regex_match(cfg.id, id_re)) {
+    throw std::invalid_argument("Invalid arm id");
+  }
+  if (!std::regex_match(cfg.namespace_str, ns_re)) {
+    throw std::invalid_argument("Invalid arm namespace");
+  }
+  if (!std::regex_match(cfg.can_port, can_re)) {
+    throw std::invalid_argument("Invalid SocketCAN interface");
+  }
+  if (cfg.mounting != "upright") {
+    throw std::invalid_argument("Only upright mounting is supported by this gravity model");
+  }
+  if (!effectors.count(cfg.end_effector)) {
+    throw std::invalid_argument("Unknown end_effector");
+  }
+
+  cfg.gravity_scale = bounded(
+    yaml_strict_number(raw["gravity_scale"], "gravity_scale"), "gravity_scale", 0.0, 1.0);
+  cfg.friction_scale = raw["friction_scale"]
+    ? bounded(
+        yaml_strict_number(raw["friction_scale"], "friction_scale"), "friction_scale", 0.0, 1.0)
+    : 1.0;
+  if (raw["friction_config"] && !raw["friction_config"].IsNull()) {
+    cfg.friction_config = trim(yaml_strict_string(raw["friction_config"], "friction_config"));
+  }
+  if (raw["gravity_config"] && !raw["gravity_config"].IsNull()) {
+    cfg.gravity_config = trim(yaml_strict_string(raw["gravity_config"], "gravity_config"));
+  }
+
+  // No path, no file or invalid content all mean the arm is not calibrated.
+  const auto calibration = [&file](std::string & cfg_path, auto loader, auto & model) {
+    if (cfg_path.empty()) {
+      return;
+    }
+    cfg_path = std::filesystem::weakly_canonical(file.parent_path() / cfg_path).string();
+    try {
+      model = loader(cfg_path);
+    } catch (const std::exception &) {
+    }
+  };
+  calibration(cfg.friction_config, load_friction_model, f_model);
+  calibration(cfg.gravity_config, load_gravity_model, g_model);
+  ArmGravityModel base_g = g_model.value_or(ArmGravityModel{cfg.id, {}, "", 0.0});
+  ArmGravityModel candidate = base_g.for_effector(effectors.at(cfg.end_effector).model);
+  if (g_model.has_value() || !candidate.effector_model.empty()) {
+    g_model = candidate;
+  }
+
+  const Vec6 auto_kd = max_critical_kd(
+    kp_vec, cfg.end_effector, g_model.has_value() ? &(*g_model) : nullptr);
+  cfg.kp = kp_vec;
+  if (raw_kd.has_value()) {
+    for (size_t i = 0; i < 6; ++i) {
+      cfg.kd[i] = ((*raw_kd)[i] < 0.0) ? auto_kd[i] : (*raw_kd)[i];
+    }
+  } else {
+    cfg.kd = auto_kd;
+  }
+  cfg.s_a = sa_val;
+  cfg.friction_error_epsilon = raw["friction_error_epsilon"]
+    ? bounded(
+        yaml_strict_number(raw["friction_error_epsilon"], "friction_error_epsilon"),
+        "friction_error_epsilon", 0.0, 10.0)
+    : 0.05;
+  cfg.friction_velocity_epsilon = raw["friction_velocity_epsilon"]
+    ? bounded(
+        yaml_strict_number(raw["friction_velocity_epsilon"], "friction_velocity_epsilon"),
+        "friction_velocity_epsilon", 0.0, 100.0)
+    : 0.02;
+  cfg.target_velocity_cutoff_hz = raw["target_velocity_cutoff_hz"]
+    ? bounded(
+        yaml_strict_number(raw["target_velocity_cutoff_hz"], "target_velocity_cutoff_hz"),
+        "target_velocity_cutoff_hz", 0.0, 1000.0)
+    : 5.0;
+  if (cfg.target_velocity_cutoff_hz <= 0.0) {
+    throw std::invalid_argument("target_velocity_cutoff_hz must be finite and positive");
+  }
+  cfg.adaptive_stiffness_b = raw["adaptive_stiffness_b"]
+    ? bounded(
+        yaml_strict_number(raw["adaptive_stiffness_b"], "adaptive_stiffness_b"),
+        "adaptive_stiffness_b", 0.0, 10.0)
+    : 0.08;
+  if (cfg.adaptive_stiffness_b <= 0.0) {
+    throw std::invalid_argument("adaptive_stiffness_b must be finite and positive");
+  }
+  cfg.adaptive_stiffness_power = raw["adaptive_stiffness_power"]
+    ? bounded(
+        yaml_strict_number(raw["adaptive_stiffness_power"], "adaptive_stiffness_power"),
+        "adaptive_stiffness_power", 0.0, 20.0)
+    : 3.0;
+  if (cfg.adaptive_stiffness_power <= 0.0) {
+    throw std::invalid_argument("adaptive_stiffness_power must be finite and positive");
+  }
+  cfg.offset_ramp_s = raw["offset_ramp_s"]
+    ? bounded(
+        yaml_strict_number(raw["offset_ramp_s"], "offset_ramp_s"),
+        "offset_ramp_s", 0.0, 30.0)
+    : 2.0;
+  return cfg;
 }
 
 const ArmConfig & FleetConfig::arm(const std::string & identifier) const {
@@ -601,7 +534,8 @@ FleetConfig FleetConfig::save_arm(
     throw std::invalid_argument("Unknown end_effector");
   }
 
-  const std::string lock_path = path + ".lock";
+  const std::filesystem::path file = files.at(current.id);
+  const std::string lock_path = file.string() + ".lock";
   const int lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
   if (lock_fd < 0) {
     throw std::runtime_error("Cannot open lock file: " + lock_path);
@@ -619,57 +553,18 @@ FleetConfig FleetConfig::save_arm(
     throw std::runtime_error("Cannot lock configuration file");
   }
 
-  FleetConfig latest(path);
-  if (!(latest.arm(current.id) == current) || latest.effectors != effectors) {
+  if (!(FleetConfig(path).arm(current.id) == current)) {
     throw std::invalid_argument("Configuration changed externally; restart drivers before saving");
   }
 
-  YAML::Node raw_doc = YAML::LoadFile(path);
+  YAML::Node doc = YAML::LoadFile(file.string());
+  doc["end_effector"] = end_effector;
+  doc["gravity_scale"] = gravity_scale;
+  doc["friction_scale"] = next_friction;
   YAML::Emitter out;
-  out << YAML::BeginMap;
-  out << YAML::Key << "version" << YAML::Value << 1;
-  out << YAML::Key << "arms" << YAML::Value << YAML::BeginSeq;
-  for (size_t i = 0; i < latest.arms.size(); ++i) {
-    ArmConfig item = latest.arms[i];
-    const YAML::Node raw_arm = raw_doc["arms"][i];
-    if (item.id == current.id) {
-      item.end_effector = end_effector;
-      item.gravity_scale = gravity_scale;
-      item.friction_scale = next_friction;
-    }
-    out << YAML::BeginMap;
-    out << YAML::Key << "id" << YAML::Value << item.id;
-    out << YAML::Key << "name" << YAML::Value << item.name;
-    out << YAML::Key << "namespace" << YAML::Value << item.namespace_str;
-    out << YAML::Key << "can_port" << YAML::Value << item.can_port;
-    out << YAML::Key << "end_effector" << YAML::Value << item.end_effector;
-    out << YAML::Key << "gravity_scale" << YAML::Value << item.gravity_scale;
-    out << YAML::Key << "mounting" << YAML::Value << item.mounting;
-    out << YAML::Key << "kp" << YAML::Value << std::vector<double>(item.kp.begin(), item.kp.end());
-    out << YAML::Key << "kd" << YAML::Value << std::vector<double>(item.kd.begin(), item.kd.end());
-    out << YAML::Key << "s_a" << YAML::Value << item.s_a;
-    out << YAML::Key << "friction_scale" << YAML::Value << item.friction_scale;
-    for (const auto * field : {"friction_config", "gravity_config"}) {
-      out << YAML::Key << field << YAML::Value
-          << (raw_arm[field] && !raw_arm[field].IsNull()
-              ? yaml_strict_string(raw_arm[field], field) : "");
-    }
-    out << YAML::Key << "friction_error_epsilon" << YAML::Value << item.friction_error_epsilon;
-    out << YAML::Key << "friction_velocity_epsilon" << YAML::Value << item.friction_velocity_epsilon;
-    out << YAML::Key << "target_velocity_cutoff_hz" << YAML::Value << item.target_velocity_cutoff_hz;
-    out << YAML::Key << "adaptive_stiffness_b" << YAML::Value << item.adaptive_stiffness_b;
-    out << YAML::Key << "adaptive_stiffness_power" << YAML::Value << item.adaptive_stiffness_power;
-    out << YAML::Key << "offset_ramp_s" << YAML::Value << item.offset_ramp_s;
-    out << YAML::EndMap;
-  }
-  out << YAML::EndSeq;
-  if (latest.has_inline_effectors && raw_doc["effectors"]) {
-    out << YAML::Key << "effectors" << YAML::Value << raw_doc["effectors"];
-  }
-  out << YAML::EndMap;
+  out << doc;
 
-  std::filesystem::path target_path(path);
-  std::string tmpl = (target_path.parent_path() / ".arms-XXXXXX").string();
+  std::string tmpl = (file.parent_path() / ("." + file.stem().string() + "-XXXXXX")).string();
   std::vector<char> buf(tmpl.begin(), tmpl.end());
   buf.push_back('\0');
   const int tmp_fd = ::mkstemp(buf.data());
@@ -687,20 +582,21 @@ FleetConfig FleetConfig::save_arm(
     ::fsync(tmp_fd);
     ::close(tmp_fd);
 
-    FleetConfig updated(tmp_path);
+    std::optional<ArmFrictionModel> f_check;
+    std::optional<ArmGravityModel> g_check;
+    load_arm(tmp_path, f_check, g_check);
     struct stat st{};
-    if (::stat(path.c_str(), &st) == 0) {
+    if (::stat(file.c_str(), &st) == 0) {
       ::chmod(tmp_path.c_str(), st.st_mode & 0777);
     }
-    if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    if (::rename(tmp_path.c_str(), file.c_str()) != 0) {
       throw std::runtime_error("Failed to atomically replace configuration file");
     }
-    updated.path = path;
-    return updated;
   } catch (...) {
     ::unlink(tmp_path.c_str());
     throw;
   }
+  return FleetConfig(path);
 }
 
 }  // namespace piper_x_driver

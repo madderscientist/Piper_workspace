@@ -19,8 +19,8 @@ const STUDIO_LAYER_RATE_DEFS = [
   {key: "wrench_pub_hz", label: "末端六维力 (end_wrench_stamped)"},
 ];
 const cards = [];
-const histories = Array.from({length: 4}, () => Array.from({length: 6}, () => []));
-const wrenchHistories = Array.from({length: 4}, () => Array.from({length: 6}, () => []));
+const histories = [];
+const wrenchHistories = [];
 const WRENCH_AXES = [
   {label: "Fx · N", title: "Fx (N)", scale: 30, color: "#0d766e", kind: "force"},
   {label: "Fy · N", title: "Fy (N)", scale: 30, color: "#0f8a5f", kind: "force"},
@@ -29,9 +29,8 @@ const WRENCH_AXES = [
   {label: "My · N·m", title: "My (N·m)", scale: 5, color: "#7840b0", kind: "torque"},
   {label: "Mz · N·m", title: "Mz (N·m)", scale: 5, color: "#b52668", kind: "torque"},
 ];
-const powerRequests = Object.fromEntries(["enable", "disable"].map(action => [
-  action, Array.from({length: 4}, () => ({pending: false, error: "", requestBefore: null, startedAt: 0})),
-]));
+const powerRequests = {enable: [], disable: []};
+const armLabels = [];
 let lastSnapshot = null;
 let lastSuccess = 0;
 let studioIndex = 0;
@@ -97,13 +96,28 @@ function setStudioJointTargetInputs(j, deg) {
   }
 }
 
-function createCards() {
+function createCards(arms) {
   const template = document.querySelector("#arm-template");
-  for (let index = 0; index < 4; index++) {
+  const tabsWrap = document.querySelector("#studio-arm-tabs");
+  document.querySelector("#online-total").textContent = `/ ${arms.length}`;
+  for (let index = 0; index < arms.length; index++) {
+    const label = (arms[index].namespace.match(/(\d+)$/)?.[1] ?? String(index + 1)).padStart(2, "0");
+    armLabels.push(label);
+    histories.push(Array.from({length: 6}, () => []));
+    wrenchHistories.push(Array.from({length: 6}, () => []));
+    for (const action of ["enable", "disable"]) {
+      powerRequests[action].push({pending: false, error: "", requestBefore: null, startedAt: 0});
+    }
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.className = "studio-arm-tab";
+    tab.textContent = `${label} 机械臂 ${label}`;
+    tab.addEventListener("click", () => openStudio(index));
+    tabsWrap?.append(tab);
     const card = template.content.firstElementChild.cloneNode(true);
-    card.querySelector(".arm-index").textContent = String(index + 1).padStart(2, "0");
-    card.querySelector("h2").textContent = `机械臂 ${String(index + 1).padStart(2, "0")}`;
-    card.querySelector(".namespace").textContent = `/arm_${index + 1}`;
+    card.querySelector(".arm-index").textContent = label;
+    card.querySelector("h2").textContent = `机械臂 ${label}`;
+    card.querySelector(".namespace").textContent = arms[index].namespace;
     window.PiperControls.bind(card, index, () => ({
       snapshot: lastSnapshot,
       online: Boolean(lastSnapshot && performance.now() - lastSuccess <= 2500),
@@ -554,15 +568,6 @@ function openStudio(index) {
 function initStudio() {
   const dialog = document.querySelector("#arm-studio");
   if (!dialog) return;
-  const tabsWrap = document.querySelector("#studio-arm-tabs");
-  for (let i = 0; i < 4; i++) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "studio-arm-tab";
-    btn.textContent = `0${i + 1} 机械臂 ${i + 1}`;
-    btn.addEventListener("click", () => openStudio(i));
-    tabsWrap.append(btn);
-  }
   document.querySelector("#studio-close-btn").addEventListener("click", () => dialog.close());
   document.querySelector("#studio-power-btn").addEventListener("click", () => {
     const arm = lastSnapshot?.arms[studioIndex];
@@ -914,8 +919,8 @@ function renderStudio(snapshot, backendOnline) {
     studioInitializedArm = studioIndex;
   }
   document.querySelectorAll(".studio-arm-tab").forEach((btn, idx) => {
-    const cfgName = snapshot.arms[idx]?.control?.configuration?.name || `机械臂 ${idx + 1}`;
-    btn.textContent = `0${idx + 1} ${cfgName}`;
+    const cfgName = snapshot.arms[idx]?.control?.configuration?.name || `机械臂 ${armLabels[idx]}`;
+    btn.textContent = `${armLabels[idx]} ${cfgName}`;
     btn.classList.toggle("active", idx === studioIndex);
   });
   const cfg = arm.control?.configuration;
@@ -930,12 +935,12 @@ function renderStudio(snapshot, backendOnline) {
   const action = nextPowerAction(arm, studioIndex, backendOnline);
   const pBtn = document.querySelector("#studio-power-btn");
   pBtn.dataset.action = action;
-  pBtn.textContent = `${action === "enable" ? "使能" : "失能"}机械臂 ${studioIndex + 1}`;
+  pBtn.textContent = `${action === "enable" ? "使能" : "失能"}机械臂 ${armLabels[studioIndex]}`;
   pBtn.disabled = cards[studioIndex]?.querySelector(".power-button")?.disabled ?? true;
 
   document.querySelector("#studio-hud-title").textContent = cfg
     ? `${cfg.name} (${arm.namespace} · ${cfg.can_port})`
-    : `机械臂 0${studioIndex + 1} (${arm.namespace})`;
+    : `机械臂 ${armLabels[studioIndex]} (${arm.namespace})`;
   document.querySelector("#studio-hud-pose").textContent = arm.pose
     ? `XYZ: [${arm.pose.position_mm.map(v => v.toFixed(1)).join(", ")}] mm · RPY: [${arm.pose.rpy_deg.map(v => v.toFixed(1)).join(", ")}]°`
     : "法兰位姿：等待 end_pose_stamped";
@@ -1026,7 +1031,7 @@ function renderStudio(snapshot, backendOnline) {
       targetPose: studioTargetPose,
       wrench: wrenchArr,
       gripper: arm.joints?.gripper_m ?? 0.02,
-      effector: cfg?.end_effector || (studioIndex < 2 ? "teaching_handle" : "gripper_with_wrench"),
+      effector: cfg?.end_effector || "gripper",
       cameraCalib: camCalib,
     });
   }
@@ -1214,10 +1219,11 @@ function reportConnection(online, error = "") {
     notice.textContent = `监控服务连接中断，正在自动重连。所有数值均为历史数据，不代表当前状态。${error ? `（${error}）` : ""}`;
   } else {
     const live = lastSnapshot.arms.filter(arm => arm.connection === "live").length;
-    notice.hidden = live === 4;
+    const total = lastSnapshot.arms.length;
+    notice.hidden = live === total;
     notice.textContent = live === 0
-      ? "尚无完整 Piper 遥测。请检查 CAN 已激活，并启动 /arm_1～/arm_4 下的 ROS 驱动。仅连接硬件不会自动产生 ROS 话题；缺失值显示为 —，不按零值处理。"
-      : `当前 ${live} / 4 台 ROS 遥测完整，其余设备存在缺失或过期话题。展开设备行内的“话题与时效”可查看详情。`;
+      ? `尚无完整 Piper 遥测。请检查 CAN 已激活，并启动 ${lastSnapshot.arms.map(arm => arm.namespace).join("、")} 下的 ROS 驱动。仅连接硬件不会自动产生 ROS 话题；缺失值显示为 —，不按零值处理。`
+      : `当前 ${live} / ${total} 台 ROS 遥测完整，其余设备存在缺失或过期话题。展开设备行内的“话题与时效”可查看详情。`;
   }
 }
 
@@ -1228,7 +1234,9 @@ async function refresh() {
     const response = await fetch("/api/status", {signal: controller.signal, cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const snapshot = await response.json();
-    if (!Array.isArray(snapshot.arms) || snapshot.arms.length !== 4) throw new Error("遥测响应格式无效");
+    if (!Array.isArray(snapshot.arms) || !snapshot.arms.length ||
+        (cards.length && snapshot.arms.length !== cards.length)) throw new Error("遥测响应格式无效");
+    if (!cards.length) createCards(snapshot.arms);
     lastSnapshot = snapshot;
     lastSuccess = performance.now();
     render(snapshot, true);
@@ -1242,7 +1250,6 @@ async function refresh() {
   }
 }
 
-createCards();
 initStudio();
 setInterval(() => {
   document.querySelector("#clock").textContent = new Date().toLocaleTimeString("zh-CN", {hour12: false});

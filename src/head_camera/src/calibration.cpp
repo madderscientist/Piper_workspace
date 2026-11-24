@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -10,7 +11,6 @@
 #include <sstream>
 #include <stdexcept>
 
-#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <opencv2/aruco.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -103,17 +103,33 @@ void append_profile_json(
 }
 }  // namespace
 
-fs::path default_intrinsic_path()
+fs::path default_intrinsic_path(const std::string & camera_name)
 {
-  try {
-    const fs::path share(ament_index_cpp::get_package_share_directory("head_camera"));
-    const fs::path anchor = share / "config" / "head_camera.yaml";
-    if (fs::exists(anchor)) {
-      return fs::canonical(anchor).parent_path() / "intrinsic.yaml";
-    }
-  } catch (...) {
+  const char * root = std::getenv("PIPER_CONFIG_DIR");
+  if (!root || !*root) {
+    throw std::runtime_error("PIPER_CONFIG_DIR is not set; pass --intrinsic explicitly");
   }
-  return fs::absolute("src/head_camera/config/intrinsic.yaml");
+  const std::string stem = camera_name.empty() ? "head_camera" : camera_name;
+  return fs::path(root) / "calibration" / (stem + ".yaml");
+}
+
+fs::path resolve_intrinsic_path(const Options & options)
+{
+  if (!options.intrinsic_file.empty()) {
+    return options.intrinsic_file;
+  }
+  for (const auto & spec : options.cameras) {
+    const bool match_name = !options.camera_name.empty() && spec.name == options.camera_name;
+    const bool match_sel = !options.camera.empty() &&
+      (spec.name == options.camera || (!spec.serial.empty() && spec.serial == options.camera));
+    const bool match_ser = !options.serial.empty() && spec.serial == options.serial;
+    if ((match_name || match_sel || match_ser) && !spec.calibration_file.empty()) {
+      return spec.calibration_file;
+    }
+  }
+  const std::string name = !options.camera_name.empty() ? options.camera_name :
+    (!options.camera.empty() ? options.camera : options.serial);
+  return default_intrinsic_path(name);
 }
 
 std::string normalize_dictionary_name(const std::string & name, int needed_markers)
@@ -474,11 +490,16 @@ IntrinsicProfile load_intrinsic_profile(
   IntrinsicProfile result;
   result.width = width;
   result.height = height;
-  if (!fs::exists(path)) {
+  if (path.empty() || !fs::exists(path)) {
     return result;
   }
-  const auto root = YAML::LoadFile(path.string());
-  if (!root.IsMap()) {
+  YAML::Node root;
+  try {
+    root = YAML::LoadFile(path.string());
+  } catch (...) {
+    return result;
+  }
+  if (!root || !root.IsMap()) {
     return result;
   }
   BoardConfig board;
@@ -571,8 +592,7 @@ IntrinsicProfile calibrate_directory(const Options & options)
     });
   }
   const auto solved = solve_charuco(board, shots);
-  const fs::path target = options.intrinsic_file.empty() ?
-    default_intrinsic_path() : options.intrinsic_file;
+  const fs::path target = resolve_intrinsic_path(options);
   std::string cam_key = !options.serial.empty() ? options.serial : options.camera;
   for (const auto & spec : options.cameras) {
     if (spec.name == cam_key && !spec.serial.empty()) {
@@ -587,10 +607,21 @@ IntrinsicProfile calibrate_directory(const Options & options)
 
 CalibrationManager::CalibrationManager(
   const fs::path & intrinsic_file, const fs::path & output_root, const std::string & camera_key)
-: intrinsic_file_(intrinsic_file.empty() ? default_intrinsic_path() : intrinsic_file),
+: intrinsic_file_(intrinsic_file.empty() ? default_intrinsic_path(camera_key) : intrinsic_file),
   output_root_(output_root),
   camera_key_(camera_key.empty() ? "default" : camera_key)
 {
+  try {
+    const auto cfg = YAML::LoadFile(default_config_path().string());
+    if (const auto b = cfg["board"]; b && b.IsMap()) {
+      if (b["squares_x"]) board_.squares_x = b["squares_x"].as<int>();
+      if (b["squares_y"]) board_.squares_y = b["squares_y"].as<int>();
+      if (b["square_size"]) board_.square_size = b["square_size"].as<double>();
+      if (b["marker_size"]) board_.marker_size = b["marker_size"].as<double>();
+      if (b["dictionary"]) board_.dictionary = b["dictionary"].as<std::string>();
+    }
+  } catch (...) {
+  }
   try {
     load_intrinsic_profile(intrinsic_file_, 0, 0, &board_, camera_key_);
     board_.dictionary = normalize_dictionary_name(
