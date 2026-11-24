@@ -93,7 +93,6 @@ def test_arm_files_define_arms_and_relative_calibration_paths(fleet_path, monkey
     ('end_effector', 'unknown'), ('mounting', 'sideways'),
     ('can_port', '../can0'), ('namespace', '/bad name'),
     ('kp', [-1.0] * 6), ('kd', [101.0] * 6), ('s_a', -0.1),
-    ('debug_kp', [-1.0] * 6), ('debug_kd', [101.0] * 6),
 ])
 def test_invalid_configuration_is_rejected(fleet_path, field, value):
     edit_arm(fleet_path, 'arm_1', **{field: value})

@@ -14,9 +14,9 @@ import numpy as np
 import yaml
 
 from wrist_camera.board import Detection
+from wrist_camera.rtsp import _scale_intrinsic, load_camera_calibration
 
 _PNG = [cv2.IMWRITE_PNG_COMPRESSION, 0]
-_SECTIONS = ('intrinsics', 'extrinsics', 'profile_relations')
 VERSION = 1
 
 
@@ -194,27 +194,13 @@ class Store:
         self._poses_cache.pop(camera, None)
 
     def read_calibration(self) -> dict:
-        if self.calib_file.is_file():
+        try:
             mtime_ns = self.calib_file.stat().st_mtime_ns
-            if self._calib_cache[0] == mtime_ns:
-                return dict(self._calib_cache[1])
-            try:
-                raw = yaml.safe_load(self.calib_file.read_text(encoding='utf-8'))
-            except (OSError, yaml.YAMLError):
-                raw = {}
-            data = raw if isinstance(raw, dict) else {}
-        else:
+        except OSError:
             mtime_ns = None
-            data = {}
-        data.setdefault('version', VERSION)
-        if not isinstance(data.get('intrinsics'), list):
-            data['intrinsics'] = []
-        if not isinstance(data.get('extrinsics'), dict):
-            data['extrinsics'] = None
-        if not isinstance(data.get('profile_relations'), list):
-            data['profile_relations'] = []
-        self._calib_cache = (mtime_ns, data)
-        return data
+        if mtime_ns is None or self._calib_cache[0] != mtime_ns:
+            self._calib_cache = (mtime_ns, {'version': VERSION, **load_camera_calibration(self.calib_file)})
+        return dict(self._calib_cache[1])
 
     def write_calibration(self, data: dict) -> str:
         data = dict(data)
@@ -226,7 +212,7 @@ class Store:
         self._calib_cache = (self.calib_file.stat().st_mtime_ns, data)
         return str(self.calib_file)
 
-    def put_intrinsic(self, camera: str, result: dict, extra: dict | None = None) -> str:
+    def put_intrinsic(self, result: dict, extra: dict | None = None) -> str:
         data = self.read_calibration()
         entry = {
             'width': result['width'], 'height': result['height'],
@@ -245,7 +231,7 @@ class Store:
         data['intrinsics'] = entries
         return self.write_calibration(data)
 
-    def put_profile_relation(self, camera: str, relation: dict) -> str:
+    def put_profile_relation(self, relation: dict) -> str:
         data = self.read_calibration()
         relations = [r for r in data['profile_relations']
                      if (r['from'], r['to']) != (relation['from'], relation['to'])]
@@ -253,13 +239,13 @@ class Store:
         data['profile_relations'] = relations
         return self.write_calibration(data)
 
-    def put_extrinsic(self, camera: str, entry: dict) -> str:
+    def put_extrinsic(self, entry: dict) -> str:
         data = self.read_calibration()
         data['extrinsics'] = {**entry, 'stamp': _stamp()}
         return self.write_calibration(data)
 
 
-def find_intrinsic(data: dict, camera: str, width: int, height: int,
+def find_intrinsic(data: dict, width: int, height: int,
                    allow_scale: bool = True) -> dict | None:
     entries = data.get('intrinsics') or []
     for entry in entries:
@@ -275,23 +261,8 @@ def find_intrinsic(data: dict, camera: str, width: int, height: int,
             continue
         for entry in entries:
             if (entry['width'], entry['height']) == source:
-                return _scale_entry(entry, width, height, source)
+                return _scale_intrinsic(entry, width, height)
     return None
-
-
-def _scale_entry(entry: dict, width: int, height: int, source) -> dict:
-    ratio_x = width / source[0]
-    ratio_y = height / source[1]
-    matrix = np.asarray(entry['camera_matrix'], float).reshape(3, 3).copy()
-    matrix[0, :] *= ratio_x
-    matrix[1, :] *= ratio_y
-    scaled = dict(entry)
-    scaled.update({
-        'width': width, 'height': height,
-        'camera_matrix': [float(v) for v in matrix.reshape(9)],
-        'scaled_from': list(source),
-    })
-    return scaled
 
 
 def _imread(path: Path):

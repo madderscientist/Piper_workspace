@@ -19,7 +19,6 @@ from wrist_camera import (
     get_extrinsic,
     get_intrinsics,
     grab_frame,
-    load_camera_info,
     piper_fk,
     resolve_arm_camera,
     resolve_camera_selection,
@@ -97,7 +96,7 @@ def test_intrinsics_extrinsics_pose_and_wrist_camera_reader(tmp_path, monkeypatc
     }), encoding='utf-8')
 
     intr_1080 = get_intrinsics('arm_4', stream='stream0', config_file=cam_dir)
-    intr_480 = load_camera_info('cam4', 720, 480, calib_file=calib_file)
+    intr_480 = get_intrinsics('cam4', width=720, height=480, calib_file=calib_file)
     assert intr_1080 is not None and (intr_1080['width'], intr_1080['height']) == (1920, 1080)
     assert intr_480 is not None and (intr_480['width'], intr_480['height']) == (720, 480)
 

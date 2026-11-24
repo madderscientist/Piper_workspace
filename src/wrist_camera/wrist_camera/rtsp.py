@@ -122,26 +122,6 @@ def load_cameras_config(config_file: str | Path | None = None) -> dict[str, dict
     return cameras
 
 
-def load_calibrations(config_file: str | Path | None = None) -> dict[str, Any]:
-    """聚合所有已配置相机的标定数据。"""
-    intrinsics: dict[str, list[dict[str, Any]]] = {}
-    extrinsics: dict[str, dict[str, Any]] = {}
-    profile_relations: dict[str, list[dict[str, Any]]] = {}
-    for name, cfg in load_cameras_config(config_file).items():
-        cal = load_camera_calibration(cfg.get('calibration_file'))
-        if cal['intrinsics']:
-            intrinsics[name] = cal['intrinsics']
-        if cal['extrinsics']:
-            extrinsics[name] = cal['extrinsics']
-        if cal['profile_relations']:
-            profile_relations[name] = cal['profile_relations']
-    return {
-        'intrinsics': intrinsics,
-        'extrinsics': extrinsics,
-        'profile_relations': profile_relations,
-    }
-
-
 def resolve_arm_camera(selector: str, config_file: str | Path | None = None) -> dict[str, Any]:
     """按机械臂名、相机别名或 IP 解析单个腕部相机配置。"""
     key = str(selector or '').strip().lower()
@@ -295,36 +275,6 @@ def get_intrinsics(
     return _scale_intrinsic(best, width, height)
 
 
-def load_camera_info(
-    camera_or_path: str | Path,
-    camera_or_width: str | int = 0,
-    width_or_height: int = 0,
-    height: int = 0,
-    *,
-    stream: str = '',
-    calib_file: str | Path | None = None,
-    allow_scale: bool = True,
-) -> dict[str, Any] | None:
-    """兼容免路径调用 load_camera_info('arm_4', 1920, 1080) 与旧签名 load_camera_info(path, 'arm_4', 1920, 1080)。"""
-    if isinstance(camera_or_width, str):
-        return get_intrinsics(
-            camera_or_width,
-            width=int(width_or_height),
-            height=int(height),
-            stream=stream,
-            calib_file=camera_or_path,
-            allow_scale=allow_scale,
-        )
-    return get_intrinsics(
-        str(camera_or_path),
-        width=int(camera_or_width),
-        height=int(width_or_height),
-        stream=stream,
-        calib_file=calib_file,
-        allow_scale=allow_scale,
-    )
-
-
 def get_extrinsic(
     camera: str,
     *,
@@ -334,9 +284,6 @@ def get_extrinsic(
     """读取指定腕部相机的手眼外参字典（gripper_base_top -> camera_optical），不存在返回 None。"""
     entry = _calibration_for(camera, calib_file, config_file)['extrinsics']
     return dict(entry) if isinstance(entry, dict) else None
-
-
-load_camera_extrinsic = get_extrinsic
 
 
 def extrinsic_matrix(

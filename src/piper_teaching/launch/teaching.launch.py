@@ -14,6 +14,7 @@ def _teaching(context):
         + '/config/bilateral_teaching.yaml',
         {
             'config_file': LaunchConfiguration('config_file'),
+            'pairs': ParameterValue(LaunchConfiguration('pairs'), value_type=str),
         },
         {
             name: ParameterValue(LaunchConfiguration(name), value_type=bool)
@@ -35,6 +36,7 @@ def _teaching(context):
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument('pairs', description='master:slave[,master:slave], e.g. arm_2:arm_4'),
         DeclareLaunchArgument('mode', default_value=''),
         DeclareLaunchArgument('dry_run', default_value='true'),
         DeclareLaunchArgument('auto_start', default_value='true'),

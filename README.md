@@ -136,7 +136,7 @@ config/
   env.bash                                # 本机环境，如 ROS_DOMAIN_ID
 ```
 
-- 驱动、Dashboard、示教、重力/摩擦标定页面只加载 `config/arms/` 中的臂；示教只运行两端都在本机的主从对（`1↔3`、`2↔4`）。
+- 驱动、Dashboard、示教、重力/摩擦标定页面只加载 `config/arms/` 中的臂；示教配对由启动参数 `pairs:=主臂:从臂[,...]` 指定。
 - 外设单向引用机械臂（如 `arm: arm_4`），机械臂文件不引用外设。
 - 臂与外设文件中的标定路径均相对所在文件解析。**未配置、文件不存在或内容无法解析，均视为未标定**。
 - 运行中在 Dashboard 修改末端或补偿系数，只改写对应臂自己的文件。
@@ -203,7 +203,7 @@ ros2 run piper_friction web --port 8090  # 关节：http://127.0.0.1:8090/  夹�
 | PX6D 六维力传感器 | `config/paxini_driver/*.yaml` → `config/calibration/` | [px6d.yaml](src/paxini_driver/config/px6d.yaml) | `ros2 run paxini_driver calibrate --arm <臂> run`，见 [README](src/paxini_driver/README.md) |
 | 腕部相机 | `config/wrist_camera/*.yaml` → `config/calibration/` | [board.yaml](src/wrist_camera/config/board.yaml) | `ros2 run wrist_camera calibrate --arm <臂>`，见 [README](src/wrist_camera/README.md) |
 | 头部相机 | `config/head_camera/*.yaml` → `config/calibration/` | [head_camera.yaml](src/head_camera/config/head_camera.yaml) | `ros2 run head_camera head_camera calibrate ...`，见 [README](src/head_camera/README.md) |
-| 示教配对参数 | — | [bilateral_teaching.yaml](src/piper_teaching/config/bilateral_teaching.yaml) | — |
+| 示教耦合参数 | 启动参数 `pairs` | [bilateral_teaching.yaml](src/piper_teaching/config/bilateral_teaching.yaml) | — |
 | 插孔任务外参 | `src/insert/config/extrinsics.yaml` | — | 见 [README](src/insert/README.md) |
 | CogACT 客户端 | `src/piperx_cogact_client/config/calibration.yaml` | [default.yaml](src/piperx_cogact_client/config/default.yaml) | 见 [README](src/piperx_cogact_client/README.md) |
 
@@ -218,8 +218,8 @@ ros2 launch piper_x_driver all_arms.launch.py
 # 终端 2：启动 Web Dashboard（浏览器打开 http://127.0.0.1:8089/）
 ros2 run state_dashboard state_dashboard --port 8089
 
-# 终端 3：启动四臂示教（默认 dry_run:=true 仅预览；正式运行加 dry_run:=false）
-ros2 launch piper_teaching teaching.launch.py
+# 终端 3：启动示教（pairs 指定主臂:从臂；默认 dry_run:=true 仅预览，正式运行加 dry_run:=false）
+ros2 launch piper_teaching teaching.launch.py pairs:=arm_2:arm_4
 
 # 四臂一键彻底断电失能
 ros2 launch piper_x_driver power_off.launch.py

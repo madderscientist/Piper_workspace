@@ -131,7 +131,7 @@ def test_dashboard_single_arm_extrinsic_workflow(tmp_path, board, flat):
         k_mat = np.array([[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]])
         d_vec = np.zeros(5)
         size = (1280, 720)
-        app.store.put_intrinsic('camera_arm_3', {
+        app.store.put_intrinsic({
             'width': 1280, 'height': 720,
             'camera_matrix': k_mat.reshape(9).tolist(),
             'distortion_model': 'plumb_bob',

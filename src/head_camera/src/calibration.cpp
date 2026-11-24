@@ -517,8 +517,6 @@ IntrinsicProfile load_intrinsic_profile(
   YAML::Node profiles;
   if (const auto cams = root["cameras"]; cams && cams.IsMap() && cams[key] && cams[key]["profiles"]) {
     profiles = cams[key]["profiles"];
-  } else if (root["profiles"] && root["profiles"].IsMap()) {
-    profiles = root["profiles"];
   }
   if (!profiles || !profiles.IsMap()) {
     return result;

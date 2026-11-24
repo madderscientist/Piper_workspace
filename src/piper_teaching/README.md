@@ -13,34 +13,36 @@
 
 先确保 `ros2 launch piper_x_driver all_arms.launch.py` 已在同一 `ROS_DOMAIN_ID` 下运行：
 
+配对由必填启动参数 `pairs:=主臂:从臂[,主臂:从臂]` 指定，臂 id 须在 `config/arms/` 中且互不重复：
+
 ```bash
 # 预览模式（默认 dry_run:=true，仅发布配对参考，不操作电机）
-ros2 launch piper_teaching teaching.launch.py
+ros2 launch piper_teaching teaching.launch.py pairs:=arm_2:arm_4
 
-# 正式启动主从示教（1、2 主臂重力补偿，分别控制 3、4 从臂）
-ros2 launch piper_teaching teaching.launch.py dry_run:=false mode:=master_slave
+# 正式启动主从示教（主臂重力补偿，控制对应从臂）
+ros2 launch piper_teaching teaching.launch.py pairs:=arm_1:arm_3,arm_2:arm_4 dry_run:=false mode:=master_slave
 
-# 正式启动双向耦合示教（1↔3、2↔4 双向跟随）
-ros2 launch piper_teaching teaching.launch.py dry_run:=false mode:=bilateral
+# 正式启动双向耦合示教（配对臂双向跟随）
+ros2 launch piper_teaching teaching.launch.py pairs:=arm_1:arm_3,arm_2:arm_4 dry_run:=false mode:=bilateral
 ```
 
-可通过 `ros2 topic echo /bilateral_teaching/state` 查看状态，各臂参考目标同时发布在 `/bilateral_teaching/arm_1/target`～`arm_4/target`。
+可通过 `ros2 topic echo /bilateral_teaching/state` 查看状态，各臂参考目标同时发布在 `/bilateral_teaching/<臂>/target`。
 
 正式模式流程（`idle → enabling → preloading → starting → engaging → active`）：
 
-1. 等待四臂反馈正常并确认使能。
+1. 等待所有配对臂反馈正常并确认使能。
 2. 保持配置的 `kp / kd` 进入 **engaging** 对齐阶段：
-   - `master_slave`：主臂 `arm_1`、`arm_2` 锁定在初始位置，从臂 `arm_3`、`arm_4` 以 **24°/s** 靠近主臂位置。
-   - `bilateral`：配对臂 `1↔3`、`2↔4` 以 **24°/s** 相互靠近至初始位置中点。
+   - `master_slave`：主臂锁定在初始位置，从臂以 **24°/s** 靠近主臂位置。
+   - `bilateral`：配对臂以 **24°/s** 相互靠近至初始位置中点。
 3. 对齐完成后自动进入 **active**：
    - `master_slave`：主臂下发 `kp=0, kd=0, velocity=0` 且夹爪零力释放，驱动因 `kd` 低于 CAN 最小步进阈值自动切换为 `t_ff` 力矩偏置重力补偿，实现零刚度自由拖动；从臂以 `kp / kd`（位置折合+超限余量偏置补偿）跟随主臂位置 `p`、速度 `dp` 与夹爪开度。
-   - `bilateral`：配对臂按 `1↔3`、`2↔4` 双向交换关节位置、速度与夹爪开度。
+   - `bilateral`：配对臂双向交换关节位置、速度与夹爪开度。
 
 运行过程中在示教终端或驱动终端按 **回车（Enter）**，可重新执行完整初始化流程。
 也可显式关闭自动开始并手动触发：
 
 ```bash
-ros2 launch piper_teaching teaching.launch.py dry_run:=false auto_start:=false
+ros2 launch piper_teaching teaching.launch.py pairs:=arm_2:arm_4 dry_run:=false auto_start:=false
 ros2 service call /bilateral_teaching/start std_srvs/srv/Trigger '{}'
 ```
 
@@ -50,16 +52,17 @@ ros2 service call /bilateral_teaching/start std_srvs/srv/Trigger '{}'
 ros2 service call /bilateral_teaching/stop std_srvs/srv/Trigger '{}'
 ```
 
-- **上层停止（调用 `/bilateral_teaching/stop` 或 `Ctrl+C` 退出 `teaching.launch.py`）**：停止发布耦合指令，四臂驱动保持在 `mit` 重力补偿模式。
+- **上层停止（调用 `/bilateral_teaching/stop` 或 `Ctrl+C` 退出 `teaching.launch.py`）**：停止发布耦合指令，各臂驱动保持在 `mit` 重力补偿模式。
 - **驱动退出（`Ctrl+C` 退出 `all_arms.launch.py`）**：底层自动切换到固件原生零力拖动（`drag`）模式。
 - **彻底断电**：运行 `ros2 launch piper_x_driver power_off.launch.py` 或调用 `enable_srv(False)`。
 
 ## 3. 配置参数
 
-配对耦合参数位于 [bilateral_teaching.yaml](config/bilateral_teaching.yaml)，臂硬件与重力参数位于工作空间 `config/arms/`（示范见 [config/examples/arms](../../config/examples/arms)）；示教只运行两端都已配置的主从对：
+配对耦合参数位于 [bilateral_teaching.yaml](config/bilateral_teaching.yaml)，臂硬件与重力参数位于工作空间 `config/arms/`（示范见 [config/examples/arms](../../config/examples/arms)）：
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
+| `pairs` | 必填 | 主从配对，如 `arm_1:arm_3,arm_2:arm_4` |
 | `mode` | `master_slave` | `master_slave` 或 `bilateral`（非活动阶段也可调 `/bilateral_teaching/set_mode` 切换） |
 | `kp` | `[60, 60, 60, 12, 8, 8]` | 从臂/双向耦合六轴位置增益与重力折合增益 |
 | `kd` | `[9.25, 9.31, 4.51, 0.6, 0.49, 0.13]` | 从臂/双向耦合六轴阻尼增益（可用 `ros2 run piper_x_driver damping --kp ...` 计算，或传负数 `-1` 由底层 `piper_x_driver` 自动推导） |

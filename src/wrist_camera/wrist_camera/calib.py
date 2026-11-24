@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 import yaml
 
-from wrist_camera import extrinsic, intrinsic, transforms
+from wrist_camera import extrinsic, intrinsic
 from wrist_camera.board import Board, probe
 from wrist_camera.rtsp import (
     default_board_config_path,
@@ -147,8 +147,8 @@ class CalibrationApp:
         with self._live_lock:
             return self._live.get(name)
 
-    def _intrinsic_for(self, source: CameraSource, size, calibration):
-        entry = find_intrinsic(calibration, source.name, *size)
+    def _intrinsic_for(self, size, calibration):
+        entry = find_intrinsic(calibration, *size)
         if entry is not None:
             return entry, 'calibrated'
         return None, 'none'
@@ -161,7 +161,7 @@ class CalibrationApp:
             live = self._live_of(name)
             detection = live['detection'] if live else None
             size = (status.get('width'), status.get('height'))
-            origin = self._intrinsic_for(source, size, calibration)[1] if None not in size else 'none'
+            origin = self._intrinsic_for(size, calibration)[1] if None not in size else 'none'
             status.update({
                 'frame': source.frame,
                 'parent_frame': source.parent_frame,
@@ -199,7 +199,7 @@ class CalibrationApp:
         counts = []
         for profile in self.sources[camera].profiles:
             width, height = profile['width'], profile['height']
-            entry = find_intrinsic(calibration, camera, width, height, allow_scale=False)
+            entry = find_intrinsic(calibration, width, height, allow_scale=False)
             shots = self.store.list_intrinsic_shots(camera, width, height)
             counts.append({
                 'width': width, 'height': height,
@@ -316,7 +316,7 @@ class CalibrationApp:
         result = self._results.get(f'{name}:{width}x{height}')
         if not result or not result.get('ok'):
             raise RuntimeError('先点「求解」并确认结果合理再保存')
-        path = self.store.put_intrinsic(name, result, {
+        path = self.store.put_intrinsic(result, {
             'board': self.board.describe(), 'source': 'wrist_camera'})
         return {'path': path, 'rms': result['rms']}
 
@@ -365,12 +365,12 @@ class CalibrationApp:
                 'from': [highest['width'], highest['height']],
                 'to': [lower['width'], lower['height']], **verdict,
             }
-            self.store.put_profile_relation(name, record)
+            self.store.put_profile_relation(record)
             relations.append(record)
         return {'camera': name, 'relations': relations}
 
     def _pose_sample(self, source: CameraSource, detection, calibration):
-        entry, origin = self._intrinsic_for(source, detection.size, calibration)
+        entry, origin = self._intrinsic_for(detection.size, calibration)
         if entry is None:
             width, height = detection.size
             raise RuntimeError(
@@ -504,7 +504,7 @@ class CalibrationApp:
             **solution['transform'],
             **extra,
         }
-        return {'path': self.store.put_extrinsic(name, payload)}
+        return {'path': self.store.put_extrinsic(payload)}
 
     def delete_pose(self, body: dict) -> dict:
         self.store.delete_extrinsic_pose(body['name'], camera=self.camera_name)

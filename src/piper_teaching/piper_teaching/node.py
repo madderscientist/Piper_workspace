@@ -26,20 +26,23 @@ from .bilateral import (
     TeachingFault, measured_references,
 )
 
-# (master, slave); only pairs whose two arms are both configured on this machine are used.
-PAIRS = (('arm_1', 'arm_3'), ('arm_2', 'arm_4'))
+
+def parse_pairs(text: str) -> list[tuple[str, str]]:
+    """Parse 'master:slave[,master:slave]' into (master, slave) tuples."""
+    pairs = [tuple(item.split(':')) for item in text.replace(' ', '').split(',') if item]
+    arms = [arm for pair in pairs for arm in pair]
+    if not pairs or any(len(p) != 2 or not all(p) for p in pairs) or len(set(arms)) != len(arms):
+        raise ValueError(f"pairs must be 'master:slave[,master:slave]' with distinct arms, got {text!r}")
+    return pairs
 
 
 class TeachingNode(Node):
     def __init__(self, **kwargs):
         super().__init__('bilateral_teaching', **kwargs)
         self.declare_parameter('config_file', str(default_config_path()))
+        self.declare_parameter('pairs', '')
         self.fleet = FleetConfig(str(self.get_parameter('config_file').value))
-        ids = {arm.id for arm in self.fleet.arms}
-        pairs = [pair for pair in PAIRS if set(pair) <= ids]
-        if not pairs:
-            raise ValueError(f'No complete master/slave pair {PAIRS} among configured arms')
-        self.pairs = pairs
+        self.pairs = pairs = parse_pairs(str(self.get_parameter('pairs').value))
         self.arms = [self.fleet.arm(m) for m, _ in pairs] + [self.fleet.arm(s) for _, s in pairs]
         count = len(self.arms)
         self.declare_parameter('dry_run', True)

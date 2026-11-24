@@ -138,7 +138,7 @@ ros2 launch piper_x_driver power_off.launch.py
 | **电机驱动板硬件环** | **`> 10 kHz`** | 驱动器硬件内部闭环 | 电机侧高频执行 $K_p(p_{\text{des}} - q) + K_d(v_{\text{des}} - \dot{q}) + t_{\text{ff}}$ |
 | **CAN 硬件状态上报** | **`200 Hz`** (`5 ms`) | 固件固定（`can_rx_hz`） | `0x2A5..0x2A7` 六轴角度、`0x251..0x256` 转速/电流、`0x2A8` 夹爪、`0x2A1` 状态、`0x2A2..0x2A4` 位姿（`0x261..0x266` 驱动状态约 `40 Hz`） |
 | **底层驱动内环与高频遥测** (`piper_x_driver`) | **`200 Hz`** (`5 ms`) | `rate_hz:=200.0`<br/>`telemetry_hz:=200.0` | 重力补偿 $g(q)$、关节/夹爪摩擦补偿 $f(q,\dot{q})$、按需启用的末端六维力估计、CAN MIT 下发（`0x15A..0x15F`），以及发布 `joint_states_feedback`（启用估计后发布 `end_wrench_stamped`） |
-| **四臂示教耦合层** (`piper_teaching`) | **`200 Hz`** (`5 ms`) | `rate_hz:=200.0` | 与驱动 1:1 同频订阅 `joint_states_feedback`，解算并下发 `command/mit`、`command/gripper` 与 `/bilateral_teaching/arm_{1..4}/target` |
+| **四臂示教耦合层** (`piper_teaching`) | **`200 Hz`** (`5 ms`) | `rate_hz:=200.0` | 与驱动 1:1 同频订阅 `joint_states_feedback`，解算并下发 `command/mit`、`command/gripper` 与 `/bilateral_teaching/<arm>/target` |
 | **上层控制与状态汇总层** | **`50 Hz`** (`20 ms`) | 驱动内置节流 / 上层节点 | 驱动以 **50 Hz**（及状态跳变时立即）发布 `control_state` JSON（含 `rates` 实时频率字典）、`arm_status` 与 `end_pose_stamped`；上层算法以 **50 Hz** 发送目标时，驱动在每两帧目标之间仍以 **200 Hz** 紧跟实测反馈实时更新重力与摩擦补偿 |
 
 ---

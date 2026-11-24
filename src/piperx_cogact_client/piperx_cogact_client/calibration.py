@@ -211,8 +211,6 @@ class CalibrationManager:
                 for key in ("calibration_id", "updated_at", "world_origin", "base_mid_x_m", "board_z_m"):
                     if raw.get(key) is not None:
                         state[key] = raw[key]
-                if state["world_origin"] in ("board", "mid_base"):
-                    state["world_origin"] = "board_up" if state["world_origin"] == "board" else "dual_base_board"
                 for group in ("world_from_base", "flange_from_tcp"):
                     src = raw.get(group) or {}
                     for side in ("left", "right"):

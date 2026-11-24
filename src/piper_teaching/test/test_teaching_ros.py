@@ -2,7 +2,8 @@ from dataclasses import replace
 import time
 
 from piper_teaching.bilateral import ArmSample, TeachingFault
-from piper_teaching.node import TeachingNode
+from piper_teaching.node import parse_pairs, TeachingNode
+import pytest
 import rclpy
 from rclpy.parameter import Parameter
 
@@ -10,6 +11,7 @@ from rclpy.parameter import Parameter
 def test_enable_acknowledgement_waits_for_updated_enabled_telemetry(monkeypatch):
     rclpy.init()
     teaching = TeachingNode(parameter_overrides=[
+        Parameter('pairs', value='arm_1:arm_3,arm_2:arm_4'),
         Parameter('dry_run', value=False),
         Parameter('kp', value=[3.0] * 6),
         Parameter('kd', value=[0.5] * 6),
@@ -57,3 +59,10 @@ def test_enable_acknowledgement_waits_for_updated_enabled_telemetry(monkeypatch)
     finally:
         teaching.destroy_node()
         rclpy.try_shutdown()
+
+
+def test_parse_pairs():
+    assert parse_pairs('arm_2:arm_4, arm_1:arm_3') == [('arm_2', 'arm_4'), ('arm_1', 'arm_3')]
+    for bad in ('', 'arm_1', 'arm_1:', 'arm_1:arm_3,arm_3:arm_2'):
+        with pytest.raises(ValueError):
+            parse_pairs(bad)

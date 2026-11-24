@@ -463,7 +463,7 @@ SDK `electronic_emergency_stop()` 发 `B0=1`，`reset()` 发 `B0=2`；
 通过 `get_leader_joint_angles()` 聚合。它不是 `0x2A5`～`0x2A7` 的实测反馈。
 
 **ROS：以上原生 Leader/Follower 能力均未开放。**
-本工程 1↔3、2↔4 的 MIT 配对不调用 `0x470/0x191`，两者不要混为一种示教模式。
+本工程 `piper_teaching` 的 MIT 配对不调用 `0x470/0x191`，两者不要混为一种示教模式。
 
 ---
 

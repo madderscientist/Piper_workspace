@@ -132,25 +132,6 @@ class FleetConfig:
         if not isinstance(values, dict):
             raise ValueError('Invalid arm configuration fields')
         raw_values = dict(values)
-        if 'kp' not in raw_values and 'debug_kp' in raw_values:
-            raw_values['kp'] = raw_values.pop('debug_kp')
-        elif 'debug_kp' in raw_values:
-            legacy_kp = _vector(raw_values.pop('debug_kp'), 'debug_kp', 6, 0.0, 500.0)
-            if 'kp' not in values:
-                raw_values['kp'] = list(legacy_kp)
-        if 'kd' not in raw_values and 'debug_kd' in raw_values:
-            raw_values['kd'] = raw_values.pop('debug_kd')
-        elif 'debug_kd' in raw_values:
-            legacy_kd = _vector(raw_values.pop('debug_kd'), 'debug_kd', 6, -100.0, 100.0)
-            if 'kd' not in values:
-                raw_values['kd'] = list(legacy_kd)
-        if 's_a' not in raw_values and 'adaptive_stiffness_scale' in raw_values:
-            raw_values['s_a'] = raw_values.pop('adaptive_stiffness_scale')
-        elif 'adaptive_stiffness_scale' in raw_values:
-            legacy_sa = bounded(
-                raw_values.pop('adaptive_stiffness_scale'), 'adaptive_stiffness_scale', 0.0, 20.0)
-            if 's_a' not in values:
-                raw_values['s_a'] = legacy_sa
         kp_vec = _vector(raw_values.get('kp'), 'kp', 6, 0.0, 500.0)
         values = {
             'kd': list(max_critical_kd(kp_vec, str(raw_values.get('end_effector', '')))),

@@ -265,8 +265,7 @@ ArmConfig FleetConfig::load_arm(
     "id", "name", "namespace", "can_port", "end_effector", "gravity_scale", "mounting",
     "kp", "kd", "s_a", "friction_scale", "friction_config", "gravity_config",
     "friction_error_epsilon", "friction_velocity_epsilon", "target_velocity_cutoff_hz",
-    "adaptive_stiffness_b", "adaptive_stiffness_power", "offset_ramp_s",
-    "debug_kp", "debug_kd", "adaptive_stiffness_scale"
+    "adaptive_stiffness_b", "adaptive_stiffness_power", "offset_ramp_s"
   };
   static const std::set<std::string> required_base_keys = {
     "id", "name", "namespace", "can_port", "end_effector", "gravity_scale", "mounting"
@@ -289,39 +288,17 @@ ArmConfig FleetConfig::load_arm(
       throw std::invalid_argument("Invalid arm configuration fields");
     }
   }
-  Vec6 kp_vec{};
-  if (raw["debug_kp"]) {
-    const Vec6 legacy_kp = yaml_vector<6>(raw["debug_kp"], "debug_kp", 0.0, 500.0);
-    if (!raw["kp"]) {
-      kp_vec = legacy_kp;
-    }
-  }
-  if (raw["kp"]) {
-    kp_vec = yaml_vector<6>(raw["kp"], "kp", 0.0, 500.0);
-  } else if (!raw["debug_kp"]) {
+  if (!raw["kp"]) {
     throw std::invalid_argument("kp requires 6 values");
   }
+  const Vec6 kp_vec = yaml_vector<6>(raw["kp"], "kp", 0.0, 500.0);
 
   std::optional<Vec6> raw_kd;
-  if (raw["debug_kd"]) {
-    const Vec6 legacy_kd = yaml_vector<6>(raw["debug_kd"], "debug_kd", -100.0, 100.0);
-    if (!raw["kd"]) {
-      raw_kd = legacy_kd;
-    }
-  }
   if (raw["kd"]) {
     raw_kd = yaml_vector<6>(raw["kd"], "kd", -100.0, 100.0);
   }
 
   double sa_val = 2.0;
-  if (raw["adaptive_stiffness_scale"]) {
-    const double legacy_sa = bounded(
-      yaml_strict_number(raw["adaptive_stiffness_scale"], "adaptive_stiffness_scale"),
-      "adaptive_stiffness_scale", 0.0, 20.0);
-    if (!raw["s_a"]) {
-      sa_val = legacy_sa;
-    }
-  }
   if (raw["s_a"]) {
     sa_val = bounded(yaml_strict_number(raw["s_a"], "s_a"), "s_a", 0.0, 20.0);
   }
